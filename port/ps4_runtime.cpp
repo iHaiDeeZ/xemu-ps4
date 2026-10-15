@@ -603,8 +603,13 @@ void* __wrap_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t off
             const int32_t ret = sceKernelMapNamedSystemFlexibleMemory(&base, size, prot & 0x7, MAP_FIXED_FLAG,
                                                                       "xemu mmap");
             if (ret == 0) {
-                heapLog("[xemu] mmap: %zu KiB prot %d from system flexible memory at %p, caller elf 0x%llx\n",
-                        size / 1024, prot, base, elf(__builtin_return_address(0)));
+                // the first ones, then every 256th: QEMU maps coroutine stacks this way, and a
+                // log line (a file write) for each slowed disk I/O down further (v00.09)
+                static std::atomic<unsigned> s_mapped{0};
+                const unsigned n = s_mapped++;
+                if (n < 32 || n % 256 == 0)
+                    heapLog("[xemu] mmap #%u: %zu KiB prot %d from system flexible memory at %p, caller elf 0x%llx\n",
+                            n, size / 1024, prot, base, elf(__builtin_return_address(0)));
                 return base;
             }
             heapLog("[xemu] mmap: %zu KiB prot %d not possible from system flexible memory (0x%x)\n",

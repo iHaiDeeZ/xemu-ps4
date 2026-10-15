@@ -809,14 +809,15 @@ index 0000000000..ed24aa5721
 +#include "backends/imgui_impl_vulkan.cpp"
 diff --git a/ui/ps4/meson.build b/ui/ps4/meson.build
 new file mode 100644
-index 0000000000..e48c43205e
+index 0000000000..feb4ee519d
 --- /dev/null
 +++ b/ui/ps4/meson.build
-@@ -0,0 +1,10 @@
+@@ -0,0 +1,11 @@
 +# xemu-ps4: the PS4 frontend (in place of ui/xemu.c and the OpenGL GUI in ui/xui)
 +xemu_ss.add(volk, files(
 +  'imgui-impl-vulkan-ps4.cc',
 +  'ps4-hud.cc',
++  'ps4-pad.c',
 +  'ps4-present.cc',
 +  'ps4-thumbnail.cc',
 +  'ps4-wsi.cc',
@@ -825,10 +826,10 @@ index 0000000000..e48c43205e
 +))
 diff --git a/ui/ps4/ps4-frontend.h b/ui/ps4/ps4-frontend.h
 new file mode 100644
-index 0000000000..13667a0c63
+index 0000000000..56bf02d82b
 --- /dev/null
 +++ b/ui/ps4/ps4-frontend.h
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,47 @@
 +/*
 + * xemu-ps4: the PS4 frontend's pieces (xemu-ps4.c, ps4-present.cc, ps4-hud.cc)
 + *
@@ -858,6 +859,9 @@ index 0000000000..13667a0c63
 +void ps4_present_shutdown(void);
 +/* frames presented so far, and those that had the emulated display in them */
 +void ps4_present_stats(uint64_t *frames, uint64_t *display_frames);
++
++/* ps4-pad.c: the DualShock 4 as an SDL virtual gamepad (after SDL's gamepad subsystem) */
++void ps4_pad_init(void);
 +
 +/* xemu-ps4.c: why the Xbox can't start (a BIOS mismatch, ...), NULL if nothing is known wrong */
 +extern const char *ps4_setup_problem;
@@ -1023,12 +1027,162 @@ index 0000000000..2a894546be
 +    DrawSetupHelp();
 +    DrawNotification();
 +}
+diff --git a/ui/ps4/ps4-pad.c b/ui/ps4/ps4-pad.c
+new file mode 100644
+index 0000000000..b5a9c6b1e1
+--- /dev/null
++++ b/ui/ps4/ps4-pad.c
+@@ -0,0 +1,144 @@
++/*
++ * xemu-ps4: the DualShock 4 as an SDL gamepad. SDL has no PS4 joystick driver; its virtual
++ * gamepad stands in, fed from ScePad each time SDL updates its joysticks, so xemu-input.c binds,
++ * maps and rumbles it like any desktop gamepad (auto-bound to the first free Xbox port).
++ *
++ *   Cross/Circle/Square/Triangle   A/B/X/Y
++ *   L1/R1                          white/black (SDL's shoulders, as xemu maps them)
++ *   L2/R2                          left/right trigger (analog)
++ *   Options                        Start
++ *   touchpad click                 Back
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "ps4-frontend.h"
++
++#include <SDL3/SDL.h>
++#include <orbis/Pad.h>
++#include <orbis/UserService.h>
++
++void ps4_boot_trace(const char *line); /* port/ps4_crashlog.cpp */
++
++typedef struct PS4Pad {
++    int handle;
++    SDL_JoystickID id;
++    SDL_Joystick *joystick;
++} PS4Pad;
++
++static PS4Pad pad = { .handle = -1 };
++
++static const struct {
++    uint32_t ps4;
++    SDL_GamepadButton sdl;
++} button_map[] = {
++    { ORBIS_PAD_BUTTON_CROSS, SDL_GAMEPAD_BUTTON_SOUTH },
++    { ORBIS_PAD_BUTTON_CIRCLE, SDL_GAMEPAD_BUTTON_EAST },
++    { ORBIS_PAD_BUTTON_SQUARE, SDL_GAMEPAD_BUTTON_WEST },
++    { ORBIS_PAD_BUTTON_TRIANGLE, SDL_GAMEPAD_BUTTON_NORTH },
++    { ORBIS_PAD_BUTTON_TOUCH_PAD, SDL_GAMEPAD_BUTTON_BACK },
++    { ORBIS_PAD_BUTTON_OPTIONS, SDL_GAMEPAD_BUTTON_START },
++    { ORBIS_PAD_BUTTON_L3, SDL_GAMEPAD_BUTTON_LEFT_STICK },
++    { ORBIS_PAD_BUTTON_R3, SDL_GAMEPAD_BUTTON_RIGHT_STICK },
++    { ORBIS_PAD_BUTTON_L1, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER },
++    { ORBIS_PAD_BUTTON_R1, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER },
++    { ORBIS_PAD_BUTTON_UP, SDL_GAMEPAD_BUTTON_DPAD_UP },
++    { ORBIS_PAD_BUTTON_DOWN, SDL_GAMEPAD_BUTTON_DPAD_DOWN },
++    { ORBIS_PAD_BUTTON_LEFT, SDL_GAMEPAD_BUTTON_DPAD_LEFT },
++    { ORBIS_PAD_BUTTON_RIGHT, SDL_GAMEPAD_BUTTON_DPAD_RIGHT },
++};
++
++/* 0..255, centre 128 -> SDL's -32768..32767 */
++static Sint16 stick_axis(uint8_t v)
++{
++    int a = ((int)v - 128) * 256;
++    return (Sint16)MAX(-32768, MIN(32767, a));
++}
++
++/* 0..255 -> SDL's trigger range 0..32767 */
++static Sint16 trigger_axis(uint8_t v)
++{
++    return (Sint16)(v * 32767 / 255);
++}
++
++static void SDLCALL pad_update(void *userdata)
++{
++    OrbisPadData data;
++    memset(&data, 0, sizeof(data));
++    if (pad.joystick == NULL || scePadReadState(pad.handle, &data) != 0) {
++        return;
++    }
++    if (!data.connected) {
++        data.buttons = 0;
++        data.leftStick.x = data.leftStick.y = 128;
++        data.rightStick.x = data.rightStick.y = 128;
++        data.analogButtons.l2 = data.analogButtons.r2 = 0;
++    }
++    for (size_t i = 0; i < ARRAY_SIZE(button_map); i++) {
++        SDL_SetJoystickVirtualButton(pad.joystick, button_map[i].sdl,
++                                     (data.buttons & button_map[i].ps4) != 0);
++    }
++    SDL_SetJoystickVirtualAxis(pad.joystick, SDL_GAMEPAD_AXIS_LEFTX, stick_axis(data.leftStick.x));
++    SDL_SetJoystickVirtualAxis(pad.joystick, SDL_GAMEPAD_AXIS_LEFTY, stick_axis(data.leftStick.y));
++    SDL_SetJoystickVirtualAxis(pad.joystick, SDL_GAMEPAD_AXIS_RIGHTX, stick_axis(data.rightStick.x));
++    SDL_SetJoystickVirtualAxis(pad.joystick, SDL_GAMEPAD_AXIS_RIGHTY, stick_axis(data.rightStick.y));
++    SDL_SetJoystickVirtualAxis(pad.joystick, SDL_GAMEPAD_AXIS_LEFT_TRIGGER,
++                               trigger_axis(data.analogButtons.l2));
++    SDL_SetJoystickVirtualAxis(pad.joystick, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER,
++                               trigger_axis(data.analogButtons.r2));
++}
++
++static bool SDLCALL pad_rumble(void *userdata, Uint16 low, Uint16 high)
++{
++    OrbisPadVibeParam param = { .lgMotor = low >> 8, .smMotor = high >> 8 };
++    return scePadSetVibration(pad.handle, &param) == 0;
++}
++
++void ps4_pad_init(void)
++{
++    char line[128];
++    sceUserServiceInitialize(NULL);
++    scePadInit();
++    int user = -1;
++    if (sceUserServiceGetInitialUser(&user) != 0 || user < 0) {
++        ps4_boot_trace("pad: no initial user");
++        return;
++    }
++    pad.handle = scePadOpen(user, ORBIS_PAD_PORT_TYPE_STANDARD, 0, NULL);
++    if (pad.handle < 0) {
++        snprintf(line, sizeof(line), "pad: scePadOpen(user %x) failed (%x)", user,
++                 (unsigned)pad.handle);
++        ps4_boot_trace(line);
++        return;
++    }
++
++    SDL_VirtualJoystickDesc desc;
++    SDL_INIT_INTERFACE(&desc);
++    desc.type = SDL_JOYSTICK_TYPE_GAMEPAD;
++    desc.vendor_id = 0x054c;    /* Sony */
++    desc.product_id = 0x09cc;   /* DualShock 4 (v2) */
++    desc.naxes = SDL_GAMEPAD_AXIS_COUNT;
++    desc.nbuttons = SDL_GAMEPAD_BUTTON_DPAD_RIGHT + 1;
++    /* every button and axis the pad has, in SDL's gamepad order: index == SDL_GamepadButton */
++    desc.button_mask = (1u << (SDL_GAMEPAD_BUTTON_DPAD_RIGHT + 1)) - 1;
++    desc.axis_mask = (1u << SDL_GAMEPAD_AXIS_COUNT) - 1;
++    desc.name = "DualShock 4";
++    desc.Update = pad_update;
++    desc.Rumble = pad_rumble;
++
++    pad.id = SDL_AttachVirtualJoystick(&desc);
++    if (pad.id == 0) {
++        snprintf(line, sizeof(line), "pad: SDL_AttachVirtualJoystick: %s", SDL_GetError());
++        ps4_boot_trace(line);
++        return;
++    }
++    /* the gamepad layer opens it for xemu-input; this keeps the virtual device's state */
++    pad.joystick = SDL_OpenJoystick(pad.id);
++    snprintf(line, sizeof(line), "pad: DualShock 4 of user %x (handle %d) as SDL gamepad %u",
++             user, pad.handle, (unsigned)pad.id);
++    ps4_boot_trace(line);
++}
 diff --git a/ui/ps4/ps4-present.cc b/ui/ps4/ps4-present.cc
 new file mode 100644
-index 0000000000..793a57a4e4
+index 0000000000..d975e4dd68
 --- /dev/null
 +++ b/ui/ps4/ps4-present.cc
-@@ -0,0 +1,392 @@
+@@ -0,0 +1,395 @@
 +/*
 + * xemu-ps4: presents the emulated display on VideoOut, on the Vulkan renderer's own device and
 + * queue (the PS4 has no OpenGL to hand the picture to, as the desktop frontends do).
@@ -1286,7 +1440,10 @@ index 0000000000..793a57a4e4
 +        const VkRect2D dst = FitRect(w, h);
 +        VkImageBlit blit {};
 +        blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-+        blit.srcOffsets[1] = { (int32_t)w, (int32_t)h, 1 };
++        // the renderer stores the display bottom-up for the desktop's OpenGL presenter ("GL
++        // compat" in vk/display.c): read it from the last row up
++        blit.srcOffsets[0] = { 0, (int32_t)h, 0 };
++        blit.srcOffsets[1] = { (int32_t)w, 0, 1 };
 +        blit.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
 +        blit.dstOffsets[0] = { dst.offset.x, dst.offset.y, 0 };
 +        blit.dstOffsets[1] = { dst.offset.x + (int32_t)dst.extent.width,
@@ -2084,10 +2241,10 @@ index 0000000000..24e9598a97
 +}
 diff --git a/ui/ps4/xemu-ps4.c b/ui/ps4/xemu-ps4.c
 new file mode 100644
-index 0000000000..57942d5073
+index 0000000000..f64233f21b
 --- /dev/null
 +++ b/ui/ps4/xemu-ps4.c
-@@ -0,0 +1,622 @@
+@@ -0,0 +1,623 @@
 +/*
 + * xemu-ps4: the PS4 frontend (replaces ui/xemu.c and its SDL window + OpenGL).
 + *
@@ -2625,6 +2782,7 @@ index 0000000000..57942d5073
 +            trace("SDL %s: %s", subsystems[i].name, SDL_GetError());
 +        }
 +    }
++    ps4_pad_init();
 +
 +    /* QEMU parses no command line here: the machine comes from xemu.toml (system/vl.c). Extra
 +     * QEMU options, one per line, from /data/xemu/qemu-args.txt (e.g. -d in_asm,int -D file). */

@@ -33,6 +33,6 @@ cd "$BUILD"
     --disable-gnutls --disable-nettle --disable-gcrypt --disable-crypto-afalg --disable-auth-pam \
     --disable-libusb --disable-usb-redir --disable-smartcard --disable-u2f --disable-virglrenderer \
     --disable-opengl --disable-png --disable-vte --disable-xkbcommon --disable-dbus-display \
-    --disable-multiprocess --disable-qom-cast-debug --disable-coroutine-pool \
+    --disable-multiprocess --disable-qom-cast-debug \
     --with-coroutine=sigaltstack --audio-drv-list=sdl \
     "$@"
