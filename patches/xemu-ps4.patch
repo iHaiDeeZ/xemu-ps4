@@ -826,10 +826,10 @@ index 0000000000..feb4ee519d
 +))
 diff --git a/ui/ps4/ps4-frontend.h b/ui/ps4/ps4-frontend.h
 new file mode 100644
-index 0000000000..56bf02d82b
+index 0000000000..6fdbc1e896
 --- /dev/null
 +++ b/ui/ps4/ps4-frontend.h
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,50 @@
 +/*
 + * xemu-ps4: the PS4 frontend's pieces (xemu-ps4.c, ps4-present.cc, ps4-hud.cc)
 + *
@@ -863,6 +863,9 @@ index 0000000000..56bf02d82b
 +/* ps4-pad.c: the DualShock 4 as an SDL virtual gamepad (after SDL's gamepad subsystem) */
 +void ps4_pad_init(void);
 +
++/* xemu-ps4.c: the busiest threads over the last 5 s ("name N%, ..."), for the overlay */
++extern char ps4_perf_threads[256];
++
 +/* xemu-ps4.c: why the Xbox can't start (a BIOS mismatch, ...), NULL if nothing is known wrong */
 +extern const char *ps4_setup_problem;
 +
@@ -879,10 +882,10 @@ index 0000000000..56bf02d82b
 +#endif
 diff --git a/ui/ps4/ps4-hud.cc b/ui/ps4/ps4-hud.cc
 new file mode 100644
-index 0000000000..2a894546be
+index 0000000000..0ab2702976
 --- /dev/null
 +++ b/ui/ps4/ps4-hud.cc
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,178 @@
 +/*
 + * xemu-ps4: the HUD drawn over the emulated picture (ImGui): notifications and error messages
 + * (xemu-notifications.h, which the desktop's xui implements), and what is missing before a
@@ -897,6 +900,7 @@ index 0000000000..2a894546be
 +#include "ps4-frontend.h"
 +#include "ui/xemu-notifications.h"
 +#include "ui/xemu-settings.h"
++#include "hw/xbox/nv2a/debug.h"
 +
 +#include "imgui.h"
 +
@@ -958,6 +962,38 @@ index 0000000000..2a894546be
 +        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", sCurrent.text.c_str());
 +    } else {
 +        ImGui::TextUnformatted(sCurrent.text.c_str());
++    }
++    ImGui::End();
++}
++
++// Top left: the game's frame rate (NV2A flips), the display's, and the busiest threads
++void DrawPerformance()
++{
++    static Clock::time_point last = Clock::now();
++    static unsigned lastFlips;
++    static uint64_t lastFrames;
++    static float gameFps, displayFps;
++    const auto now = Clock::now();
++    const float secs = std::chrono::duration<float>(now - last).count();
++    if (secs >= 0.5f) {
++        uint64_t frames, displayFrames;
++        ps4_present_stats(&frames, &displayFrames);
++        const unsigned flips = g_nv2a_stats.frame_count;
++        gameFps = (flips - lastFlips) / secs;
++        displayFps = (frames - lastFrames) / secs;
++        lastFlips = flips;
++        lastFrames = frames;
++        last = now;
++    }
++    ImGui::SetNextWindowPos(ImVec2(16.0f, 16.0f), ImGuiCond_Always);
++    ImGui::SetNextWindowBgAlpha(0.55f);
++    ImGui::Begin("##performance", nullptr,
++                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
++                     ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing |
++                     ImGuiWindowFlags_NoInputs);
++    ImGui::Text("Game %.1f FPS   Display %.0f FPS", gameFps, displayFps);
++    if (ps4_perf_threads[0] != '\0') {
++        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "%s", ps4_perf_threads);
 +    }
 +    ImGui::End();
 +}
@@ -1024,6 +1060,7 @@ index 0000000000..2a894546be
 +
 +extern "C" void ps4_hud_draw(void)
 +{
++    DrawPerformance();
 +    DrawSetupHelp();
 +    DrawNotification();
 +}
@@ -1179,10 +1216,10 @@ index 0000000000..b5a9c6b1e1
 +}
 diff --git a/ui/ps4/ps4-present.cc b/ui/ps4/ps4-present.cc
 new file mode 100644
-index 0000000000..d975e4dd68
+index 0000000000..2629a7ba42
 --- /dev/null
 +++ b/ui/ps4/ps4-present.cc
-@@ -0,0 +1,395 @@
+@@ -0,0 +1,508 @@
 +/*
 + * xemu-ps4: presents the emulated display on VideoOut, on the Vulkan renderer's own device and
 + * queue (the PS4 has no OpenGL to hand the picture to, as the desktop frontends do).
@@ -1230,7 +1267,80 @@ index 0000000000..d975e4dd68
 +    bool imguiReady = false;
 +    uint64_t frames = 0;
 +    uint64_t displayFrames = 0;
++    // the last finished guest frame (a copy of the renderer's display image), shown until the
++    // next: the renderer is asked for the display only when the guest has flipped
++    VkImage last = VK_NULL_HANDLE;
++    VkDeviceMemory lastMemory = VK_NULL_HANDLE;
++    uint32_t lastWidth = 0, lastHeight = 0;
++    bool lastValid = false;
 +} P;
++
++bool Check(VkResult r, const char *what);
++
++uint32_t DeviceLocalMemoryType(uint32_t typeBits)
++{
++    VkPhysicalDeviceMemoryProperties props;
++    vkGetPhysicalDeviceMemoryProperties(P.dev.physical_device, &props);
++    for (uint32_t i = 0; i < props.memoryTypeCount; i++) {
++        if ((typeBits & (1u << i)) &&
++            (props.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
++            return i;
++        }
++    }
++    return 0;
++}
++
++void DestroyLastFrame()
++{
++    if (P.last != VK_NULL_HANDLE) {
++        vkDestroyImage(P.dev.device, P.last, nullptr);
++        vkFreeMemory(P.dev.device, P.lastMemory, nullptr);
++    }
++    P.last = VK_NULL_HANDLE;
++    P.lastMemory = VK_NULL_HANDLE;
++    P.lastWidth = P.lastHeight = 0;
++    P.lastValid = false;
++}
++
++// The copy of the guest's frame, at the display image's size (made again when that changes;
++// the caller has waited for the GPU)
++bool EnsureLastFrame(uint32_t w, uint32_t h)
++{
++    if (P.last != VK_NULL_HANDLE && P.lastWidth == w && P.lastHeight == h) {
++        return true;
++    }
++    DestroyLastFrame();
++    VkImageCreateInfo ici { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
++    ici.imageType = VK_IMAGE_TYPE_2D;
++    ici.format = VK_FORMAT_R8G8B8A8_UNORM;
++    ici.extent = { w, h, 1 };
++    ici.mipLevels = 1;
++    ici.arrayLayers = 1;
++    ici.samples = VK_SAMPLE_COUNT_1_BIT;
++    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
++    ici.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++    if (!Check(vkCreateImage(P.dev.device, &ici, nullptr, &P.last), "vkCreateImage (last frame)")) {
++        P.last = VK_NULL_HANDLE;
++        return false;
++    }
++    VkMemoryRequirements req;
++    vkGetImageMemoryRequirements(P.dev.device, P.last, &req);
++    VkMemoryAllocateInfo mai { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
++    mai.allocationSize = req.size;
++    mai.memoryTypeIndex = DeviceLocalMemoryType(req.memoryTypeBits);
++    if (!Check(vkAllocateMemory(P.dev.device, &mai, nullptr, &P.lastMemory),
++               "vkAllocateMemory (last frame)")) {
++        vkDestroyImage(P.dev.device, P.last, nullptr);
++        P.last = VK_NULL_HANDLE;
++        return false;
++    }
++    vkBindImageMemory(P.dev.device, P.last, P.lastMemory, 0);
++    P.lastWidth = w;
++    P.lastHeight = h;
++    P.lastValid = false;
++    return true;
++}
 +
 +bool Check(VkResult r, const char *what)
 +{
@@ -1425,35 +1535,59 @@ index 0000000000..d975e4dd68
 +    VkImageSubresourceRange all { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 +    vkCmdClearColorImage(cmd, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &all);
 +
++    // a new guest frame: copied out of the renderer's display image, which is the renderer's
++    // again once this command buffer has run (ps4_present_frame waits for that)
 +    VkImage display = VK_NULL_HANDLE;
 +    VkImageView view;
 +    uint32_t w, h;
-+    if (haveDisplay && nv2a_vk_ps4_get_display(&display, &view, &w, &h) && w && h) {
++    if (haveDisplay && nv2a_vk_ps4_get_display(&display, &view, &w, &h) && w == P.lastWidth &&
++        h == P.lastHeight && P.last != VK_NULL_HANDLE) {
 +        ImageBarrier(cmd, display, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 +                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 +                     VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
 +                     VK_PIPELINE_STAGE_TRANSFER_BIT);
-+        ImageBarrier(cmd, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-+                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
++        ImageBarrier(cmd, P.last,
++                     P.lastValid ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
++                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
 +                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
 +                     VK_PIPELINE_STAGE_TRANSFER_BIT);
-+        const VkRect2D dst = FitRect(w, h);
-+        VkImageBlit blit {};
-+        blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-+        // the renderer stores the display bottom-up for the desktop's OpenGL presenter ("GL
-+        // compat" in vk/display.c): read it from the last row up
-+        blit.srcOffsets[0] = { 0, (int32_t)h, 0 };
-+        blit.srcOffsets[1] = { (int32_t)w, 0, 1 };
-+        blit.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-+        blit.dstOffsets[0] = { dst.offset.x, dst.offset.y, 0 };
-+        blit.dstOffsets[1] = { dst.offset.x + (int32_t)dst.extent.width,
-+                               dst.offset.y + (int32_t)dst.extent.height, 1 };
-+        vkCmdBlitImage(cmd, display, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target,
-+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
++        VkImageCopy copy {};
++        copy.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
++        copy.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
++        copy.extent = { w, h, 1 };
++        vkCmdCopyImage(cmd, display, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, P.last,
++                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
 +        // back to where the renderer left it
 +        ImageBarrier(cmd, display, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 +                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, 0,
 +                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
++        ImageBarrier(cmd, P.last, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
++                     VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                     VK_PIPELINE_STAGE_TRANSFER_BIT);
++        P.lastValid = true;
++    }
++
++    // the last guest frame, every presented frame, scaled to fit
++    if (P.lastValid) {
++        ImageBarrier(cmd, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
++                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                     VK_PIPELINE_STAGE_TRANSFER_BIT);
++        const uint32_t lw = P.lastWidth, lh = P.lastHeight;
++        const VkRect2D dst = FitRect(lw, lh);
++        VkImageBlit blit {};
++        blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
++        // the renderer stores the display bottom-up for the desktop's OpenGL presenter ("GL
++        // compat" in vk/display.c): read it from the last row up
++        blit.srcOffsets[0] = { 0, (int32_t)lh, 0 };
++        blit.srcOffsets[1] = { (int32_t)lw, 0, 1 };
++        blit.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
++        blit.dstOffsets[0] = { dst.offset.x, dst.offset.y, 0 };
++        blit.dstOffsets[1] = { dst.offset.x + (int32_t)dst.extent.width,
++                               dst.offset.y + (int32_t)dst.extent.height, 1 };
++        vkCmdBlitImage(cmd, P.last, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target,
++                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
 +    }
 +
 +    ImageBarrier(cmd, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -1499,6 +1633,21 @@ index 0000000000..d975e4dd68
 +{
 +    if (!P.ready) {
 +        return;
++    }
++
++    // a new display size (the guest's video mode): the last-frame copy follows, once the GPU
++    // is done with the old one
++    if (have_display) {
++        VkImage display;
++        VkImageView view;
++        uint32_t w, h;
++        if (nv2a_vk_ps4_get_display(&display, &view, &w, &h) && w && h &&
++            (w != P.lastWidth || h != P.lastHeight)) {
++            nv2a_vk_ps4_queue_lock();
++            vkQueueWaitIdle(P.dev.queue);
++            nv2a_vk_ps4_queue_unlock();
++            EnsureLastFrame(w, h);
++        }
 +    }
 +
 +    // the ImGui frame (its first NewFrame uploads the font texture through the shared queue)
@@ -1572,6 +1721,7 @@ index 0000000000..d975e4dd68
 +        vkDestroyFramebuffer(P.dev.device, P.framebuffers[i], nullptr);
 +        vkDestroyImageView(P.dev.device, P.views[i], nullptr);
 +    }
++    DestroyLastFrame();
 +    vkDestroyCommandPool(P.dev.device, P.pool, nullptr);
 +    vkDestroyRenderPass(P.dev.device, P.renderPass, nullptr);
 +    vkDestroySwapchainKHR(P.dev.device, P.swapchain, nullptr);
@@ -2241,10 +2391,10 @@ index 0000000000..24e9598a97
 +}
 diff --git a/ui/ps4/xemu-ps4.c b/ui/ps4/xemu-ps4.c
 new file mode 100644
-index 0000000000..f64233f21b
+index 0000000000..0c27a4a849
 --- /dev/null
 +++ b/ui/ps4/xemu-ps4.c
-@@ -0,0 +1,623 @@
+@@ -0,0 +1,649 @@
 +/*
 + * xemu-ps4: the PS4 frontend (replaces ui/xemu.c and its SDL window + OpenGL).
 + *
@@ -2646,10 +2796,15 @@ index 0000000000..f64233f21b
 +
 +type_init(register_xemu_display);
 +
++void ps4_thread_busy_report(char *out, size_t size, int min_percent); /* port/ps4_sampler.cpp */
++
++/* the busiest threads over the last 5 s, for the HUD's overlay (ps4-frontend.h) */
++char ps4_perf_threads[256];
++
 +/*
 + * Every 5 s in boot-trace.log: frames presented (and with the emulated display in them),
-+ * frames the guest flipped on the NV2A, the guest's clock and where its CPU is. Racy reads,
-+ * for diagnosis only.
++ * frames the guest flipped on the NV2A, the guest's clock and where its CPU is, and each named
++ * thread at 5% or more (one near 100% limits the speed). Racy reads, for diagnosis only.
 + */
 +static void *monitor_thread(void *opaque)
 +{
@@ -2667,12 +2822,15 @@ index 0000000000..f64233f21b
 +        if (cpu != NULL && CPU_GET_CLASS(cpu)->get_pc) {
 +            pc = CPU_GET_CLASS(cpu)->get_pc(cpu);
 +        }
++        char threads[sizeof(ps4_perf_threads)];
++        ps4_thread_busy_report(threads, sizeof(threads), 5);
++        memcpy(ps4_perf_threads, threads, sizeof(threads));
 +        trace("monitor: presented %.1f/s (display in %.1f/s), guest flips %.1f/s, "
-+              "guest clock +%.2f s, runstate %s, cpu pc 0x%08" PRIx64 "%s",
++              "guest clock +%.2f s, runstate %s, cpu pc 0x%08" PRIx64 "%s | %s",
 +              (frames - last_frames) / 5.0, (display - last_display) / 5.0,
 +              (flips - last_flips) / 5.0, (guest_ns - last_guest_ns) / 1e9,
 +              RunState_str(runstate_get()), pc,
-+              cpu != NULL && cpu->halted ? " (halted)" : "");
++              cpu != NULL && cpu->halted ? " (halted)" : "", threads);
 +        /* (no cpu_dump_state here: from this thread, with the guest kernel running, it took
 +         * the process down in v00.07) */
 +        last_frames = frames;
@@ -2727,16 +2885,34 @@ index 0000000000..f64233f21b
 +        trace("presenting on VideoOut");
 +    }
 +
-+    /* Fast path as on the desktop: the renderer's display image. Frames the guest draws without
-+     * the GPU (VGA framebuffer) are not shown yet. */
-+    bool have_display = nv2a_get_framebuffer_surface() != 0;
++    /*
++     * The renderer's display image (frames the guest draws without the GPU, through the VGA
++     * framebuffer, are not shown yet) - but only when the guest has flipped since, or a quarter
++     * second has passed (screens drawn without flips). Each request flushes the renderer's
++     * pending work and waits for it if the displayed surface was drawn into: 60 times a second
++     * on the PS4 that cost speed and showed half-drawn frames (flashing, v00.10). In between,
++     * the presenter shows its copy of the last frame.
++     */
++    static unsigned int last_flips;
++    static int64_t last_fetch_ns;
++    const unsigned int flips = g_nv2a_stats.frame_count;
++    const int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    const bool fetch = flips != last_flips || now - last_fetch_ns > 250 * SCALE_MS;
++    bool have_display = false;
++    if (fetch) {
++        have_display = nv2a_get_framebuffer_surface() != 0;
++        last_flips = flips;
++        last_fetch_ns = now;
++    }
 +
 +    xemu_main_loop_lock();
 +    ps4_hud_update();
 +    xemu_main_loop_unlock();
 +
 +    ps4_present_frame(have_display);
-+    nv2a_release_framebuffer_surface();
++    if (fetch) {
++        nv2a_release_framebuffer_surface();
++    }
 +}
 +
 +int main(int argc, char **argv)
@@ -3063,3 +3239,24 @@ index 3c14b72665..08488e9009 100644
      /* BSDs don't have /proc, but they provide a nice substitute */
      struct kinfo_proc *proc = kinfo_getproc(pid);
  
+diff --git a/util/qemu-thread-posix.c b/util/qemu-thread-posix.c
+index ba725444ba..5a13e0cd4f 100644
+--- a/util/qemu-thread-posix.c
++++ b/util/qemu-thread-posix.c
+@@ -370,6 +370,16 @@ static void *qemu_thread_start(void *args)
+         pthread_set_name_np(pthread_self(), qemu_thread_args->name);
+ # endif
+     }
++#ifdef __PS4__
++    {
++        /* the PS4 port's thread watch (port/ps4_sampler.cpp): named in crash and hang
++         * reports and in the per-thread load the frontend shows; busy ones get a heap arena */
++        extern void ps4_watch_thread(const char *name);
++        if (qemu_thread_args->name) {
++            ps4_watch_thread(qemu_thread_args->name);
++        }
++    }
++#endif
+     QEMU_TSAN_ANNOTATE_THREAD_NAME(qemu_thread_args->name);
+     g_free(qemu_thread_args->name);
+     g_free(qemu_thread_args);
