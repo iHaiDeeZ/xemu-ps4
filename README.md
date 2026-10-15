@@ -39,3 +39,11 @@ scripts/save-patch.sh "message"   # commit ~/xemups4-build/src/xemu and refresh 
 
 Run the scripts from WSL through `~/xemups4` (the space in "PS4 Projects" breaks linker flags).
 Upload from Windows (Git Bash): `scripts/upload-to-console.sh out/xemu-ps4-vXX.YY.pkg`.
+
+## License
+
+GPL-2.0-or-later, as xemu/QEMU ([LICENSE](LICENSE)): `patches/xemu-ps4.patch` is a modification of
+xemu, and the PS4 frontend it adds (`ui/ps4`) is part of that work. The PS4 runtime in `port/` and
+the toolchain scripts come from the Resonance / DolphinPS4 / Crema ports; `port/mesa/ac_ps4_drm.c`
+is the RADV winsys of the PS4 Mesa port (MIT, as Mesa); `port/third_party` keeps its own notices.
+No Microsoft BIOS, boot ROM, Sony system files or games are included: supply your own.
