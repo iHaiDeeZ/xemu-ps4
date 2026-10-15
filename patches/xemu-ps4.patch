@@ -2084,10 +2084,10 @@ index 0000000000..24e9598a97
 +}
 diff --git a/ui/ps4/xemu-ps4.c b/ui/ps4/xemu-ps4.c
 new file mode 100644
-index 0000000000..8622fcbe5e
+index 0000000000..57942d5073
 --- /dev/null
 +++ b/ui/ps4/xemu-ps4.c
-@@ -0,0 +1,627 @@
+@@ -0,0 +1,622 @@
 +/*
 + * xemu-ps4: the PS4 frontend (replaces ui/xemu.c and its SDL window + OpenGL).
 + *
@@ -2516,13 +2516,8 @@ index 0000000000..8622fcbe5e
 +              (flips - last_flips) / 5.0, (guest_ns - last_guest_ns) / 1e9,
 +              RunState_str(runstate_get()), pc,
 +              cpu != NULL && cpu->halted ? " (halted)" : "");
-+        /* the guest CPU's whole state: in xemu.log, the first minute, then every minute */
-+        static int dumps;
-+        if (cpu != NULL && (dumps < 12 || dumps % 12 == 0)) {
-+            fprintf(stderr, "== guest CPU at %.1f s of guest time\n", guest_ns / 1e9);
-+            cpu_dump_state(cpu, stderr, CPU_DUMP_FPU);
-+        }
-+        dumps++;
++        /* (no cpu_dump_state here: from this thread, with the guest kernel running, it took
++         * the process down in v00.07) */
 +        last_frames = frames;
 +        last_display = display;
 +        last_flips = flips;
