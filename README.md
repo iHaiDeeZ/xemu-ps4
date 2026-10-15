@@ -2,14 +2,17 @@
 
 [xemu](https://github.com/xemu-project/xemu) (original Xbox emulator, QEMU 10.2) for jailbroken
 PS4 homebrew, built in WSL Ubuntu with the Resonance / DolphinPS4 / Crema PS4 toolchain (clang 21 +
-libc++ 21 on OpenOrbis). Work in progress: see [docs/PORTING.md](docs/PORTING.md).
+libc++ 21 on OpenOrbis). **Paused at v00.15:** boots the BIOS and runs Halo 2 to its title
+screen with the DualShock 4, at about 1 fps with rendering errors; findings and next steps in
+[docs/PORTING.md](docs/PORTING.md).
 
 - Graphics: xemu's Vulkan NV2A renderer on DolphinPS4's RADV/GNM port; the PS4 frontend
   (`ui/ps4`) presents the renderer's display image on VideoOut (no OpenGL on the PS4)
 - CPU: QEMU's TCG (x86 guest on the PS4's x86-64), code buffer in the system flexible pool
 - DSP: xemu's interpreter (the dsp56300 JIT is a Rust library with no PS4 build yet)
-- UI: ImGui HUD (notifications, setup help); the home screen and menus will come from Resonance's
-  launcher. xemu's own GUI (`ui/xui`) is desktop OpenGL + mouse and isn't built.
+- Input: the DualShock 4 (ScePad) as an SDL virtual gamepad on Xbox port 1
+- UI: ImGui HUD (FPS, GPU and thread load, notifications, setup help); a home screen from
+  Resonance's launcher was planned. xemu's own GUI (`ui/xui`) is desktop OpenGL + mouse and isn't built.
 
 ## On the console
 
