@@ -2006,10 +2006,10 @@ index 0000000000..24e9598a97
 +}
 diff --git a/ui/ps4/xemu-ps4.c b/ui/ps4/xemu-ps4.c
 new file mode 100644
-index 0000000000..ac75417261
+index 0000000000..36539e55c6
 --- /dev/null
 +++ b/ui/ps4/xemu-ps4.c
-@@ -0,0 +1,462 @@
+@@ -0,0 +1,465 @@
 +/*
 + * xemu-ps4: the PS4 frontend (replaces ui/xemu.c and its SDL window + OpenGL).
 + *
@@ -2372,6 +2372,9 @@ index 0000000000..ac75417261
 +    mkdir(XEMU_DATA "/bios", 0777);
 +    mkdir(XEMU_DATA "/hdd", 0777);
 +    mkdir(XEMU_DATA "/games", 0777);
++    /* no /tmp on the PS4 (glib's temporary files, QEMU's fallbacks) */
++    mkdir(XEMU_DATA "/tmp", 0777);
++    setenv("TMPDIR", XEMU_DATA "/tmp", 1);
 +    redirect_output();
 +    atexit(trace_exit);
 +    setlocale(LC_NUMERIC, "C");
@@ -2472,6 +2475,38 @@ index 0000000000..ac75417261
 +
 +    xbox_smc_update_tray_state();
 +}
+diff --git a/ui/qemu-pixman.c b/ui/qemu-pixman.c
+index aea09755b9..c8fc7c7037 100644
+--- a/ui/qemu-pixman.c
++++ b/ui/qemu-pixman.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "qemu/memalign.h"
+ #include "qapi/error.h"
+ #include "ui/console.h"
+ #include "qemu/memfd.h"
+@@ -278,6 +279,10 @@ qemu_pixman_shareable_alloc(const char *name, size_t size,
+ {
+ #ifdef WIN32
+     return qemu_win32_map_alloc(size, handle, errp);
++#elif defined(__PS4__)
++    /* no memfd and no /tmp, and no other process to share the surface with */
++    *handle = -1;
++    return qemu_memalign(qemu_real_host_page_size(), size);
+ #else
+     return qemu_memfd_alloc(name, size, 0, handle, errp);
+ #endif
+@@ -294,6 +299,8 @@ qemu_pixman_shareable_free(qemu_pixman_shareable handle,
+     if (err) {
+         error_report_err(err);
+     }
++#elif defined(__PS4__)
++    qemu_vfree(ptr);
+ #else
+     qemu_memfd_free(ptr, size, handle);
+ #endif
 diff --git a/ui/xemu-data.c b/ui/xemu-data.c
 index b0972ce280..1e9d516ca9 100644
 --- a/ui/xemu-data.c
