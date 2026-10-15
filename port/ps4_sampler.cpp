@@ -39,7 +39,7 @@ constexpr int kRipIndex = 20, kRspIndex = 23;
 // function that called into them: the first eboot code address on the stack, tagged.
 constexpr uint64_t kSystemLibs = 0x800000000ULL, kCallerTag = 1ULL << 62;
 constexpr uintptr_t kTextWindow = 0x4000000;
-constexpr int kMaxThreads = 4;
+constexpr int kMaxThreads = 8;
 constexpr int kMaxSamples = 16384;  // per thread and window (10 s at 1 kHz fits)
 
 struct ThreadSamples {

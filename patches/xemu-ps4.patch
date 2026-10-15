@@ -1,3 +1,18 @@
+diff --git a/accel/tcg/tcg-accel-ops-mttcg.c b/accel/tcg/tcg-accel-ops-mttcg.c
+index cf1ee7ac25..c5cc4da46b 100644
+--- a/accel/tcg/tcg-accel-ops-mttcg.c
++++ b/accel/tcg/tcg-accel-ops-mttcg.c
+@@ -85,6 +85,10 @@ static void *mttcg_cpu_thread_fn(void *arg)
+     qemu_guest_random_seed_thread_part2(cpu->random_seed);
+ 
+     do {
++#ifdef __PS4__
++        /* the thread's CPU time for the PS4 frontend's load display (port/ps4_sampler.cpp) */
++        { extern void ps4_thread_cpu_tick(void); ps4_thread_cpu_tick(); }
++#endif
+         qemu_process_cpu_events(cpu);
+ 
+         if (cpu_can_run(cpu)) {
 diff --git a/block.c b/block.c
 index 14ed7f1487..6923af4535 100644
 --- a/block.c
@@ -67,6 +82,21 @@ index 4c6ca713eb..83e4169c7e 100644
  
  static void tty_serial_init(int fd, int speed,
                              int parity, int data_bits, int stop_bits)
+diff --git a/hw/xbox/mcpx/apu/apu.c b/hw/xbox/mcpx/apu/apu.c
+index 1ee6dc4252..b6b5f933ba 100644
+--- a/hw/xbox/mcpx/apu/apu.c
++++ b/hw/xbox/mcpx/apu/apu.c
+@@ -259,6 +259,10 @@ static void *mcpx_apu_frame_thread(void *arg)
+     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+     qemu_mutex_lock(&d->lock);
+     while (!qatomic_read(&d->exiting)) {
++#ifdef __PS4__
++        /* the thread's CPU time for the PS4 frontend's load display (port/ps4_sampler.cpp) */
++        { extern void ps4_thread_cpu_tick(void); ps4_thread_cpu_tick(); }
++#endif
+         if (d->pause_requested) {
+             d->is_idle = true;
+             qemu_cond_signal(&d->idle_cond);
 diff --git a/hw/xbox/mcpx/apu/dsp/dsp_jit_stub.c b/hw/xbox/mcpx/apu/dsp/dsp_jit_stub.c
 new file mode 100644
 index 0000000000..830c2adf63
@@ -172,6 +202,21 @@ index 0000000000..8531287d1e
 +#endif
 +
 +#endif
+diff --git a/hw/xbox/nv2a/pfifo.c b/hw/xbox/nv2a/pfifo.c
+index ff4625c258..56d9f9a410 100644
+--- a/hw/xbox/nv2a/pfifo.c
++++ b/hw/xbox/nv2a/pfifo.c
+@@ -459,6 +459,10 @@ void *pfifo_thread(void *arg)
+ 
+     qemu_mutex_lock(&d->pfifo.lock);
+     while (true) {
++#ifdef __PS4__
++        /* the thread's CPU time for the PS4 frontend's load display (port/ps4_sampler.cpp) */
++        { extern void ps4_thread_cpu_tick(void); ps4_thread_cpu_tick(); }
++#endif
+         d->pfifo.fifo_kick = false;
+ 
+         pgraph_process_pending(d);
 diff --git a/hw/xbox/nv2a/pgraph/meson.build b/hw/xbox/nv2a/pgraph/meson.build
 index fc52f609eb..e0fd91eb26 100644
 --- a/hw/xbox/nv2a/pgraph/meson.build
@@ -826,10 +871,10 @@ index 0000000000..feb4ee519d
 +))
 diff --git a/ui/ps4/ps4-frontend.h b/ui/ps4/ps4-frontend.h
 new file mode 100644
-index 0000000000..a809de019b
+index 0000000000..425dc7e47e
 --- /dev/null
 +++ b/ui/ps4/ps4-frontend.h
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,58 @@
 +/*
 + * xemu-ps4: the PS4 frontend's pieces (xemu-ps4.c, ps4-present.cc, ps4-hud.cc)
 + *
@@ -871,6 +916,8 @@ index 0000000000..a809de019b
 +
 +/* xemu-ps4.c: the busiest threads over the last 5 s ("name N%, ..."), for the overlay */
 +extern char ps4_perf_threads[256];
++/* xemu-ps4.c: how busy the GPU was over the last 5 s, in percent (-1: not known yet) */
++extern int ps4_perf_gpu;
 +
 +/* xemu-ps4.c: why the Xbox can't start (a BIOS mismatch, ...), NULL if nothing is known wrong */
 +extern const char *ps4_setup_problem;
@@ -888,10 +935,10 @@ index 0000000000..a809de019b
 +#endif
 diff --git a/ui/ps4/ps4-hud.cc b/ui/ps4/ps4-hud.cc
 new file mode 100644
-index 0000000000..363aeca42c
+index 0000000000..07c66b17c0
 --- /dev/null
 +++ b/ui/ps4/ps4-hud.cc
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,187 @@
 +/*
 + * xemu-ps4: the HUD drawn over the emulated picture (ImGui): notifications and error messages
 + * (xemu-notifications.h, which the desktop's xui implements), and what is missing before a
@@ -997,7 +1044,12 @@ index 0000000000..363aeca42c
 +                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
 +                     ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing |
 +                     ImGuiWindowFlags_NoInputs);
-+    ImGui::Text("Game %.1f FPS   Display %.0f FPS", gameFps, displayFps);
++    if (ps4_perf_gpu >= 0) {
++        ImGui::Text("Game %.1f FPS   Display %.0f FPS   GPU %d%%", gameFps, displayFps,
++                    ps4_perf_gpu);
++    } else {
++        ImGui::Text("Game %.1f FPS   Display %.0f FPS", gameFps, displayFps);
++    }
 +    if (ps4_pad_intercepted()) {
 +        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f),
 +                           "Controller input held by the PS4 system");
@@ -2471,10 +2523,10 @@ index 0000000000..24e9598a97
 +}
 diff --git a/ui/ps4/xemu-ps4.c b/ui/ps4/xemu-ps4.c
 new file mode 100644
-index 0000000000..c0b4dfb038
+index 0000000000..93ced8c605
 --- /dev/null
 +++ b/ui/ps4/xemu-ps4.c
-@@ -0,0 +1,759 @@
+@@ -0,0 +1,775 @@
 +/*
 + * xemu-ps4: the PS4 frontend (replaces ui/xemu.c and its SDL window + OpenGL).
 + *
@@ -2912,6 +2964,13 @@ index 0000000000..c0b4dfb038
 +
 +/* the busiest threads over the last 5 s, for the HUD's overlay (ps4-frontend.h) */
 +char ps4_perf_threads[256];
++/* how busy the GPU was over the last 5 s, in percent (-1: not known yet) */
++int ps4_perf_gpu = -1;
++
++/* port/mesa/ac_ps4_drm.c: GPU time with work in flight, and first start to last end, in GPU
++ * clock ticks (timestamps around each submission) */
++void ac_ps4_get_gpu_busy(uint64_t *busy_ticks, uint64_t *span_ticks);
++void ps4_thread_cpu_tick(void);
 +
 +/*
 + * Every 5 s in boot-trace.log: frames presented (and with the emulated display in them),
@@ -2937,14 +2996,22 @@ index 0000000000..c0b4dfb038
 +        char threads[sizeof(ps4_perf_threads)];
 +        ps4_thread_busy_report(threads, sizeof(threads), 5);
 +        memcpy(ps4_perf_threads, threads, sizeof(threads));
++        static uint64_t last_busy, last_span;
++        uint64_t busy, span;
++        ac_ps4_get_gpu_busy(&busy, &span);
++        if (span > last_span && last_span != 0) {
++            ps4_perf_gpu = (int)((busy - last_busy) * 100 / (span - last_span));
++        }
++        last_busy = busy;
++        last_span = span;
 +        char pad_stats[160];
 +        ps4_pad_stats(pad_stats, sizeof(pad_stats));
 +        trace("monitor: presented %.1f/s (display in %.1f/s), guest flips %.1f/s, "
-+              "guest clock +%.2f s, runstate %s, cpu pc 0x%08" PRIx64 "%s | %s | %s",
++              "guest clock +%.2f s, runstate %s, cpu pc 0x%08" PRIx64 "%s | GPU %d%% | %s | %s",
 +              (frames - last_frames) / 5.0, (display - last_display) / 5.0,
 +              (flips - last_flips) / 5.0, (guest_ns - last_guest_ns) / 1e9,
 +              RunState_str(runstate_get()), pc,
-+              cpu != NULL && cpu->halted ? " (halted)" : "", threads, pad_stats);
++              cpu != NULL && cpu->halted ? " (halted)" : "", ps4_perf_gpu, threads, pad_stats);
 +        /* (no cpu_dump_state here: from this thread, with the guest kernel running, it took
 +         * the process down in v00.07) */
 +        last_frames = frames;
@@ -3049,6 +3116,7 @@ index 0000000000..c0b4dfb038
 +
 +static void render_frame(void)
 +{
++    ps4_thread_cpu_tick();
 +    /* the device appears once the machine's NV2A has brought the Vulkan renderer up */
 +    if (!ps4_present_ready()) {
 +        NV2AVkDevice dev;
