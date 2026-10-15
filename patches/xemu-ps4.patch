@@ -372,7 +372,7 @@ index d78087e56b..c3d4b53866 100644
  
          bool check_budget = false;
 diff --git a/hw/xbox/nv2a/pgraph/vk/gpuprops.c b/hw/xbox/nv2a/pgraph/vk/gpuprops.c
-index ecc8bb3852..a4befed968 100644
+index ecc8bb3852..6eba23b1e3 100644
 --- a/hw/xbox/nv2a/pgraph/vk/gpuprops.c
 +++ b/hw/xbox/nv2a/pgraph/vk/gpuprops.c
 @@ -451,8 +451,10 @@ static uint8_t *render_geom_shader_triangles(NV2AState *d, int width,
@@ -386,6 +386,30 @@ index ecc8bb3852..a4befed968 100644
  
      void *data;
      VK_CHECK(
+@@ -591,6 +593,23 @@ void pgraph_vk_determine_gpu_properties(NV2AState *d)
+     const int height = 480;
+ 
+     uint8_t *pixels = render_geom_shader_triangles(d, width, height);
++#ifdef __PS4__
++    {
++        /* What came back: the render pass clears to (0,0,0,1), so opaque black everywhere =
++         * cleared and read back, but nothing drawn (the geometry shader path); alpha 0 = the
++         * readback (or the clear) failed. */
++        int coloured = 0, opaque = 0;
++        for (int i = 0; i < width * height; i++) {
++            const uint8_t *p = pixels + i * 4;
++            coloured += (p[0] | p[1] | p[2]) != 0;
++            opaque += p[3] == 255;
++        }
++        const uint8_t *c = pixels + ((height / 2) * width + width / 2) * 4;
++        fprintf(stderr,
++                "VK geometry shader test: %d of %d pixels coloured, %d opaque; centre %02x%02x%02x%02x\n",
++                coloured, width * height, opaque, c[0], c[1], c[2], c[3]);
++    }
++#endif
+     determine_triangle_winding_order(pixels, width, height,
+                                      &pgraph_vk_gpu_properties);
+     g_free(pixels);
 diff --git a/hw/xbox/nv2a/pgraph/vk/instance.c b/hw/xbox/nv2a/pgraph/vk/instance.c
 index edead06c0f..0e5bdb4862 100644
 --- a/hw/xbox/nv2a/pgraph/vk/instance.c
