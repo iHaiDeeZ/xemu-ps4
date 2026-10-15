@@ -825,10 +825,10 @@ index 0000000000..e48c43205e
 +))
 diff --git a/ui/ps4/ps4-frontend.h b/ui/ps4/ps4-frontend.h
 new file mode 100644
-index 0000000000..918ff98f12
+index 0000000000..13667a0c63
 --- /dev/null
 +++ b/ui/ps4/ps4-frontend.h
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,44 @@
 +/*
 + * xemu-ps4: the PS4 frontend's pieces (xemu-ps4.c, ps4-present.cc, ps4-hud.cc)
 + *
@@ -859,6 +859,9 @@ index 0000000000..918ff98f12
 +/* frames presented so far, and those that had the emulated display in them */
 +void ps4_present_stats(uint64_t *frames, uint64_t *display_frames);
 +
++/* xemu-ps4.c: why the Xbox can't start (a BIOS mismatch, ...), NULL if nothing is known wrong */
++extern const char *ps4_setup_problem;
++
 +/* ps4-hud.cc: notifications, status and menus (ImGui), called with the main loop lock */
 +void ps4_hud_process_sdl_event(const SDL_Event *event);
 +void ps4_hud_update(void);
@@ -872,10 +875,10 @@ index 0000000000..918ff98f12
 +#endif
 diff --git a/ui/ps4/ps4-hud.cc b/ui/ps4/ps4-hud.cc
 new file mode 100644
-index 0000000000..bf4f85b198
+index 0000000000..2a894546be
 --- /dev/null
 +++ b/ui/ps4/ps4-hud.cc
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,144 @@
 +/*
 + * xemu-ps4: the HUD drawn over the emulated picture (ImGui): notifications and error messages
 + * (xemu-notifications.h, which the desktop's xui implements), and what is missing before a
@@ -963,6 +966,17 @@ index 0000000000..bf4f85b198
 +    const bool haveFlash = g_config.sys.files.flashrom_path[0] != '\0' &&
 +                           access(g_config.sys.files.flashrom_path, R_OK) == 0;
 +    if (haveBootrom && haveFlash) {
++        if (ps4_setup_problem != nullptr) {
++            const ImVec2 screen = ImGui::GetIO().DisplaySize;
++            ImGui::SetNextWindowPos(ImVec2(screen.x * 0.5f, screen.y * 0.5f), ImGuiCond_Always,
++                                    ImVec2(0.5f, 0.5f));
++            ImGui::SetNextWindowSize(ImVec2(screen.x * 0.6f, 0.0f));
++            ImGui::Begin("xemu for PS4", nullptr,
++                         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove |
++                             ImGuiWindowFlags_NoResize);
++            ImGui::TextWrapped("%s", ps4_setup_problem);
++            ImGui::End();
++        }
 +        return;
 +    }
 +    const ImVec2 screen = ImGui::GetIO().DisplaySize;
@@ -2070,10 +2084,10 @@ index 0000000000..24e9598a97
 +}
 diff --git a/ui/ps4/xemu-ps4.c b/ui/ps4/xemu-ps4.c
 new file mode 100644
-index 0000000000..8927bfbb5b
+index 0000000000..8622fcbe5e
 --- /dev/null
 +++ b/ui/ps4/xemu-ps4.c
-@@ -0,0 +1,529 @@
+@@ -0,0 +1,627 @@
 +/*
 + * xemu-ps4: the PS4 frontend (replaces ui/xemu.c and its SDL window + OpenGL).
 + *
@@ -2271,6 +2285,103 @@ index 0000000000..8927bfbb5b
 +    trace("%s: none in " XEMU_DATA "/bios", what);
 +}
 +
++/* Why the Xbox can't start, for the HUD (ps4-frontend.h); NULL when nothing is known wrong */
++const char *ps4_setup_problem;
++
++#define MCPX_1_0_MD5 "d49c52a4102f6df7bcf8d0617ac475ed"
++
++/*
++ * Does this flash BIOS boot with the MCPX 1.0 boot ROM? The ROM RC4-decrypts the 2BL from flash
++ * 0xffff9e00 (0x6000 bytes, key at ROM offset 0x1a5) to RAM 0x90000 and checks the dword at
++ * 0x95fe4 for 0x7854794a; on a mismatch it hides itself and the CPU runs off into empty memory
++ * (a black screen). BIOS images for later Xbox revisions (MCPX 1.1, e.g. kernel 5838) fail it.
++ */
++static bool flash_boots_with_mcpx_1_0(const uint8_t *rom, const uint8_t *flash, size_t flash_size)
++{
++    const uint8_t *key = rom + 0x1a5;
++    const size_t src = (0xffff9e00u - 0xff000000u) % flash_size;
++    if (src + 0x6000 > flash_size) {
++        return false;
++    }
++    uint8_t s[256];
++    for (int i = 0; i < 256; i++) {
++        s[i] = i;
++    }
++    for (int i = 0, j = 0; i < 256; i++) {
++        j = (j + s[i] + key[i % 16]) & 0xff;
++        uint8_t t = s[i];
++        s[i] = s[j];
++        s[j] = t;
++    }
++    uint32_t magic = 0;
++    for (int n = 0, i = 0, j = 0; n < 0x5fe8; n++) {
++        i = (i + 1) & 0xff;
++        j = (j + s[i]) & 0xff;
++        uint8_t t = s[i];
++        s[i] = s[j];
++        s[j] = t;
++        uint8_t b = flash[src + n] ^ s[(s[i] + s[j]) & 0xff];
++        if (n >= 0x5fe4) {
++            magic |= (uint32_t)b << (8 * (n - 0x5fe4));
++        }
++    }
++    return magic == 0x7854794a;
++}
++
++/* With an MCPX 1.0 boot ROM: a flash BIOS that boots with it, the configured one if it does */
++static void check_bios_pair(void)
++{
++    g_autofree char *rom = NULL;
++    gsize rom_size = 0;
++    if (!g_file_get_contents(g_config.sys.files.bootrom_path, &rom, &rom_size, NULL) ||
++        rom_size != 512) {
++        return;
++    }
++    g_autofree char *md5 = g_compute_checksum_for_data(G_CHECKSUM_MD5, (const guchar *)rom, 512);
++    if (strcmp(md5, MCPX_1_0_MD5) != 0) {
++        trace("MCPX boot ROM %s isn't 1.0 (md5 %s): BIOS pairing not checked",
++              g_config.sys.files.bootrom_path, md5);
++        return;
++    }
++
++    g_autoptr(GPtrArray) candidates = g_ptr_array_new_with_free_func(g_free);
++    if (g_config.sys.files.flashrom_path[0] != '\0') {
++        g_ptr_array_add(candidates, g_strdup(g_config.sys.files.flashrom_path));
++    }
++    DIR *dir = opendir(XEMU_DATA "/bios");
++    struct dirent *e;
++    while (dir != NULL && (e = readdir(dir)) != NULL) {
++        if (e->d_name[0] != '.') {
++            g_ptr_array_add(candidates, g_strdup_printf(XEMU_DATA "/bios/%s", e->d_name));
++        }
++    }
++    if (dir != NULL) {
++        closedir(dir);
++    }
++
++    for (guint i = 0; i < candidates->len; i++) {
++        const char *path = g_ptr_array_index(candidates, i);
++        g_autofree char *flash = NULL;
++        gsize size = 0;
++        if (!g_file_get_contents(path, &flash, &size, NULL) ||
++            (size != 256 * 1024 && size != 1024 * 1024)) {
++            continue;
++        }
++        if (flash_boots_with_mcpx_1_0((const uint8_t *)rom, (const uint8_t *)flash, size)) {
++            if (strcmp(path, g_config.sys.files.flashrom_path) != 0) {
++                trace("flash BIOS: %s (boots with the MCPX 1.0 boot ROM)", path);
++                xemu_settings_set_string(&g_config.sys.files.flashrom_path, path);
++            }
++            return;
++        }
++        trace("flash BIOS %s doesn't boot with the MCPX 1.0 boot ROM", path);
++    }
++    ps4_setup_problem =
++        "The flash BIOS doesn't work with the MCPX 1.0 boot ROM: it is for a later Xbox "
++        "(v1.1-1.6, e.g. kernel 5838). Put a BIOS for the v1.0 Xbox (kernel 3944, 4034, 4132 "
++        "or 4627, e.g. the \"Complex 4627\" image) in /data/xemu/bios and restart.";
++}
++
 +/* PS4 defaults: the renderer that can run here, files where the user puts them */
 +static void apply_ps4_settings(void)
 +{
@@ -2286,6 +2397,7 @@ index 0000000000..8927bfbb5b
 +                   bootrom_sizes, ARRAY_SIZE(bootrom_sizes));
 +    find_bios_file(&g_config.sys.files.flashrom_path, "flash BIOS",
 +                   flash_sizes, ARRAY_SIZE(flash_sizes));
++    check_bios_pair();
 +    if (g_config.sys.files.hdd_path[0] == '\0') {
 +        xemu_settings_set_string(&g_config.sys.files.hdd_path,
 +                                 XEMU_DATA "/hdd/xbox_hdd.qcow2");
