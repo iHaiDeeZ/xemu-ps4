@@ -585,6 +585,16 @@ unsigned long long ps4_fault_count = 0;   // fastmem faults seen by Dolphin's ha
 void* __real_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset);
 void* __wrap_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset) {
     const bool anonymous = fd == -1 && (flags & MAP_ANON) && !(flags & MAP_FIXED);
+    // xemu: inaccessible mappings are address space reservations (QEMU's guest RAM is reserved
+    // PROT_NONE, then mapped MAP_FIXED inside): reserve the range without memory behind it.
+    if (anonymous && prot == PROT_NONE && len >= MB) {
+        const size_t size = (len + PAGE - 1) & ~(PAGE - 1);
+        if (void* base = reserveAwayFromKernel(size)) {
+            heapLog("[xemu] mmap: %zu KiB reserved (no memory) at %p, caller elf 0x%llx\n", size / 1024,
+                    base, elf(__builtin_return_address(0)));
+            return base;
+        }
+    }
     const bool allowed = !(prot & PROT_EXEC) || ps4_jit_in_system_pool;
     if (anonymous && allowed && len >= MB) {
         const size_t size = (len + PAGE - 1) & ~(PAGE - 1);

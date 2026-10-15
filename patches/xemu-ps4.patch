@@ -666,6 +666,37 @@ index df65d2231a..9895b198d4 100644
  
  #include <sys/procctl.h>
  
+diff --git a/tcg/region.c b/tcg/region.c
+index 2181267e48..337e782196 100644
+--- a/tcg/region.c
++++ b/tcg/region.c
+@@ -709,7 +709,15 @@ static int alloc_code_gen_buffer(size_t size, int splitwx, Error **errp)
+      * guard pages later.  We can go the other way with the same number
+      * of syscalls, so always begin with PROT_NONE.
+      */
++#ifdef __PS4__
++    /*
++     * The PS4 grants execute permission only when memory is mapped, not by a later mprotect
++     * (as Resonance's and Dolphin's JITs map their code): map it RWX up front.
++     */
++    prot = PROT_READ | PROT_WRITE | PROT_EXEC;
++#else
+     prot = PROT_NONE;
++#endif
+     flags = MAP_PRIVATE | MAP_ANONYMOUS;
+ #ifdef CONFIG_DARWIN
+     /* Applicable to both iOS and macOS (Apple Silicon). */
+@@ -762,6 +770,10 @@ void tcg_region_init(size_t tb_size, int splitwx, unsigned max_threads)
+             tb_size = MIN(DEFAULT_CODE_GEN_BUFFER_SIZE, tb_size);
+         }
+     }
++#ifdef __PS4__
++    /* system memory is scarce (the GPU's is separate); the Xbox's code fits many times over */
++    tb_size = MIN(tb_size, 64 * MiB);
++#endif
+     if (tb_size < MIN_CODE_GEN_BUFFER_SIZE) {
+         tb_size = MIN_CODE_GEN_BUFFER_SIZE;
+     }
 diff --git a/ui/meson.build b/ui/meson.build
 index ea46bf0f44..719cdc08a6 100644
 --- a/ui/meson.build
@@ -1975,10 +2006,10 @@ index 0000000000..24e9598a97
 +}
 diff --git a/ui/ps4/xemu-ps4.c b/ui/ps4/xemu-ps4.c
 new file mode 100644
-index 0000000000..512cf47ae5
+index 0000000000..ac75417261
 --- /dev/null
 +++ b/ui/ps4/xemu-ps4.c
-@@ -0,0 +1,435 @@
+@@ -0,0 +1,462 @@
 +/*
 + * xemu-ps4: the PS4 frontend (replaces ui/xemu.c and its SDL window + OpenGL).
 + *
@@ -2116,13 +2147,26 @@ index 0000000000..512cf47ae5
 +    }
 +}
 +
-+/* stdout/stderr into /data/xemu/xemu.log: QEMU and xemu report everything there */
++/* stdout/stderr into /data/xemu/xemu.log: QEMU and xemu report everything there. Not
++ * freopen: OpenOrbis' calls dup3, an ENOSYS stub, and then closes the stream. */
 +static void redirect_output(void)
 +{
-+    if (freopen(XEMU_DATA "/xemu.log", "w", stderr) != NULL) {
-+        setvbuf(stderr, NULL, _IOLBF, 0);
-+        dup2(fileno(stderr), fileno(stdout));
++    int fd = open(XEMU_DATA "/xemu.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
++    if (fd < 0) {
++        return;
 +    }
++    dup2(fd, STDERR_FILENO);
++    dup2(fd, STDOUT_FILENO);
++    close(fd);
++    setvbuf(stderr, NULL, _IONBF, 0);
++    setvbuf(stdout, NULL, _IOLBF, 0);
++}
++
++/* QEMU leaves on fatal errors with exit(): the reason is in xemu.log, the fact here */
++static void trace_exit(void)
++{
++    ps4_boot_trace(qatomic_read(&qemu_exiting) ? "exit (emulator shut down)"
++                                               : "exit() called: see xemu.log");
 +}
 +
 +/* The first file in /data/xemu/bios whose size matches, for a setting left empty */
@@ -2329,6 +2373,7 @@ index 0000000000..512cf47ae5
 +    mkdir(XEMU_DATA "/hdd", 0777);
 +    mkdir(XEMU_DATA "/games", 0777);
 +    redirect_output();
++    atexit(trace_exit);
 +    setlocale(LC_NUMERIC, "C");
 +
 +    trace("xemu-ps4 %s (%s %s) starting", xemu_version, xemu_commit, xemu_date);
@@ -2342,8 +2387,21 @@ index 0000000000..512cf47ae5
 +    xemu_settings_save();
 +    atexit(xemu_settings_save);
 +
-+    if (!SDL_Init(SDL_INIT_AUDIO | SDL_INIT_GAMEPAD | SDL_INIT_EVENTS)) {
-+        trace("SDL_Init: %s", SDL_GetError());
++    /* One subsystem at a time: SDL_Init stops at the first that fails. No PS4 audio driver in
++     * SDL yet: the dummy one keeps xemu's audio streams working, silently. */
++    SDL_SetHint(SDL_HINT_AUDIO_DRIVER, "dummy");
++    static const struct {
++        SDL_InitFlags flag;
++        const char *name;
++    } subsystems[] = {
++        { SDL_INIT_EVENTS, "events" },
++        { SDL_INIT_GAMEPAD, "gamepad" },
++        { SDL_INIT_AUDIO, "audio" },
++    };
++    for (size_t i = 0; i < ARRAY_SIZE(subsystems); i++) {
++        if (!SDL_InitSubSystem(subsystems[i].flag)) {
++            trace("SDL %s: %s", subsystems[i].name, SDL_GetError());
++        }
 +    }
 +
 +    /* QEMU parses no command line here: the machine comes from xemu.toml (system/vl.c) */
