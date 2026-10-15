@@ -186,6 +186,60 @@ index fc52f609eb..e0fd91eb26 100644
  subdir('glsl')
  subdir('vk')
  specific_ss.add(nv2a_vsh_cpu)
+diff --git a/hw/xbox/nv2a/pgraph/vk/buffer.c b/hw/xbox/nv2a/pgraph/vk/buffer.c
+index d87c875aa4..084cbd929d 100644
+--- a/hw/xbox/nv2a/pgraph/vk/buffer.c
++++ b/hw/xbox/nv2a/pgraph/vk/buffer.c
+@@ -60,6 +60,22 @@ void pgraph_vk_init_buffers(NV2AState *d)
+         .flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT
+     };
+ 
++#ifdef __PS4__
++    /*
++     * The PS4's GPU memory is physical (4.5 GiB of direct memory, no overcommit), and these
++     * are rings sized for desktop drivers (~4.8 GB). Smaller rings flush more often; each
++     * still holds the largest single request: a 4096x4096 surface at native scale (compute),
++     * one full batch (inline vertices), one batch's indices.
++     */
++    const VkDeviceSize compute_buffer_size = 4096 * 4096 * 8;
++    const int index_buffer_batches = 8;
++    const int inline_vertex_batches = 2;
++#else
++    const VkDeviceSize compute_buffer_size = (1024 * 10) * (1024 * 10) * 8;
++    const int index_buffer_batches = 100;
++    const int inline_vertex_batches = 10;
++#endif
++
+     r->storage_buffers[BUFFER_STAGING_DST] = (StorageBuffer){
+         .alloc_info = host_alloc_create_info,
+         .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+@@ -76,7 +92,7 @@ void pgraph_vk_init_buffers(NV2AState *d)
+         .alloc_info = device_alloc_create_info,
+         .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+-        .buffer_size = (1024 * 10) * (1024 * 10) * 8,
++        .buffer_size = compute_buffer_size,
+     };
+ 
+     r->storage_buffers[BUFFER_COMPUTE_SRC] = (StorageBuffer){
+@@ -90,7 +106,7 @@ void pgraph_vk_init_buffers(NV2AState *d)
+         .alloc_info = device_alloc_create_info,
+         .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                  VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+-        .buffer_size = sizeof(pg->inline_elements) * 100,
++        .buffer_size = sizeof(pg->inline_elements) * index_buffer_batches,
+     };
+ 
+     r->storage_buffers[BUFFER_INDEX_STAGING] = (StorageBuffer){
+@@ -115,7 +131,7 @@ void pgraph_vk_init_buffers(NV2AState *d)
+         .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                  VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+         .buffer_size = NV2A_VERTEXSHADER_ATTRIBUTES * NV2A_MAX_BATCH_LENGTH *
+-                       4 * sizeof(float) * 10,
++                       4 * sizeof(float) * inline_vertex_batches,
+     };
+ 
+     r->storage_buffers[BUFFER_VERTEX_INLINE_STAGING] = (StorageBuffer){
 diff --git a/hw/xbox/nv2a/pgraph/vk/command.c b/hw/xbox/nv2a/pgraph/vk/command.c
 index 0e9fc9a2ee..cee36c5ad2 100644
 --- a/hw/xbox/nv2a/pgraph/vk/command.c
@@ -2006,10 +2060,10 @@ index 0000000000..24e9598a97
 +}
 diff --git a/ui/ps4/xemu-ps4.c b/ui/ps4/xemu-ps4.c
 new file mode 100644
-index 0000000000..36539e55c6
+index 0000000000..beab1311f3
 --- /dev/null
 +++ b/ui/ps4/xemu-ps4.c
-@@ -0,0 +1,465 @@
+@@ -0,0 +1,467 @@
 +/*
 + * xemu-ps4: the PS4 frontend (replaces ui/xemu.c and its SDL window + OpenGL).
 + *
@@ -2207,6 +2261,8 @@ index 0000000000..36539e55c6
 +static void apply_ps4_settings(void)
 +{
 +    g_config.display.renderer = CONFIG_DISPLAY_RENDERER_VULKAN;
++    /* native resolution: the renderer's buffers are sized for it on the PS4 (vk/buffer.c) */
++    g_config.display.quality.surface_scale = 1;
 +    /* the welcome screen is the desktop GUI's; the PS4 home screen explains instead */
 +    g_config.general.show_welcome = false;
 +
