@@ -826,10 +826,10 @@ index 0000000000..feb4ee519d
 +))
 diff --git a/ui/ps4/ps4-frontend.h b/ui/ps4/ps4-frontend.h
 new file mode 100644
-index 0000000000..e0e11a3775
+index 0000000000..a809de019b
 --- /dev/null
 +++ b/ui/ps4/ps4-frontend.h
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,56 @@
 +/*
 + * xemu-ps4: the PS4 frontend's pieces (xemu-ps4.c, ps4-present.cc, ps4-hud.cc)
 + *
@@ -866,6 +866,8 @@ index 0000000000..e0e11a3775
 +SDL_JoystickID ps4_pad_joystick_id(void);
 +/* reads, failures, reopens and the last buttons, for the monitor */
 +void ps4_pad_stats(char *out, size_t size);
++/* the system holds the pad's input (its reads are marked intercepted) */
++bool ps4_pad_intercepted(void);
 +
 +/* xemu-ps4.c: the busiest threads over the last 5 s ("name N%, ..."), for the overlay */
 +extern char ps4_perf_threads[256];
@@ -886,10 +888,10 @@ index 0000000000..e0e11a3775
 +#endif
 diff --git a/ui/ps4/ps4-hud.cc b/ui/ps4/ps4-hud.cc
 new file mode 100644
-index 0000000000..0ab2702976
+index 0000000000..363aeca42c
 --- /dev/null
 +++ b/ui/ps4/ps4-hud.cc
-@@ -0,0 +1,178 @@
+@@ -0,0 +1,182 @@
 +/*
 + * xemu-ps4: the HUD drawn over the emulated picture (ImGui): notifications and error messages
 + * (xemu-notifications.h, which the desktop's xui implements), and what is missing before a
@@ -996,6 +998,10 @@ index 0000000000..0ab2702976
 +                     ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing |
 +                     ImGuiWindowFlags_NoInputs);
 +    ImGui::Text("Game %.1f FPS   Display %.0f FPS", gameFps, displayFps);
++    if (ps4_pad_intercepted()) {
++        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f),
++                           "Controller input held by the PS4 system");
++    }
 +    if (ps4_perf_threads[0] != '\0') {
 +        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "%s", ps4_perf_threads);
 +    }
@@ -1070,10 +1076,10 @@ index 0000000000..0ab2702976
 +}
 diff --git a/ui/ps4/ps4-pad.c b/ui/ps4/ps4-pad.c
 new file mode 100644
-index 0000000000..04de3496fa
+index 0000000000..4690883f0f
 --- /dev/null
 +++ b/ui/ps4/ps4-pad.c
-@@ -0,0 +1,184 @@
+@@ -0,0 +1,214 @@
 +/*
 + * xemu-ps4: the DualShock 4 as an SDL gamepad. SDL has no PS4 joystick driver; its virtual
 + * gamepad stands in, fed from ScePad each time SDL updates its joysticks, so xemu-input.c binds,
@@ -1252,11 +1258,41 @@ index 0000000000..04de3496fa
 +    return pad.id;
 +}
 +
++/* sceSystemServiceGetStatus's result (Sony's SceSystemServiceStatus; OpenOrbis declares the
++ * function without it) */
++typedef struct PS4SystemStatus {
++    int32_t event_count;
++    bool system_ui_overlaid;
++    bool in_background;
++    bool cpu_mode7_normal;
++    bool live_streaming;
++    bool out_of_vr_area;
++    uint8_t reserved[125];
++} PS4SystemStatus;
++int sceSystemServiceGetStatus(PS4SystemStatus *status);
++
++/* The pad's reads are marked "intercepted" (bit 31): the system has the input (its UI is over
++ * the app, the app is in the background, ...) and reports no buttons to us */
++#define PS4_PAD_INTERCEPTED 0x80000000u
++
++bool ps4_pad_intercepted(void)
++{
++    return (pad.last_buttons & PS4_PAD_INTERCEPTED) != 0;
++}
++
 +void ps4_pad_stats(char *out, size_t size)
 +{
++    PS4SystemStatus status;
++    memset(&status, 0, sizeof(status));
++    int r = sceSystemServiceGetStatus(&status);
 +    snprintf(out, size, "pad: %u reads, %u failed (last %x), %u disconnected, %u reopens, "
-+             "buttons %x", pad.reads, pad.failures, (unsigned)pad.last_error, pad.disconnected,
-+             pad.reopens, pad.last_buttons);
++             "buttons %x%s | system: %s%s%s (%x, %d events)", pad.reads, pad.failures,
++             (unsigned)pad.last_error, pad.disconnected, pad.reopens, pad.last_buttons,
++             ps4_pad_intercepted() ? " INTERCEPTED" : "",
++             status.system_ui_overlaid ? "UI overlaid " : "",
++             status.in_background ? "in background " : "",
++             !status.system_ui_overlaid && !status.in_background ? "foreground" : "",
++             (unsigned)r, status.event_count);
 +}
 diff --git a/ui/ps4/ps4-present.cc b/ui/ps4/ps4-present.cc
 new file mode 100644
@@ -2435,10 +2471,10 @@ index 0000000000..24e9598a97
 +}
 diff --git a/ui/ps4/xemu-ps4.c b/ui/ps4/xemu-ps4.c
 new file mode 100644
-index 0000000000..cc2551fbe4
+index 0000000000..c0b4dfb038
 --- /dev/null
 +++ b/ui/ps4/xemu-ps4.c
-@@ -0,0 +1,746 @@
+@@ -0,0 +1,759 @@
 +/*
 + * xemu-ps4: the PS4 frontend (replaces ui/xemu.c and its SDL window + OpenGL).
 + *
@@ -2489,6 +2525,7 @@ index 0000000000..cc2551fbe4
 +#include <locale.h>
 +#include <orbis/Sysmodule.h>
 +#include <orbis/libkernel.h>
++#include <orbis/SystemService.h>
 +
 +void ps4_boot_trace(const char *line);  /* port/ps4_crashlog.cpp */
 +void tcg_register_init_ctx(void);       /* tcg.c */
@@ -2855,9 +2892,10 @@ index 0000000000..cc2551fbe4
 + */
 +void ps4_thread_started(const char *name)
 +{
-+    static const char *const sampled[] = { "ALL CPUs/TCG", "nv2a.pfifo_thread",
-+                                           "mcpx.apu_thread", "qemu_main" };
-+    bool sample = false;
++    static const char *const sampled[] = { "nv2a.pfifo_thread", "mcpx.apu_thread",
++                                           "qemu_main" };
++    /* the emulated CPU: "CPU 0/TCG" (multi-threaded TCG) or "ALL CPUs/TCG" */
++    bool sample = profiling && g_str_has_suffix(name, "/TCG");
 +    for (size_t i = 0; i < ARRAY_SIZE(sampled); i++) {
 +        sample |= profiling && strcmp(name, sampled[i]) == 0;
 +    }
@@ -3048,6 +3086,17 @@ index 0000000000..cc2551fbe4
 +    ps4_present_frame(have_display);
 +    if (fetch) {
 +        nv2a_release_framebuffer_surface();
++    }
++
++    /* The system keeps the controller's input while its boot splash counts as shown (the pad's
++     * reads come back "intercepted"): hide it once there is a picture of ours, and say so.
++     * (ps4-wsi.cc also hides it at the first flip, without checking.) */
++    static int splash_tries;
++    if (splash_tries < 3 && (splash_tries == 0 || ps4_pad_intercepted())) {
++        int r = sceSystemServiceHideSplashScreen();
++        trace("splash screen hidden (%x)%s", (unsigned)r,
++              ps4_pad_intercepted() ? ", pad still intercepted" : "");
++        splash_tries++;
 +    }
 +}
 +
