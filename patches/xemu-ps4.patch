@@ -826,10 +826,10 @@ index 0000000000..feb4ee519d
 +))
 diff --git a/ui/ps4/ps4-frontend.h b/ui/ps4/ps4-frontend.h
 new file mode 100644
-index 0000000000..6fdbc1e896
+index 0000000000..8b6dd02a6e
 --- /dev/null
 +++ b/ui/ps4/ps4-frontend.h
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,52 @@
 +/*
 + * xemu-ps4: the PS4 frontend's pieces (xemu-ps4.c, ps4-present.cc, ps4-hud.cc)
 + *
@@ -862,6 +862,8 @@ index 0000000000..6fdbc1e896
 +
 +/* ps4-pad.c: the DualShock 4 as an SDL virtual gamepad (after SDL's gamepad subsystem) */
 +void ps4_pad_init(void);
++/* its SDL joystick id (0 if it couldn't be set up) */
++SDL_JoystickID ps4_pad_joystick_id(void);
 +
 +/* xemu-ps4.c: the busiest threads over the last 5 s ("name N%, ..."), for the overlay */
 +extern char ps4_perf_threads[256];
@@ -1066,10 +1068,10 @@ index 0000000000..0ab2702976
 +}
 diff --git a/ui/ps4/ps4-pad.c b/ui/ps4/ps4-pad.c
 new file mode 100644
-index 0000000000..b5a9c6b1e1
+index 0000000000..183f590c8b
 --- /dev/null
 +++ b/ui/ps4/ps4-pad.c
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,150 @@
 +/*
 + * xemu-ps4: the DualShock 4 as an SDL gamepad. SDL has no PS4 joystick driver; its virtual
 + * gamepad stands in, fed from ScePad each time SDL updates its joysticks, so xemu-input.c binds,
@@ -1210,9 +1212,15 @@ index 0000000000..b5a9c6b1e1
 +    }
 +    /* the gamepad layer opens it for xemu-input; this keeps the virtual device's state */
 +    pad.joystick = SDL_OpenJoystick(pad.id);
-+    snprintf(line, sizeof(line), "pad: DualShock 4 of user %x (handle %d) as SDL gamepad %u",
-+             user, pad.handle, (unsigned)pad.id);
++    snprintf(line, sizeof(line),
++             "pad: DualShock 4 of user %x (handle %d) as SDL joystick %u, gamepad: %s",
++             user, pad.handle, (unsigned)pad.id, SDL_IsGamepad(pad.id) ? "yes" : "NO");
 +    ps4_boot_trace(line);
++}
++
++SDL_JoystickID ps4_pad_joystick_id(void)
++{
++    return pad.id;
 +}
 diff --git a/ui/ps4/ps4-present.cc b/ui/ps4/ps4-present.cc
 new file mode 100644
@@ -2391,10 +2399,10 @@ index 0000000000..24e9598a97
 +}
 diff --git a/ui/ps4/xemu-ps4.c b/ui/ps4/xemu-ps4.c
 new file mode 100644
-index 0000000000..0c27a4a849
+index 0000000000..f1404b20b3
 --- /dev/null
 +++ b/ui/ps4/xemu-ps4.c
-@@ -0,0 +1,649 @@
+@@ -0,0 +1,709 @@
 +/*
 + * xemu-ps4: the PS4 frontend (replaces ui/xemu.c and its SDL window + OpenGL).
 + *
@@ -2859,16 +2867,76 @@ index 0000000000..0c27a4a849
 +    return NULL;
 +}
 +
++/*
++ * The DualShock 4 on Xbox port 1. xemu-input binds a gamepad when SDL reports it added; in
++ * v00.10 that never showed in the log. If the pad isn't among xemu's controllers a second
++ * after start, hand xemu-input the "added" event; if port 1 holds the keyboard (no use on the
++ * PS4), the pad takes it.
++ */
++static void ensure_pad_bound(void)
++{
++    static int64_t start_ns;
++    static bool done;
++    const SDL_JoystickID id = ps4_pad_joystick_id();
++    const int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    if (done || id == 0) {
++        return;
++    }
++    if (start_ns == 0) {
++        start_ns = now;
++    }
++    if (now - start_ns < NANOSECONDS_PER_SECOND) {
++        return;
++    }
++    done = true;
++
++    ControllerState *con = NULL, *iter;
++    QTAILQ_FOREACH (iter, &available_controllers, entry) {
++        if (iter->type == INPUT_DEVICE_SDL_GAMEPAD && iter->sdl_joystick_id == id) {
++            con = iter;
++        }
++    }
++    if (con == NULL) {
++        trace("pad: not among xemu's controllers after 1 s: adding it");
++        SDL_Event added = { 0 };
++        added.type = SDL_EVENT_GAMEPAD_ADDED;
++        added.gdevice.which = id;
++        xemu_input_process_sdl_events(&added);
++        QTAILQ_FOREACH (iter, &available_controllers, entry) {
++            if (iter->type == INPUT_DEVICE_SDL_GAMEPAD && iter->sdl_joystick_id == id) {
++                con = iter;
++            }
++        }
++    }
++    if (con == NULL) {
++        trace("pad: xemu couldn't open it as a gamepad (%s)", SDL_GetError());
++        return;
++    }
++    ControllerState *port1 = xemu_input_get_bound(0);
++    if (con->bound < 0 && (port1 == NULL || port1->type == INPUT_DEVICE_SDL_KEYBOARD)) {
++        xemu_input_bind(0, con, 1);
++    }
++    trace("pad: '%s' on Xbox port %d", con->name ? con->name : "?", con->bound + 1);
++}
++
 +static void poll_events(void)
 +{
 +    SDL_Event ev;
++    static int logged;
 +    while (SDL_PollEvent(&ev)) {
++        if (logged < 16 && ev.type >= SDL_EVENT_JOYSTICK_AXIS_MOTION &&
++            ev.type < SDL_EVENT_FINGER_DOWN && ev.type != SDL_EVENT_JOYSTICK_AXIS_MOTION &&
++            ev.type != SDL_EVENT_GAMEPAD_AXIS_MOTION) {
++            trace("SDL event 0x%x (device %u)", ev.type, (unsigned)ev.jdevice.which);
++            logged++;
++        }
 +        xemu_main_loop_lock();
 +        ps4_hud_process_sdl_event(&ev);
 +        xemu_input_process_sdl_events(&ev);
 +        xemu_main_loop_unlock();
 +    }
 +    xemu_main_loop_lock();
++    ensure_pad_bound();
 +    xemu_input_update_controllers();
 +    xemu_main_loop_unlock();
 +}
