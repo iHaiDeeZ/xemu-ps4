@@ -722,6 +722,13 @@ void* startOnAppCores(void* raw) {
 }
 }  // namespace
 
+// From CEMUPS4: the GPU submission thread of its RADV winsys (port/mesa/ac_ps4_drm.c) calls
+// this to run above the default priority (256 highest .. 767 lowest, 700 default).
+extern "C" int scePthreadSetprio(void* thread, int prio);
+extern "C" void ps4_boost_thread() {
+    scePthreadSetprio(scePthreadSelf(), 650);
+}
+
 int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (*start)(void*), void* arg) {
     // the stack: at least kMinThreadStack
     pthread_attr_t local;

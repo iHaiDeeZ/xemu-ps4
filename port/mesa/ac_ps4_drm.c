@@ -28,8 +28,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <emmintrin.h>
 
 /* libkernel (declared here rather than through the OpenOrbis headers, which clash with Mesa's). */
 int sceKernelAllocateDirectMemory(off_t search_start, off_t search_end, size_t len, size_t align,
@@ -106,6 +108,7 @@ struct amdgpu_bo {
    bool tail_mapped;   /* the overflow tail is mapped after the buffer (see PS4_TAIL) */
    bool tail_reported;
    bool gpu_ro; /* mapped GPU read-only (command buffers) */
+   bool write_combined; /* garlic memory (VRAM); else CPU-cached onion */
 };
 
 struct amdgpu_va {
@@ -221,6 +224,9 @@ static void ps4_scan_writes(ac_drm_device *dev, uint32_t *ib, unsigned num_dw, u
 struct ps4_deferred;
 static void ps4_defer(ac_drm_device *dev, struct ps4_deferred d);
 static void ps4_run_deferred(ac_drm_device *dev);
+static void ps4_run_deferred_ex(ac_drm_device *dev, uint64_t keep);
+static void ps4_note_released(uint32_t handle, uint64_t va, uint64_t size, uint64_t seq);
+#define PS4_QUARANTINE_BYTES (96ull << 20)
 static int ps4_do_unmap(ac_drm_device *dev, struct amdgpu_bo *b, uint32_t bo_handle, uint64_t addr,
                         uint64_t size);
 static void ps4_do_free(ac_drm_device *dev, struct amdgpu_bo *b);
@@ -239,12 +245,27 @@ ps4_log(const char *fmt, ...)
    va_end(args);
    fputs(line, stderr);
    sceKernelDebugOutText(0, line);
-   /* Also straight to a file: the app may not route stderr anywhere. */
+   /* Also straight to a file: the app may not route stderr anywhere. Opened once: without braces
+    * here every line opened (and truncated) the file again and never closed it, ~one descriptor
+    * per 7 s in Tekken Tag Tournament 2 until the PS4's ~250 open file limit stopped the game's own
+    * file loads (Crema 1.71-1.77). */
    static int fd = -2;
-   if (fd == -2)
-      fd = open("/data/DolphinPS4/radv-ps4.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
-   if (fd >= 0)
-      write(fd, line, strlen(line));
+   int current = __atomic_load_n(&fd, __ATOMIC_ACQUIRE);
+   if (current == -2) {
+      mkdir("/data/Crema/gpu", 0777);
+      int opened = open("/data/Crema/gpu/radv-ps4.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+      int expected = -2;
+      if (__atomic_compare_exchange_n(&fd, &expected, opened, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+         current = opened;
+      } else {
+         /* another thread opened it first */
+         if (opened >= 0)
+            close(opened);
+         current = expected;
+      }
+   }
+   if (current >= 0)
+      write(current, line, strlen(line));
 }
 
 #undef fprintf
@@ -274,6 +295,24 @@ ps4_completed(ac_drm_device *dev)
 }
 
 /* Waits until submission `seq` has finished; returns false on timeout. */
+static void ps4_progress(const char *fmt, ...);
+
+/* Writes a range's lines back from the CPU caches and drops them (clflush works through any
+ * mapping: the caches are physically tagged). Direct memory changes hands between CPU-cached
+ * buffers (onion: GTT, and the emulator's own memory) and write-combined ones (garlic: VRAM), and
+ * a dirty line left from the cached owner can be written back over what is written through the
+ * new write-combined mapping. Donkey Kong Country: Tropical Freeze (1.83): Mesa's new geometry
+ * ring table (VRAM) took the memory of the old one (GTT), got the old ring addresses back, and the
+ * GPU wrote to the freed ring - a GPU page fault that ends the app. */
+static void
+ps4_flush_cpu_cache(const void *addr, uint64_t size)
+{
+   _mm_mfence();
+   for (uintptr_t p = (uintptr_t)addr & ~(uintptr_t)63; p < (uintptr_t)addr + size; p += 64)
+      _mm_clflush((const void *)p);
+   _mm_mfence();
+}
+
 /* GPU addresses are CPU addresses: the IB parser can follow chained IBs directly. */
 static void
 ps4_record(ac_drm_device *dev, char what, struct amdgpu_bo *b, uint64_t va, uint64_t size)
@@ -285,6 +324,12 @@ ps4_record(ac_drm_device *dev, char what, struct amdgpu_bo *b, uint64_t va, uint
    e->size = size;
    e->phys = b ? b->phys : -1;
    e->seq = dev->last_seq;
+   /* Also to the flight recorder (when on): a GPU page fault kills the app before anything can
+    * be asked, so the buffers mapped at the faulting address are looked up there afterwards
+    * (Donkey Kong Country: Tropical Freeze, 1.82: a GPU write to an unmapped page). */
+   ps4_progress("%c bo %u va %#llx size %#llx heap %#x seq %llu\n", what, e->handle,
+                (unsigned long long)va, (unsigned long long)size, b ? b->heap : 0,
+                (unsigned long long)dev->last_seq);
 }
 
 /* Which live buffer maps `va`, and what happened recently around it. */
@@ -412,7 +457,7 @@ ps4_walk_ib(ac_drm_device *dev, FILE *f, const uint32_t *ib, unsigned num_dw, in
 }
 
 /* Writes the command buffers of the first submission the GPU hasn't finished, decoded by Mesa's
- * IB parser, to /data/DolphinPS4/gpu-hang.txt (once). */
+ * IB parser, to /data/Crema/gpu/gpu-hang.txt (once). */
 static void
 ps4_report_hang(ac_drm_device *dev, uint64_t waited_seq)
 {
@@ -421,10 +466,10 @@ ps4_report_hang(ac_drm_device *dev, uint64_t waited_seq)
    dev->hang_reported = true;
    const uint64_t completed = ps4_completed(dev);
    ps4_log("radv/ps4: GPU hang? waiting for %llu, completed %llu, submitted %llu - writing "
-           "/data/DolphinPS4/gpu-hang.txt\n",
+           "/data/Crema/gpu/gpu-hang.txt\n",
            (unsigned long long)waited_seq, (unsigned long long)completed,
            (unsigned long long)dev->last_seq);
-   FILE *f = fopen("/data/DolphinPS4/gpu-hang.txt", "w");
+   FILE *f = fopen("/data/Crema/gpu/gpu-hang.txt", "w");
    if (!f)
       return;
    fprintf(f, "waiting for %llu, GPU completed %llu, submitted %llu\n\n",
@@ -469,6 +514,33 @@ ps4_report_hang(ac_drm_device *dev, uint64_t waited_seq)
    ps4_log("radv/ps4: hang report written\n");
 }
 
+/* Crema: how the CPU waits for the GPU, every 5 s in the boot trace (waits per second, their
+ * average length, and how many sleeps ended by the 1 ms timeout instead of the interrupt). */
+void ps4_boot_trace(const char *stage);
+static struct {
+   uint64_t waits, wait_ns, sleeps, timeouts, since_ns;
+} s_wait_stats;
+
+static void
+ps4_wait_stats_report(int64_t now)
+{
+   if (!s_wait_stats.since_ns) {
+      s_wait_stats.since_ns = now;
+      return;
+   }
+   const int64_t span = now - (int64_t)s_wait_stats.since_ns;
+   if (span < 5000000000ll)
+      return;
+   char line[200];
+   snprintf(line, sizeof(line), "gpu waits: %.0f/s, average %.0f us, %.0f%% of the time; %llu sleeps, %llu ended by the 1 ms timeout",
+            s_wait_stats.waits * 1e9 / span, s_wait_stats.waits ? s_wait_stats.wait_ns / 1e3 / s_wait_stats.waits : 0.0,
+            s_wait_stats.wait_ns * 100.0 / span, (unsigned long long)s_wait_stats.sleeps,
+            (unsigned long long)s_wait_stats.timeouts);
+   ps4_boot_trace(line);
+   s_wait_stats.waits = s_wait_stats.wait_ns = s_wait_stats.sleeps = s_wait_stats.timeouts = 0;
+   s_wait_stats.since_ns = now;
+}
+
 /* Waits for the next GPU end-of-pipe interrupt (any submission's fence write), at most 1 ms. */
 static void
 ps4_sleep(ac_drm_device *dev)
@@ -478,6 +550,9 @@ ps4_sleep(ac_drm_device *dev)
       int count = 0;
       unsigned timeout = 1000;
       sceKernelWaitEqueue(dev->eop_queue, events, 8, &count, &timeout);
+      s_wait_stats.sleeps++;
+      if (count <= 0)
+         s_wait_stats.timeouts++;
    } else {
       sceKernelUsleep(50);
    }
@@ -500,6 +575,12 @@ ps4_wait_seq(ac_drm_device *dev, uint64_t seq, int64_t abs_timeout_ns)
       }
       if (++spins > 64)
          ps4_sleep(dev);
+   }
+   if (spins) {
+      const int64_t end = os_time_get_nano();
+      s_wait_stats.waits++;
+      s_wait_stats.wait_ns += end - start;
+      ps4_wait_stats_report(end);
    }
    return true;
 }
@@ -544,7 +625,7 @@ ps4_load_gnm(ac_drm_device *dev)
  *    there (+0 valid, +0x90 protection fault timestamp, ...). Its pointer is GnmDriver data
  *    +0x10508 (firmware 12.00: sceGnmIsCoredumpValid at +0x690 reads it).
  *  - sceKernelAddGpuExceptionEvent(eq, udata): kevent filter -20 on GPU exceptions.
- * Everything is written to /data/DolphinPS4/gpu-fault.txt, with the recent submissions and every
+ * Everything is written to /data/Crema/gpu/gpu-fault.txt, with the recent submissions and every
  * live buffer, so a fault address can be mapped to its buffer.
  */
 int sceKernelGetModuleList(int *handles, size_t num, size_t *actual);
@@ -601,7 +682,7 @@ static int
 ps4_coredump_handler(void *arg)
 {
    (void)arg;
-   FILE *f = fopen("/data/DolphinPS4/gpu-fault.txt", "w");
+   FILE *f = fopen("/data/Crema/gpu/gpu-fault.txt", "w");
    if (f) {
       fprintf(f, "==== core dump handler (the system is killing the app)\n");
       ps4_dump_state(f, ps4_fault_dev);
@@ -618,7 +699,7 @@ ps4_gpu_exception_thread(void *eq)
       int n = 0;
       if (sceKernelWaitEqueue(eq, ev, 4, &n, NULL) || n <= 0)
          continue;
-      FILE *f = fopen("/data/DolphinPS4/gpu-fault.txt", "a");
+      FILE *f = fopen("/data/Crema/gpu/gpu-fault.txt", "a");
       for (int i = 0; i < n; i++) {
          ps4_log("radv/ps4: GPU EXCEPTION event: ident %#llx filter/flags/fflags %#llx data %#llx "
                  "udata %#llx\n", (unsigned long long)ev[i][0], (unsigned long long)ev[i][1],
@@ -656,9 +737,9 @@ ps4_find_symbol(const char *name)
  * Flight recorder (with RADV_PS4_TRACE, ps4.ini radv_trace=on). Nothing reports a GPU fault on a
  * retail PS4 - the app is just gone, and its core dump is encrypted - but data written with
  * write() sits in the kernel's page cache and survives the kill. So:
- *  - /data/DolphinPS4/flight/ib-N.bin: the complete command stream of each submission (every IB,
+ *  - /data/Crema/gpu/flight/ib-N.bin: the complete command stream of each submission (every IB,
  *    chained and nested), in a ring of 8 files (N = submission % 8);
- *  - /data/DolphinPS4/flight/progress.log: submissions, the GPU's completed submission, and the
+ *  - /data/Crema/gpu/flight/progress.log: submissions, the GPU's completed submission, and the
  *    last RADV trace id (written by the CP as it reaches each draw), every millisecond it changes.
  * After a kill, the last trace id locates the draw the GPU died on inside the saved stream.
  */
@@ -768,18 +849,138 @@ ps4_record_ib(int fd, const uint32_t *ib, unsigned num_dw, uint64_t seq, unsigne
 }
 
 static void
+ps4_record_submission(void *const *dcb, const uint32_t *dcb_sizes, unsigned num_ibs, uint64_t seq);
+
+/* The memory the submission's shader user data point to (descriptor sets, push constants, vertex
+ * buffer tables), and the 32-bit pointers inside that, one level more: mem-N.bin, records of
+ * 'DMEM' va length + bytes, to find offline what a draw reaches through descriptors (Donkey Kong
+ * Country: Tropical Freeze: a GPU write into a freed 720p image no command referred to). */
+struct ps4_mem_record {
+   uint32_t magic;
+   uint32_t length;
+   uint64_t va;
+};
+
+static void
+ps4_collect_user_data(uint32_t *ib, unsigned num_dw, uint32_t *values, unsigned *count, unsigned max,
+                      int depth)
+{
+   for (unsigned link = 0; link < 256 && num_dw; link++) {
+      if (!ps4_mapped(ib, num_dw * 4ull))
+         return;
+      uint32_t *next = NULL;
+      unsigned next_dw = 0;
+      for (unsigned i = 0; i < num_dw;) {
+         const uint32_t h = ib[i];
+         if (h >> 30 == 2) {
+            i++;
+            continue;
+         }
+         if (h >> 30 != 3)
+            return;
+         const unsigned op = (h >> 8) & 0xff;
+         const unsigned body = ((h >> 16) & 0x3fff) + 1;
+         if (i + 1 + body > num_dw)
+            return;
+         uint32_t *b = &ib[i + 1];
+         if (op == 0x76) { /* SET_SH_REG: values in pairs (a 64-bit address) and alone */
+            for (unsigned k = 1; k < body && *count + 2 <= max; k++) {
+               values[(*count)++] = b[k];
+               values[(*count)++] = k + 1 < body ? b[k + 1] : 0;
+            }
+         } else if (op == 0x3f && body >= 3) {
+            uint32_t *t = (uint32_t *)(uintptr_t)(b[0] | ((uint64_t)(b[1] & 0xffff) << 32));
+            if (b[2] & (1u << 20)) {
+               next = t;
+               next_dw = b[2] & 0xfffff;
+            } else if (depth < 3) {
+               ps4_collect_user_data(t, b[2] & 0xfffff, values, count, max, depth + 1);
+            }
+         }
+         if (next)
+            break;
+         i += 1 + body;
+      }
+      if (!next)
+         return;
+      ib = next;
+      num_dw = next_dw;
+   }
+}
+
+static ac_drm_device *ps4_last_device;
+static struct amdgpu_bo *ps4_bo_at(ac_drm_device *dev, uint64_t va);
+
+static void
+ps4_record_descriptors(void *const *dcb, const uint32_t *dcb_sizes, unsigned num_ibs, uint64_t seq)
+{
+   ac_drm_device *dev = ps4_last_device;
+   if (!dev || ps4_progress_fd < 0)
+      return;
+   static uint32_t values[8192];
+   unsigned count = 0;
+   for (unsigned i = 0; i < num_ibs; i++)
+      ps4_collect_user_data(dcb[i], dcb_sizes[i] / 4, values, &count, ARRAY_SIZE(values), 0);
+   char path[64];
+   snprintf(path, sizeof(path), "/data/Crema/gpu/flight/mem-%u.bin", (unsigned)(seq % 8));
+   const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+   if (fd < 0)
+      return;
+   /* pointers to dump: 64-bit pairs and 32-bit window pointers; then 32-bit pointers inside */
+   static uint64_t done[2048];
+   unsigned num_done = 0;
+   static uint64_t queue[4096];
+   unsigned queued = 0;
+   for (unsigned i = 0; i + 1 < count && queued + 2 <= ARRAY_SIZE(queue); i += 2) {
+      queue[queued++] = values[i] | ((uint64_t)(values[i + 1] & 0xffff) << 32);
+      if (dev->va32_start)
+         queue[queued++] = dev->va32_start + values[i];
+   }
+   const unsigned first_level = queued;
+   simple_mtx_lock(&dev->lock);
+   for (unsigned q = 0; q < queued && num_done < ARRAY_SIZE(done); q++) {
+      const uint64_t ptr = queue[q] & ~3ull;
+      if (ptr < 0x4000000000ull || ptr >= PS4_GPU_VA_LIMIT)
+         continue;
+      bool seen = false;
+      for (unsigned d = 0; d < num_done && !seen; d++)
+         seen = done[d] == ptr;
+      if (seen)
+         continue;
+      struct amdgpu_bo *t = ps4_bo_at(dev, ptr);
+      if (!t)
+         continue;
+      done[num_done++] = ptr;
+      const uint32_t length = (uint32_t)MIN2(t->last_va + t->size - ptr, 1024);
+      const struct ps4_mem_record r = {0x4d454d44, length, ptr};
+      write(fd, &r, sizeof(r));
+      write(fd, (const void *)(uintptr_t)ptr, length);
+      /* one level more: 32-bit pointers inside (only from the first level) */
+      if (q < first_level && dev->va32_start) {
+         const uint32_t *d = (const uint32_t *)(uintptr_t)ptr;
+         for (unsigned j = 0; j < length / 4 && queued < ARRAY_SIZE(queue); j++)
+            if (d[j] && d[j] % 4 == 0)
+               queue[queued++] = dev->va32_start + d[j];
+      }
+   }
+   simple_mtx_unlock(&dev->lock);
+   close(fd);
+}
+
+static void
 ps4_record_submission(void *const *dcb, const uint32_t *dcb_sizes, unsigned num_ibs, uint64_t seq)
 {
    if (ps4_progress_fd < 0)
       return;
    char path[64];
-   snprintf(path, sizeof(path), "/data/DolphinPS4/flight/ib-%u.bin", (unsigned)(seq % 8));
+   snprintf(path, sizeof(path), "/data/Crema/gpu/flight/ib-%u.bin", (unsigned)(seq % 8));
    const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
    if (fd < 0)
       return;
    for (unsigned i = 0; i < num_ibs; i++)
       ps4_record_ib(fd, dcb[i], dcb_sizes[i] / 4, seq, i, 0);
    close(fd);
+   ps4_record_descriptors(dcb, dcb_sizes, num_ibs, seq);
    ps4_progress("submit %llu -> ib-%u.bin\n", (unsigned long long)seq, (unsigned)(seq % 8));
 }
 
@@ -788,13 +989,14 @@ ps4_start_flight_recorder(ac_drm_device *dev)
 {
    if (!getenv("RADV_PS4_TRACE") || ps4_progress_fd >= 0)
       return;
-   mkdir("/data/DolphinPS4/flight", 0777);
-   ps4_progress_fd = open("/data/DolphinPS4/flight/progress.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+   mkdir("/data/Crema/gpu", 0777);
+   mkdir("/data/Crema/gpu/flight", 0777);
+   ps4_progress_fd = open("/data/Crema/gpu/flight/progress.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
    if (ps4_progress_fd < 0)
       return;
    pthread_t t;
    pthread_create(&t, NULL, ps4_progress_thread, dev);
-   ps4_log("radv/ps4: flight recorder on (/data/DolphinPS4/flight)\n");
+   ps4_log("radv/ps4: flight recorder on (/data/Crema/gpu/flight)\n");
 }
 
 static void
@@ -1047,6 +1249,7 @@ ac_drm_bo_alloc(ac_drm_device *dev, struct amdgpu_bo_alloc_request *req, ac_drm_
                           (req->flags & AMDGPU_GEM_CREATE_CPU_GTT_USWC)
                        ? PS4_WC_GARLIC
                        : PS4_WB_ONION;
+   bo->write_combined = type == PS4_WC_GARLIC;
    const uint64_t align = MAX2(util_next_power_of_two64(MAX2(req->phys_alignment, 1)), PS4_PAGE);
    simple_mtx_lock(&dev->lock);
    ps4_run_deferred(dev);
@@ -1054,13 +1257,22 @@ ac_drm_bo_alloc(ac_drm_device *dev, struct amdgpu_bo_alloc_request *req, ac_drm_
    int r = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), bo->size + PS4_TAIL,
                                          align, type, &bo->phys);
    if (r && dev->num_deferred) {
-      /* Memory still waiting for the GPU: let it finish, then try again. */
+      /* Memory still waiting for the GPU (or in quarantine): let it finish, then release the
+       * quarantine's older half at a time (the newest stays protected longest) until it fits. */
       ps4_wait_seq(dev, dev->last_seq, INT64_MAX);
-      simple_mtx_lock(&dev->lock);
-      ps4_run_deferred(dev);
-      simple_mtx_unlock(&dev->lock);
-      r = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), bo->size + PS4_TAIL,
-                                        align, type, &bo->phys);
+      for (uint64_t keep = PS4_QUARANTINE_BYTES / 2; r; keep /= 2) {
+         simple_mtx_lock(&dev->lock);
+         ps4_run_deferred_ex(dev, keep);
+         simple_mtx_unlock(&dev->lock);
+         r = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), bo->size + PS4_TAIL,
+                                           align, type, &bo->phys);
+         if (!keep)
+            break;
+      }
+      static unsigned logged;
+      if (logged++ < 8)
+         ps4_log("radv/ps4: %llu bytes did not fit: quarantine released (%s)\n",
+                 (unsigned long long)bo->size, r ? "still no memory" : "fits now");
    }
    if (r) {
       ps4_log("radv/ps4: allocating %llu bytes of direct memory failed (%#x)\n",
@@ -1164,6 +1376,8 @@ ac_drm_bo_cpu_map(ac_drm_device *dev, ac_drm_bo bo, void **cpu)
          ps4_log("radv/ps4: cpu map of bo %u failed\n", b->handle);
          return -ENOMEM;
       }
+      if (b->write_combined)
+         ps4_flush_cpu_cache(addr, b->size);
       b->cpu = addr;
       b->cpu_owned = true;
    }
@@ -1319,6 +1533,9 @@ ps4_va_op(ac_drm_device *dev, uint32_t bo_handle, uint64_t offset, uint64_t size
       int r = sceKernelMapDirectMemory(&a, map_size,
                                        PS4_PROT_CPU_RW | (gpu_ro ? PS4_PROT_GPU_READ : PS4_PROT_GPU_RW),
                                        PS4_MAP_FIXED, b->phys + offset, PS4_PAGE);
+      /* write-combined memory: no stale cached lines of an earlier owner (see ps4_flush_cpu_cache) */
+      if (!r && whole && a == (void *)(uintptr_t)addr && b->write_combined)
+         ps4_flush_cpu_cache(a, map_size);
       if (!r && whole && a == (void *)(uintptr_t)addr) {
          memset((uint8_t *)a + size, 0, PS4_TAIL);
          b->tail_mapped = true;
@@ -1365,6 +1582,8 @@ ps4_do_unmap(ac_drm_device *dev, struct amdgpu_bo *b, uint32_t bo_handle, uint64
       }
       if (b && b->cpu == (void *)(uintptr_t)addr && !b->cpu_owned)
          b->cpu = NULL;
+      if (b && addr == b->last_va)
+         ps4_note_released(b->handle, addr, b->size, dev->last_seq);
       ps4_record(dev, 'U', b, addr, size);
       /* Unmap explicitly, then put the reservation back so the window stays ours. (Reserving
        * over a live mapping isn't guaranteed to replace it; a mapping left behind would vanish
@@ -1412,6 +1631,8 @@ ac_drm_bo_va_op_raw2(ac_drm_device *dev, uint32_t bo_handle, uint64_t offset, ui
    return r;
 }
 
+static void ps4_va_release_held(unsigned w, uint64_t keep);
+
 int
 ac_drm_va_range_alloc(ac_drm_device *dev, enum amdgpu_gpu_va_range va_range_type, uint64_t size,
                       uint64_t va_base_alignment, uint64_t va_base_required,
@@ -1424,11 +1645,15 @@ ac_drm_va_range_alloc(ac_drm_device *dev, enum amdgpu_gpu_va_range va_range_type
 
    simple_mtx_lock(&ps4_va_lock);
    uint64_t addr = 0;
-   if (va_base_required) {
-      if (util_vma_heap_alloc_addr(heap, va_base_required, size))
-         addr = va_base_required;
-   } else {
-      addr = util_vma_heap_alloc(heap, size, align);
+   for (int attempt = 0; attempt < 2 && !addr; attempt++) {
+      if (attempt) /* no room: the held-back ranges of this window go back first (ps4_do_va_free) */
+         ps4_va_release_held(heap == &dev->va32_heap ? 1 : 0, 0);
+      if (va_base_required) {
+         if (util_vma_heap_alloc_addr(heap, va_base_required, size))
+            addr = va_base_required;
+      } else {
+         addr = util_vma_heap_alloc(heap, size, align);
+      }
    }
    simple_mtx_unlock(&ps4_va_lock);
    if (!addr) {
@@ -1459,29 +1684,92 @@ ac_drm_va_range_free(amdgpu_va_handle va)
    return 0;
 }
 
+/* Released address ranges are held back before they are handed out again: up to PS4_VA_HOLD of
+ * the 16 GiB window and PS4_VA32_HOLD of the 32-bit one, oldest returned first (all of a window's
+ * when an allocation finds no room). Cemu uses resources through stale descriptors; when the
+ * range had already gone to a new buffer, a stale write landed in that buffer - Donkey Kong
+ * Country: Tropical Freeze (1.87) wrote into a command buffer (mapped GPU read-only: a fault that
+ * ends the app) at the address of a 720p image freed shortly before. Held back, the range stays a
+ * hole, which ps4_user_data_stale recognises (and the draw is skipped). */
+#define PS4_VA_HOLD (4ull << 30)
+#define PS4_VA32_HOLD (512ull << 20)
+static struct {
+   amdgpu_va_handle *items;
+   unsigned head, count, cap;
+   uint64_t bytes;
+} ps4_va_held[2]; /* 0: the 16 GiB window, 1: the 32-bit one */
+
+/* Returns the oldest held ranges of a window until at most `keep` bytes are held (ps4_va_lock held). */
+static void
+ps4_va_release_held(unsigned w, uint64_t keep)
+{
+   while (ps4_va_held[w].count && ps4_va_held[w].bytes > keep) {
+      amdgpu_va_handle va = ps4_va_held[w].items[ps4_va_held[w].head];
+      ps4_va_held[w].head = (ps4_va_held[w].head + 1) % ps4_va_held[w].cap;
+      ps4_va_held[w].count--;
+      ps4_va_held[w].bytes -= va->size;
+      util_vma_heap_free(va->heap, va->addr, va->size);
+      free(va);
+   }
+}
+
 /* A deferred address range free. */
 static void
 ps4_do_va_free(amdgpu_va_handle va)
 {
    simple_mtx_lock(&ps4_va_lock);
-   util_vma_heap_free(va->heap, va->addr, va->size);
+   const unsigned w = va->heap == &va->dev->va32_heap ? 1 : 0;
+   if (ps4_va_held[w].count == ps4_va_held[w].cap) {
+      /* grow the ring, keeping its order */
+      const unsigned cap = MAX2(ps4_va_held[w].cap * 2, 256);
+      amdgpu_va_handle *items = malloc(cap * sizeof(*items));
+      if (!items) {
+         util_vma_heap_free(va->heap, va->addr, va->size);
+         simple_mtx_unlock(&ps4_va_lock);
+         free(va);
+         return;
+      }
+      for (unsigned i = 0; i < ps4_va_held[w].count; i++)
+         items[i] = ps4_va_held[w].items[(ps4_va_held[w].head + i) % ps4_va_held[w].cap];
+      free(ps4_va_held[w].items);
+      ps4_va_held[w].items = items;
+      ps4_va_held[w].head = 0;
+      ps4_va_held[w].cap = cap;
+   }
+   ps4_va_held[w].items[(ps4_va_held[w].head + ps4_va_held[w].count) % ps4_va_held[w].cap] = va;
+   ps4_va_held[w].count++;
+   ps4_va_held[w].bytes += va->size;
+   ps4_va_release_held(w, w ? PS4_VA32_HOLD : PS4_VA_HOLD);
    simple_mtx_unlock(&ps4_va_lock);
-   free(va);
 }
 
 /* Runs the deferred operations whose submissions have completed, in order. dev->lock held. */
 static void
-ps4_run_deferred(ac_drm_device *dev)
+ps4_run_deferred_ex(ac_drm_device *dev, uint64_t keep)
 {
+   /* Quarantine: buffers the GPU is done with stay mapped (and their address ranges allocated)
+    * until more than PS4_QUARANTINE_BYTES wait, oldest released first. On Linux and Windows a
+    * GPU write to an unmapped address is dropped and the app goes on; on the PS4 it is a GPU page
+    * fault that ends the app, and Cemu does write through stale descriptors: Donkey Kong Country:
+    * Tropical Freeze (1.84) wrote into a buffer freed ~500 submissions (8 s) earlier at its save
+    * menu. Such writes now land in the old buffer's own memory. (A shared "sink" page can't back
+    * the freed ranges instead: the PS4 maps direct memory only once.) */
    const uint64_t done = ps4_completed(dev);
+   unsigned ready = 0;
+   uint64_t held = 0;
+   for (; ready < dev->num_deferred && dev->deferred[ready].seq <= done; ready++)
+      if (dev->deferred[ready].op == 'F' && dev->deferred[ready].bo)
+         held += dev->deferred[ready].bo->size;
    unsigned n = 0;
-   for (; n < dev->num_deferred && dev->deferred[n].seq <= done; n++) {
+   for (; n < ready && held > keep; n++) {
       struct ps4_deferred *d = &dev->deferred[n];
       switch (d->op) {
       case 'U':
          ps4_do_unmap(dev, d->bo, d->handle, d->addr, d->size);
          break;
       case 'F':
+         if (d->bo)
+            held -= MIN2(held, d->bo->size);
          ps4_do_free(dev, d->bo);
          break;
       case 'V':
@@ -1493,6 +1781,12 @@ ps4_run_deferred(ac_drm_device *dev)
       dev->num_deferred -= n;
       memmove(dev->deferred, dev->deferred + n, dev->num_deferred * sizeof(*dev->deferred));
    }
+}
+
+static void
+ps4_run_deferred(ac_drm_device *dev)
+{
+   ps4_run_deferred_ex(dev, PS4_QUARANTINE_BYTES);
 }
 
 static void
@@ -1709,6 +2003,230 @@ ps4_bo_at(ac_drm_device *dev, uint64_t va)
    return NULL;
 }
 
+/* Released buffers' address ranges (whole-buffer unmaps), for finding stale descriptors. */
+struct ps4_released_range {
+   uint64_t va, size, seq;
+   uint32_t handle;
+};
+static struct ps4_released_range ps4_released[4096];
+static unsigned ps4_num_released;
+
+static void
+ps4_note_released(uint32_t handle, uint64_t va, uint64_t size, uint64_t seq)
+{
+   ps4_released[ps4_num_released++ % ARRAY_SIZE(ps4_released)] =
+      (struct ps4_released_range){va, size, seq, handle};
+}
+
+/* A released range holding va that no live buffer covers now (dev->lock held). */
+static const struct ps4_released_range *
+ps4_stale_at(ac_drm_device *dev, uint64_t va)
+{
+   if (va < 0x4000000000ull || va >= PS4_GPU_VA_LIMIT)
+      return NULL;
+   const struct ps4_released_range *hit = NULL;
+   const unsigned n = MIN2(ps4_num_released, ARRAY_SIZE(ps4_released));
+   for (unsigned i = 0; i < n && !hit; i++)
+      if (va >= ps4_released[i].va && va < ps4_released[i].va + ps4_released[i].size)
+         hit = &ps4_released[i];
+   if (!hit)
+      return NULL;
+   for (unsigned h = 1; h < dev->num_bos; h++) {
+      struct amdgpu_bo *b = dev->bos[h];
+      if (b && b->cpu && !b->cpu_owned && va >= b->last_va && va < b->last_va + b->size + PS4_TAIL)
+         return NULL;
+   }
+   return hit;
+}
+
+/* Do a shader stage's user data (or the descriptors they point to) hold the address of a released
+ * buffer? Cemu uses resources through stale descriptors: on PC the GPU drops writes to freed
+ * memory, on the PS4 they are a GPU page fault that ends the app (Donkey Kong Country: Tropical
+ * Freeze, 1.86: a write into a 720p image released 5 submissions earlier, through a descriptor
+ * set). User data hold 64-bit addresses and 32-bit descriptor set pointers (into the 32-bit
+ * window); buffer descriptors carry an address in dwords 0-1 (48 bits), image descriptors as
+ * address >> 8 (40 bits). A descriptor set is read again only after a release or every 64
+ * submissions. dev->lock held. */
+static struct {
+   uint64_t ptr, epoch;
+} ps4_checked_sets[2048];
+
+static const struct ps4_released_range *
+ps4_set_stale(ac_drm_device *dev, uint64_t ptr, uint64_t epoch, uint64_t *addr)
+{
+   if (ptr % 4)
+      return NULL;
+   /* the buffer found last time first: a frame's descriptor sets mostly lie in one upload buffer */
+   static uint32_t last_handle;
+   struct amdgpu_bo *t = last_handle < dev->num_bos ? dev->bos[last_handle] : NULL;
+   if (!t || !t->cpu || t->cpu_owned || ptr < t->last_va || ptr >= t->last_va + t->size) {
+      t = ps4_bo_at(dev, ptr);
+      if (!t)
+         return NULL;
+      last_handle = t->handle;
+   }
+   const unsigned slot = (unsigned)((ptr >> 4) * 2654435761u) % ARRAY_SIZE(ps4_checked_sets);
+   if (ps4_checked_sets[slot].ptr == ptr && ps4_checked_sets[slot].epoch == epoch)
+      return NULL;
+   const uint64_t avail = t->last_va + t->size - ptr;
+   const unsigned n = (unsigned)MIN2(avail / 4, 256);
+   const uint32_t *d = (const uint32_t *)(uintptr_t)ptr;
+   for (unsigned j = 0; j + 1 < n; j++) {
+      const uint64_t buffer = d[j] | ((uint64_t)(d[j + 1] & 0xffff) << 32);
+      const uint64_t image = (d[j] | ((uint64_t)(d[j + 1] & 0xff) << 32)) << 8;
+      const struct ps4_released_range *r;
+      if ((r = ps4_stale_at(dev, buffer))) {
+         *addr = buffer;
+         return r;
+      }
+      if ((r = ps4_stale_at(dev, image))) {
+         *addr = image;
+         return r;
+      }
+   }
+   ps4_checked_sets[slot].ptr = ptr;
+   ps4_checked_sets[slot].epoch = epoch;
+   return NULL;
+}
+
+static const struct ps4_released_range *
+ps4_user_data_stale(ac_drm_device *dev, const uint32_t *ud, unsigned count, uint64_t seq,
+                    unsigned *where, uint64_t *addr)
+{
+   const uint64_t epoch = ps4_num_released + (seq >> 6) * 0x100000000ull;
+   for (unsigned u = 0; u < count; u++) {
+      if (!ud[u])
+         continue;
+      const struct ps4_released_range *r;
+      if (u + 1 < count) {
+         const uint64_t ptr = ud[u] | ((uint64_t)(ud[u + 1] & 0xffff) << 32);
+         if ((r = ps4_stale_at(dev, ptr))) {
+            *where = u;
+            *addr = ptr;
+            return r;
+         }
+         if (ptr >= 0x4000000000ull && ptr < PS4_GPU_VA_LIMIT && (r = ps4_set_stale(dev, ptr, epoch, addr))) {
+            *where = 0x100 + u;
+            return r;
+         }
+      }
+      if (dev->va32_start && ud[u] < PS4_VA32_SIZE &&
+          (r = ps4_set_stale(dev, dev->va32_start + ud[u], epoch, addr))) {
+         *where = 0x200 + u;
+         return r;
+      }
+   }
+   return NULL;
+}
+
+/* The dispatches and draws of a submission, checked with ps4_user_data_stale (always on: only packet headers
+ * are walked, and nothing is read until a buffer has been released). dev->lock held. */
+static void
+ps4_scan_dispatches(ac_drm_device *dev, uint32_t *ib, unsigned num_dw, uint64_t seq, int depth)
+{
+   /* user data: COMPUTE_USER_DATA_0..15, and SPI_SHADER_USER_DATA_{PS,VS,GS,ES,HS,LS}_0..15 */
+   static const unsigned stage_reg[6] = {0x0c, 0x4c, 0x8c, 0xcc, 0x10c, 0x14c};
+   static const char *const stage_name[6] = {"PS", "VS", "GS", "ES", "HS", "LS"};
+   uint32_t compute_ud[16] = {0};
+   uint32_t gfx_ud[6][16] = {{0}};
+   for (unsigned link = 0; link < 256 && num_dw; link++) {
+      if (!ps4_mapped(ib, num_dw * 4ull))
+         return;
+      uint32_t *next = NULL;
+      unsigned next_dw = 0;
+      for (unsigned i = 0; i < num_dw;) {
+         const uint32_t h = ib[i];
+         if (h >> 30 == 2) {
+            i++;
+            continue;
+         }
+         if (h >> 30 != 3)
+            return;
+         const unsigned op = (h >> 8) & 0xff;
+         const unsigned body = ((h >> 16) & 0x3fff) + 1;
+         if (i + 1 + body > num_dw)
+            return;
+         uint32_t *b = &ib[i + 1];
+         switch (op) {
+         case 0x76: /* SET_SH_REG: COMPUTE_USER_DATA_n is SH register 0x240 + n */
+            for (unsigned k = 1; k < body; k++) {
+               const unsigned reg = b[0] + k - 1;
+               if (reg >= 0x240 && reg < 0x250)
+                  compute_ud[reg - 0x240] = b[k];
+               for (unsigned s = 0; s < 6; s++)
+                  if (reg >= stage_reg[s] && reg < stage_reg[s] + 16)
+                     gfx_ud[s][reg - stage_reg[s]] = b[k];
+            }
+            break;
+         case 0x27: /* DRAW_INDEX_2 */
+         case 0x2d: /* DRAW_INDEX_AUTO */
+         case 0x35: /* DRAW_INDEX_OFFSET_2 */
+         case 0x24: /* DRAW_INDIRECT */
+         case 0x25: /* DRAW_INDEX_INDIRECT */
+         case 0x2c: /* DRAW_INDIRECT_MULTI */
+         case 0x38: /* DRAW_INDEX_INDIRECT_MULTI */
+            for (unsigned s = 0; s < 6; s++) {
+               unsigned where = 0;
+               uint64_t addr = 0;
+               const struct ps4_released_range *r = ps4_user_data_stale(dev, gfx_ud[s], 16, seq, &where, &addr);
+               if (!r)
+                  continue;
+               static unsigned logged;
+               if (logged++ < 40)
+                  ps4_log("radv/ps4: submission %llu: %p: draw (%s stage) uses %#llx (user data %#x) "
+                          "inside bo %u released at submission %llu (va %#llx, %#llx bytes) - skipped\n",
+                          (unsigned long long)seq, (void *)&ib[i], stage_name[s], (unsigned long long)addr,
+                          where, r->handle, (unsigned long long)r->seq, (unsigned long long)r->va,
+                          (unsigned long long)r->size);
+               ps4_progress("stale draw: submission %llu %s addr %#llx bo %u\n", (unsigned long long)seq,
+                            stage_name[s], (unsigned long long)addr, r->handle);
+               ib[i] = (h & ~0xff00u) | (0x10u << 8); /* NOP, same length */
+               break;
+            }
+            break;
+         case 0x15: /* DISPATCH_DIRECT */
+         case 0x16: { /* DISPATCH_INDIRECT */
+            unsigned where = 0;
+            uint64_t addr = 0;
+            const struct ps4_released_range *r = ps4_user_data_stale(dev, compute_ud, 16, seq, &where, &addr);
+            if (r) {
+               static unsigned logged;
+               if (logged++ < 40)
+                  ps4_log("radv/ps4: submission %llu: %p: dispatch uses %#llx (user data %#x) inside "
+                          "bo %u released at submission %llu (va %#llx, %#llx bytes) - skipped\n",
+                          (unsigned long long)seq, (void *)&ib[i], (unsigned long long)addr, where,
+                          r->handle, (unsigned long long)r->seq, (unsigned long long)r->va,
+                          (unsigned long long)r->size);
+               ps4_progress("stale dispatch: submission %llu addr %#llx bo %u\n",
+                            (unsigned long long)seq, (unsigned long long)addr, r->handle);
+               ib[i] = (h & ~0xff00u) | (0x10u << 8); /* NOP, same length */
+            }
+            break;
+         }
+         case 0x3f: { /* INDIRECT_BUFFER */
+            uint32_t *t = (uint32_t *)(uintptr_t)(b[0] | ((uint64_t)(b[1] & 0xffff) << 32));
+            if (body >= 3 && (b[2] & (1u << 20))) {
+               next = t;
+               next_dw = b[2] & 0xfffff;
+            } else if (body >= 3 && depth < 3) {
+               ps4_scan_dispatches(dev, t, b[2] & 0xfffff, seq, depth + 1);
+            }
+            break;
+         }
+         default:
+            break;
+         }
+         if (next)
+            break;
+         i += 1 + body;
+      }
+      if (!next)
+         return;
+      ib = next;
+      num_dw = next_dw;
+   }
+}
+
 /* Every command that writes memory (WRITE_DATA, EVENT_WRITE(_EOP), COPY_DATA, DMA_DATA,
  * ATOMIC_MEM) is checked before the GPU sees it: a destination inside a command buffer (mapped
  * GPU read-only, so the write would fault and the system kill the app) or outside every buffer is
@@ -1885,7 +2403,7 @@ ps4_check_ib_chain(ac_drm_device *dev, const uint32_t *ib, unsigned num_dw, uint
          if (ps4_corrupt_reports++ < 4) {
             ps4_log("radv/ps4: submission %llu: IB %p (%u dwords) %s (first dword %#x) - see "
                     "ib-corrupt.txt\n", (unsigned long long)seq, (void *)ib, num_dw, problem, ib[0]);
-            FILE *f = fopen("/data/DolphinPS4/ib-corrupt.txt", "a");
+            FILE *f = fopen("/data/Crema/gpu/ib-corrupt.txt", "a");
             if (f) {
                fprintf(f, "==== submission %llu, chain link %u: IB %p, %u dwords, %s\n",
                        (unsigned long long)seq, link, (void *)ib, num_dw, problem);
@@ -1933,7 +2451,13 @@ static uint32_t *
 ps4_emit_eop(uint32_t *cs, uint64_t addr, uint64_t value, bool interrupt)
 {
    *cs++ = 0xC0044700; /* PKT3(EVENT_WRITE_EOP, 4) */
-   *cs++ = 0x14 | (5 << 8) | (1 << 16) | (1 << 17); /* CACHE_FLUSH_AND_INV_TS_EVENT, TCL1, TC */
+   /* CACHE_FLUSH_AND_INV_TS_EVENT with TC_WB (bit 15), TCL1 and TC actions: Gnm's "write back and
+    * invalidate L1 and L2". Without the write-back bit the fence could signal while shader stores
+    * still sat dirty in the L2; the buffer was then released (unmapped) and the L2 wrote them back
+    * later - a GPU page fault that ends the app (Donkey Kong Country: Tropical Freeze, 1.82-1.89:
+    * a 720p image written through a storage buffer, released right after its submission
+    * "finished"). */
+   *cs++ = 0x14 | (5 << 8) | (1 << 15) | (1 << 16) | (1 << 17);
    *cs++ = (uint32_t)addr;
    /* DATA_SEL: 64-bit value; INT_SEL 2: interrupt once the write is confirmed. */
    *cs++ = ((addr >> 32) & 0xffff) | (2u << 29) | (interrupt ? 2u << 24 : 0);
@@ -1979,6 +2503,108 @@ ac_ps4_get_gpu_busy(uint64_t *busy_ticks, uint64_t *span_ticks)
    *busy_ticks = dev->ts_busy;
    *span_ticks = dev->ts_span_last - dev->ts_span_first;
    simple_mtx_unlock(&dev->lock);
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * Submission thread. sceGnmSubmitCommandBuffers is a kernel call of ~0.4 ms, and the GPU thread
+ * of an emulator submits ~230 times a second (Breath of the Wild: ~9% of Cemu's GPU thread). The
+ * submitting thread now only queues the job - the sequence number is taken and the fence written
+ * into the IB as before - and this thread makes the calls, in queue order (jobs are queued under
+ * dev->lock, in sequence order; the thread never takes dev->lock). Flips go through the same
+ * queue, so a flip can't overtake the work queued before it. A failed submission writes its
+ * fence from the CPU, so nothing waits for it forever.
+ */
+#define PS4_JOB_RING 128
+struct ps4_job {
+   ac_drm_device *dev;
+   bool flip;
+   unsigned num_ibs;
+   void *dcb[68];
+   uint32_t dcb_sizes[68];
+   uint64_t seq;
+   int video;
+   unsigned buffer, mode;
+   int64_t arg;
+};
+static struct ps4_job ps4_jobs[PS4_JOB_RING];
+static unsigned ps4_job_head, ps4_job_tail; /* next to run, next to fill */
+static pthread_mutex_t ps4_job_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t ps4_job_ready = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t ps4_job_space = PTHREAD_COND_INITIALIZER;
+static bool ps4_job_thread_started;
+void ps4_boost_thread(void); /* port/ps4_runtime.cpp: above the default priority */
+
+static void
+ps4_fence_at_least(ac_drm_device *dev, uint64_t seq)
+{
+   volatile uint64_t *f = (volatile uint64_t *)dev->fence;
+   uint64_t cur = *f;
+   while (cur < seq && !__atomic_compare_exchange_n(f, &cur, seq, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+      ;
+}
+
+static void *
+ps4_submit_thread(void *arg)
+{
+   (void)arg;
+   ps4_boost_thread();
+   int64_t last_done = 0;
+   for (;;) {
+      pthread_mutex_lock(&ps4_job_lock);
+      while (ps4_job_head == ps4_job_tail)
+         pthread_cond_wait(&ps4_job_ready, &ps4_job_lock);
+      struct ps4_job *job = &ps4_jobs[ps4_job_head % PS4_JOB_RING];
+      pthread_mutex_unlock(&ps4_job_lock);
+
+      ac_drm_device *dev = job->dev;
+      void *ccb[68] = {0};
+      uint32_t ccb_sizes[68] = {0};
+      int r;
+      if (job->flip)
+         r = dev->submit_and_flip(job->num_ibs, job->dcb, job->dcb_sizes, ccb, ccb_sizes, job->video,
+                                  job->buffer, job->mode, job->arg);
+      else
+         r = dev->submit(job->num_ibs, job->dcb, job->dcb_sizes, ccb, ccb_sizes);
+      /* sceGnmSubmitDone tells the system the frame's work is in (it wants one at least every
+       * frame): after every flip, else at most every 4 ms */
+      const int64_t now = os_time_get_nano();
+      if (job->flip || now - last_done >= 4000000) {
+         dev->submit_done();
+         last_done = now;
+      }
+      if (r) {
+         static unsigned logged;
+         if (logged++ < 8)
+            ps4_log("radv/ps4: %s of submission %llu = %#x (its fence written by the CPU)\n",
+                    job->flip ? "sceGnmSubmitAndFlipCommandBuffers" : "sceGnmSubmitCommandBuffers",
+                    (unsigned long long)job->seq, r);
+         ps4_fence_at_least(dev, job->seq);
+      }
+
+      pthread_mutex_lock(&ps4_job_lock);
+      ps4_job_head++;
+      pthread_cond_signal(&ps4_job_space);
+      pthread_mutex_unlock(&ps4_job_lock);
+   }
+   return NULL;
+}
+
+/* Queues a submission (called with dev->lock held, in sequence order). */
+static void
+ps4_queue_job(const struct ps4_job *job)
+{
+   pthread_mutex_lock(&ps4_job_lock);
+   if (!ps4_job_thread_started) {
+      pthread_t thread;
+      pthread_create(&thread, NULL, ps4_submit_thread, NULL);
+      ps4_job_thread_started = true;
+   }
+   while (ps4_job_tail - ps4_job_head >= PS4_JOB_RING)
+      pthread_cond_wait(&ps4_job_space, &ps4_job_lock);
+   ps4_jobs[ps4_job_tail % PS4_JOB_RING] = *job;
+   ps4_job_tail++;
+   pthread_cond_signal(&ps4_job_ready);
+   pthread_mutex_unlock(&ps4_job_lock);
 }
 
 int
@@ -2066,6 +2692,15 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
          ps4_scan_writes(dev, dcb[i], dcb_sizes[i] / 4, dev->last_seq + 1, 0);
       simple_mtx_unlock(&dev->lock);
    }
+   /* Draws and dispatches through descriptors of released buffers: skipped (see
+    * ps4_user_data_stale; RADV_PS4_SCAN=1 too: it never fired, the faults it hunted were the
+    * fence's missing L2 write-back, ps4_emit_eop). */
+   if (num_ibs && scan && ps4_num_released) {
+      simple_mtx_lock(&dev->lock);
+      for (unsigned i = 0; i < num_ibs; i++)
+         ps4_scan_dispatches(dev, dcb[i], dcb_sizes[i] / 4, dev->last_seq + 1, 0);
+      simple_mtx_unlock(&dev->lock);
+   }
 
    simple_mtx_lock(&dev->lock);
    /* The fence IB slot for the next sequence number must be free (its previous user finished).
@@ -2131,8 +2766,18 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
       dcb_sizes[0] = (uint32_t)(t - ts_ib) * 4;
       submit_ibs++;
    }
-   int r = dev->submit(submit_ibs, dcb, dcb_sizes, ccb, ccb_sizes);
-   dev->submit_done();
+   /* the submission thread makes the calls (ps4_queue_job) */
+   struct ps4_job job;
+   job.dev = dev;
+   job.flip = false;
+   job.num_ibs = submit_ibs;
+   memcpy(job.dcb, dcb, sizeof(dcb[0]) * submit_ibs);
+   memcpy(job.dcb_sizes, dcb_sizes, sizeof(dcb_sizes[0]) * submit_ibs);
+   job.seq = seq;
+   ps4_queue_job(&job);
+   (void)ccb;
+   (void)ccb_sizes;
+   const int r = 0;
    if (seq <= 40 || seq % 1000 == 0)
       ps4_log("radv/ps4: submit %llu: %u IBs (first %p, %u bytes) = %#x, GPU completed %llu, "
               "%llu memory writes checked, %u disabled\n",
@@ -2145,7 +2790,12 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
       return -EINVAL;
    }
 
-   if (seq % 256 == 0)
+   /* Only with the flight recorder (Crema: GPU Fault Recorder): the tails are in write-combined
+    * memory, slow to read, and every live buffer's took ~2% of Breath of the Wild's GPU thread. */
+   static int trace_tails = -1;
+   if (trace_tails < 0)
+      trace_tails = getenv("RADV_PS4_TRACE") != NULL;
+   if (trace_tails && seq % 256 == 0)
       ps4_scan_tails(dev);
    ps4_run_deferred(dev);
 
@@ -2205,8 +2855,22 @@ ac_ps4_submit_flip(int video, unsigned buffer, unsigned mode, int64_t arg)
    uint32_t dcb_size[1] = {(uint32_t)(cs - ib) * 4};
    void *ccb[1] = {NULL};
    uint32_t ccb_size[1] = {0};
-   const int r = dev->submit_and_flip(1, dcb, dcb_size, ccb, ccb_size, video, buffer, mode, arg);
-   dev->submit_done();
+   /* behind the queued submissions (ps4_queue_job) */
+   struct ps4_job job;
+   job.dev = dev;
+   job.flip = true;
+   job.num_ibs = 1;
+   job.dcb[0] = dcb[0];
+   job.dcb_sizes[0] = dcb_size[0];
+   job.seq = seq;
+   job.video = video;
+   job.buffer = buffer;
+   job.mode = mode;
+   job.arg = arg;
+   ps4_queue_job(&job);
+   (void)ccb;
+   (void)ccb_size;
+   const int r = 0;
    if (r) {
       dev->last_seq--;
       static unsigned logged;
