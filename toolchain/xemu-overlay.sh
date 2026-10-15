@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # xemu additions to the sysroot (idempotent): declarations for libps4compat.a in the libc overlay
-# and the library itself (toolchain/runtime/ps4_compat.c), also installed as libresolv.a.
+# and the library itself (toolchain/runtime/ps4_compat.c), also installed as libresolv.a; libc.a
+# without its ENOSYS stubs (toolchain/trim-libc.py).
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 source "$HERE/env.sh"
@@ -62,6 +63,9 @@ cat > "$O/dirent.h" <<'H'
 #endif
 H
 
+# whole headers OpenOrbis lacks (toolchain/overlay)
+cp -r "$HERE/overlay/." "$O/"
+
 OBJ="$PSB/build/runtime"
 mkdir -p "$OBJ"
 "$HERE/bin/ps4-cc" -std=gnu11 -O2 -Wall -c "$HERE/runtime/ps4_compat.c" -o "$OBJ/ps4_compat.o"
@@ -69,4 +73,8 @@ for lib in libps4compat.a libresolv.a; do
     rm -f "$PS4_SYSROOT/lib/$lib"
     "$PS4_AR" rcs "$PS4_SYSROOT/lib/$lib" "$OBJ/ps4_compat.o"
 done
+# libc.a without the ENOSYS stubs, ahead of OpenOrbis' on the wrappers' library path
+python3 "$HERE/trim-libc.py" "$OPENORBIS/lib/libc.a" "$PS4_SYSROOT/lib/libc.a" "$PS4_SYSROOT/lib/libc_enosys.a"
+# the link script for PS4 programs (toolchain/bin/ps4-cc)
+python3 "$HERE/make-link-script.py" "$OPENORBIS/link.x" "$PS4_SYSROOT/lib/ps4-link.x" >/dev/null
 echo "xemu overlay installed"

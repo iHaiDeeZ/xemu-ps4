@@ -1,0 +1,2579 @@
+diff --git a/block.c b/block.c
+index 14ed7f1487..6923af4535 100644
+--- a/block.c
++++ b/block.c
+@@ -54,7 +54,7 @@
+ #include "qemu/rcu.h"
+ #include "block/coroutines.h"
+ 
+-#ifdef CONFIG_BSD
++#if defined(CONFIG_BSD) && !defined(__PS4__)
+ #include <sys/ioctl.h>
+ #include <sys/queue.h>
+ #if defined(HAVE_SYS_DISK_H)
+diff --git a/block/file-posix.c b/block/file-posix.c
+index 6265d2e248..0fbd8b353f 100644
+--- a/block/file-posix.c
++++ b/block/file-posix.c
+@@ -89,6 +89,14 @@
+ #if defined(CONFIG_FALLOCATE_PUNCH_HOLE) || defined(CONFIG_FALLOCATE_ZERO_RANGE)
+ #include <linux/falloc.h>
+ #endif
++#ifdef __PS4__
++/* the PS4's kernel is FreeBSD's but has none of its disk devices: plain POSIX files from here */
++#include <sys/ioctl.h>
++#undef __FreeBSD__
++#undef __FreeBSD_kernel__
++/* the C library declares it (Linux) but has none: the fallback below fails with ENOSYS */
++#define copy_file_range xemu_ps4_copy_file_range
++#endif
+ #if defined (__FreeBSD__) || defined(__FreeBSD_kernel__)
+ #include <sys/disk.h>
+ #include <sys/cdio.h>
+diff --git a/chardev/char-parallel.c b/chardev/char-parallel.c
+index 62a44b2f96..03cd2b05b0 100644
+--- a/chardev/char-parallel.c
++++ b/chardev/char-parallel.c
+@@ -29,7 +29,7 @@
+ #include "qemu/option.h"
+ #include <sys/ioctl.h>
+ 
+-#ifdef CONFIG_BSD
++#if defined(CONFIG_BSD) && !defined(__PS4__)
+ #if defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
+ #include <dev/ppbus/ppi.h>
+ #include <dev/ppbus/ppbconf.h>
+@@ -175,7 +175,7 @@ static void qemu_chr_open_pp_fd(Chardev *chr,
+ }
+ #endif /* __linux__ */
+ 
+-#if defined(__FreeBSD__) || defined(__FreeBSD_kernel__) || defined(__DragonFly__)
++#if (defined(__FreeBSD__) || defined(__FreeBSD_kernel__) || defined(__DragonFly__)) && !defined(__PS4__)
+ 
+ typedef struct {
+     Chardev parent;
+diff --git a/chardev/char-serial.c b/chardev/char-serial.c
+index 4c6ca713eb..83e4169c7e 100644
+--- a/chardev/char-serial.c
++++ b/chardev/char-serial.c
+@@ -51,9 +51,7 @@ static void qmp_chardev_open_serial(Chardev *chr,
+     win_chr_serial_init(chr, serial->device, errp);
+ }
+ 
+-#elif defined(__linux__) || defined(__sun__) || defined(__FreeBSD__)      \
+-    || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__) \
+-    || defined(__GLIBC__) || defined(__APPLE__)
++#elif defined(HAVE_CHARDEV_SERIAL) /* osdep.h: the hosts with serial ports */
+ 
+ static void tty_serial_init(int fd, int speed,
+                             int parity, int data_bits, int stop_bits)
+diff --git a/hw/xbox/mcpx/apu/dsp/dsp_jit_stub.c b/hw/xbox/mcpx/apu/dsp/dsp_jit_stub.c
+new file mode 100644
+index 0000000000..830c2adf63
+--- /dev/null
++++ b/hw/xbox/mcpx/apu/dsp/dsp_jit_stub.c
+@@ -0,0 +1,19 @@
++/*
++ * MCPX DSP emulator: the JIT engine's entry points for builds without the dsp56300 JIT library
++ * (the PS4: no prebuilt dsp56300-emu-ffi for it yet). Asking for the JIT gives the interpreter.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "dsp_internal.h"
++
++const DSPOps jit_dsp_ops;
++
++void dsp_jit_init(DSPState *dsp)
++{
++    dsp_c_init(dsp);
++}
+diff --git a/hw/xbox/mcpx/apu/dsp/meson.build b/hw/xbox/mcpx/apu/dsp/meson.build
+index 3429547e24..6ba7217141 100644
+--- a/hw/xbox/mcpx/apu/dsp/meson.build
++++ b/hw/xbox/mcpx/apu/dsp/meson.build
+@@ -1,10 +1,17 @@
+-dsp56300_emu_ffi = dependency('dsp56300-emu-ffi', fallback: ['dsp56300', 'dsp56300_dep'])
++# The dsp56300 JIT comes as a prebuilt Rust library for Linux, Windows and macOS only; on the
++# PS4 the DSP runs on the interpreter (dsp_jit_stub.c).
++if ps4
++  dsp56300_emu_ffi = not_found
++else
++  dsp56300_emu_ffi = dependency('dsp56300-emu-ffi', fallback: ['dsp56300', 'dsp56300_dep'])
++endif
+ 
+ subdir('interp')
+ 
+ libdsp = static_library(
+   'dsp',
+-  files(['dsp.c', 'dsp_c.c', 'dsp_jit.c', 'dsp_dma.c']) + genh,
++  files(['dsp.c', 'dsp_c.c', 'dsp_dma.c']) +
++    (dsp56300_emu_ffi.found() ? files('dsp_jit.c') : files('dsp_jit_stub.c')) + genh,
+   dependencies: [dsp56300_emu_ffi],
+ )
+ 
+diff --git a/hw/xbox/nv2a/nv2a_vk_ps4.h b/hw/xbox/nv2a/nv2a_vk_ps4.h
+new file mode 100644
+index 0000000000..8531287d1e
+--- /dev/null
++++ b/hw/xbox/nv2a/nv2a_vk_ps4.h
+@@ -0,0 +1,50 @@
++/*
++ * xemu-ps4: what the PS4 frontend (ui/ps4) needs from the Vulkan renderer to present on the
++ * renderer's own device: there is no OpenGL on the PS4 to hand the picture to.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ */
++
++#ifndef HW_XBOX_NV2A_NV2A_VK_PS4_H
++#define HW_XBOX_NV2A_NV2A_VK_PS4_H
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <vulkan/vulkan.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct NV2AVkDevice {
++    VkInstance instance;
++    VkPhysicalDevice physical_device;
++    VkDevice device;
++    VkQueue queue;
++    uint32_t queue_family;
++    uint32_t api_version;
++    PFN_vkGetInstanceProcAddr get_instance_proc_addr;
++} NV2AVkDevice;
++
++/* The renderer's device, once the Vulkan renderer is up (false before). */
++bool nv2a_vk_ps4_get_device(NV2AVkDevice *out);
++
++/*
++ * The emulated display, rendered and idle in SHADER_READ_ONLY_OPTIMAL layout. Valid between
++ * nv2a_get_framebuffer_surface() returning nonzero and nv2a_release_framebuffer_surface().
++ */
++bool nv2a_vk_ps4_get_display(VkImage *image, VkImageView *view, uint32_t *width,
++                             uint32_t *height);
++
++/* The renderer's queue is shared: every vkQueueSubmit/vkQueuePresentKHR holds this lock. */
++void nv2a_vk_ps4_queue_lock(void);
++void nv2a_vk_ps4_queue_unlock(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/hw/xbox/nv2a/pgraph/meson.build b/hw/xbox/nv2a/pgraph/meson.build
+index fc52f609eb..e0fd91eb26 100644
+--- a/hw/xbox/nv2a/pgraph/meson.build
++++ b/hw/xbox/nv2a/pgraph/meson.build
+@@ -12,7 +12,9 @@ if have_renderdoc
+ endif
+ subdir('thirdparty')
+ subdir('null')
++if opengl.found()
+ subdir('gl')
++endif
+ subdir('glsl')
+ subdir('vk')
+ specific_ss.add(nv2a_vsh_cpu)
+diff --git a/hw/xbox/nv2a/pgraph/vk/command.c b/hw/xbox/nv2a/pgraph/vk/command.c
+index 0e9fc9a2ee..cee36c5ad2 100644
+--- a/hw/xbox/nv2a/pgraph/vk/command.c
++++ b/hw/xbox/nv2a/pgraph/vk/command.c
+@@ -99,9 +99,11 @@ void pgraph_vk_end_single_time_commands(PGRAPHState *pg, VkCommandBuffer cmd)
+         .commandBufferCount = 1,
+         .pCommandBuffers = &cmd,
+     };
++    pgraph_vk_queue_lock();
+     VK_CHECK(vkQueueSubmit(r->queue, 1, &submit_info, VK_NULL_HANDLE));
+     nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT_AUX);
+     VK_CHECK(vkQueueWaitIdle(r->queue));
++    pgraph_vk_queue_unlock();
+ 
+     r->in_aux_command_buffer = false;
+ }
+diff --git a/hw/xbox/nv2a/pgraph/vk/display.c b/hw/xbox/nv2a/pgraph/vk/display.c
+index 6b9e5851c4..e50289b062 100644
+--- a/hw/xbox/nv2a/pgraph/vk/display.c
++++ b/hw/xbox/nv2a/pgraph/vk/display.c
+@@ -578,10 +578,10 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
+         destroy_current_display_image(pg);
+     }
+ 
+-    const GLint gl_internal_format = GL_RGBA8;
+     bool use_optimal_tiling = true;
+ 
+ #if HAVE_EXTERNAL_MEMORY
++    const GLint gl_internal_format = GL_RGBA8;
+     GLint num_tiling_types;
+     glGetInternalformativ(GL_TEXTURE_2D, gl_internal_format,
+                           GL_NUM_TILING_TYPES_EXT, 1, &num_tiling_types);
+@@ -612,11 +612,13 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
+         .format = VK_FORMAT_R8G8B8A8_UNORM,
+         .tiling = use_optimal_tiling ? VK_IMAGE_TILING_OPTIMAL : VK_IMAGE_TILING_LINEAR,
+         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+-        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
++        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++                 (HAVE_SHARED_DISPLAY_IMAGE ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0),
+         .samples = VK_SAMPLE_COUNT_1_BIT,
+         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+     };
+ 
++#if HAVE_EXTERNAL_MEMORY
+     VkExternalMemoryImageCreateInfo external_memory_image_create_info = {
+         .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+ #ifdef WIN32
+@@ -626,6 +628,7 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
+ #endif
+     };
+     image_create_info.pNext = &external_memory_image_create_info;
++#endif
+ 
+     VK_CHECK(vkCreateImage(r->device, &image_create_info, NULL, &d->image));
+ 
+@@ -641,6 +644,7 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
+                                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+     };
+ 
++#if HAVE_EXTERNAL_MEMORY
+     VkExportMemoryAllocateInfo export_memory_alloc_info = {
+         .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+         .handleTypes =
+@@ -652,6 +656,7 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
+             ,
+     };
+     alloc_info.pNext = &export_memory_alloc_info;
++#endif
+ 
+     VK_CHECK(vkAllocateMemory(r->device, &alloc_info, NULL, &d->memory));
+     VK_CHECK(vkBindImageMemory(r->device, d->image, d->memory, 0));
+diff --git a/hw/xbox/nv2a/pgraph/vk/draw.c b/hw/xbox/nv2a/pgraph/vk/draw.c
+index d78087e56b..c3d4b53866 100644
+--- a/hw/xbox/nv2a/pgraph/vk/draw.c
++++ b/hw/xbox/nv2a/pgraph/vk/draw.c
+@@ -1259,8 +1259,10 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
+         };
+         nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT);
+         vkResetFences(r->device, 1, &r->command_buffer_fence);
++        pgraph_vk_queue_lock();
+         VK_CHECK(vkQueueSubmit(r->queue, ARRAY_SIZE(submit_infos), submit_infos,
+                                r->command_buffer_fence));
++        pgraph_vk_queue_unlock();
+         r->submit_count += 1;
+ 
+         bool check_budget = false;
+diff --git a/hw/xbox/nv2a/pgraph/vk/gpuprops.c b/hw/xbox/nv2a/pgraph/vk/gpuprops.c
+index ecc8bb3852..a4befed968 100644
+--- a/hw/xbox/nv2a/pgraph/vk/gpuprops.c
++++ b/hw/xbox/nv2a/pgraph/vk/gpuprops.c
+@@ -451,8 +451,10 @@ static uint8_t *render_geom_shader_triangles(NV2AState *d, int width,
+         .pCommandBuffers = &r->command_buffer,
+     };
+ 
++    pgraph_vk_queue_lock();
+     VK_CHECK(vkQueueSubmit(r->queue, 1, &submit_info, VK_NULL_HANDLE));
+     VK_CHECK(vkQueueWaitIdle(r->queue));
++    pgraph_vk_queue_unlock();
+ 
+     void *data;
+     VK_CHECK(
+diff --git a/hw/xbox/nv2a/pgraph/vk/instance.c b/hw/xbox/nv2a/pgraph/vk/instance.c
+index edead06c0f..0e5bdb4862 100644
+--- a/hw/xbox/nv2a/pgraph/vk/instance.c
++++ b/hw/xbox/nv2a/pgraph/vk/instance.c
+@@ -32,7 +32,10 @@ static char const *const validation_layers[] = {
+ };
+ 
+ static char const *const required_device_extensions[] = {
+-#ifdef WIN32
++#if defined(__PS4__)
++    /* the frontend presents on this device (ui/ps4/ps4-wsi.cc: VideoOut) */
++    VK_KHR_SWAPCHAIN_EXTENSION_NAME,
++#elif defined(WIN32)
+     VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
+     VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
+ #else
+@@ -142,6 +145,14 @@ add_optional_instance_extension_names(PGRAPHState *pg,
+         g_config.display.vulkan.validation_layers &&
+         add_extension_if_available(available_extensions, enabled_extension_names,
+                                    VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
++
++#ifdef __PS4__
++    /* the frontend's VideoOut surface (ui/ps4/ps4-wsi.cc) */
++    add_extension_if_available(available_extensions, enabled_extension_names,
++                               VK_KHR_SURFACE_EXTENSION_NAME);
++    add_extension_if_available(available_extensions, enabled_extension_names,
++                               VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME);
++#endif
+ }
+ 
+ static bool create_instance(PGRAPHState *pg, Error **errp)
+@@ -149,11 +160,16 @@ static bool create_instance(PGRAPHState *pg, Error **errp)
+     PGRAPHVkState *r = pg->vk_renderer_state;
+     VkResult result;
+ 
++#ifdef __PS4__
++    /* RADV is linked into the program: no loader to open */
++    volkInitializeCustom(ps4_vk_get_instance_proc_addr());
++#else
+     result = volkInitialize();
+     if (result != VK_SUCCESS) {
+         error_setg(errp, "volkInitialize failed");
+         return false;
+     }
++#endif
+ 
+     uint32_t instance_version = VK_API_VERSION_1_0;
+     if (vkEnumerateInstanceVersion) {
+diff --git a/hw/xbox/nv2a/pgraph/vk/meson.build b/hw/xbox/nv2a/pgraph/vk/meson.build
+index 93ef5ca330..f4a38898af 100644
+--- a/hw/xbox/nv2a/pgraph/vk/meson.build
++++ b/hw/xbox/nv2a/pgraph/vk/meson.build
+@@ -21,5 +21,8 @@ specific_ss.add([volk, libglslang, vma, vulkan, spirv_reflect,
+ 		'vertex.c',
+ 		)
+ 	])
++if ps4
++	specific_ss.add(files('ps4.c'))
++endif
+ 
+ endif
+diff --git a/hw/xbox/nv2a/pgraph/vk/ps4.c b/hw/xbox/nv2a/pgraph/vk/ps4.c
+new file mode 100644
+index 0000000000..f96821fbe1
+--- /dev/null
++++ b/hw/xbox/nv2a/pgraph/vk/ps4.c
+@@ -0,0 +1,82 @@
++/*
++ * xemu-ps4: the Vulkan renderer's device, display image and queue for the PS4 frontend
++ * (hw/xbox/nv2a/nv2a_vk_ps4.h).
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/thread.h"
++#include "hw/xbox/nv2a/nv2a_int.h"
++#include "hw/xbox/nv2a/nv2a_vk_ps4.h"
++#include "renderer.h"
++
++static QemuMutex queue_mutex;
++
++static void __attribute__((constructor)) init_queue_mutex(void)
++{
++    qemu_mutex_init(&queue_mutex);
++}
++
++void pgraph_vk_queue_lock(void)
++{
++    qemu_mutex_lock(&queue_mutex);
++}
++
++void pgraph_vk_queue_unlock(void)
++{
++    qemu_mutex_unlock(&queue_mutex);
++}
++
++void nv2a_vk_ps4_queue_lock(void)
++{
++    pgraph_vk_queue_lock();
++}
++
++void nv2a_vk_ps4_queue_unlock(void)
++{
++    pgraph_vk_queue_unlock();
++}
++
++static PGRAPHVkState *vk_state(void)
++{
++    if (g_nv2a == NULL ||
++        g_nv2a->pgraph.renderer == NULL ||
++        g_nv2a->pgraph.renderer->type != CONFIG_DISPLAY_RENDERER_VULKAN) {
++        return NULL;
++    }
++    return qatomic_read(&g_nv2a->pgraph.vk_renderer_state);
++}
++
++bool nv2a_vk_ps4_get_device(NV2AVkDevice *out)
++{
++    PGRAPHVkState *r = vk_state();
++    if (r == NULL || r->device == VK_NULL_HANDLE || r->queue == VK_NULL_HANDLE) {
++        return false;
++    }
++    out->instance = r->instance;
++    out->physical_device = r->physical_device;
++    out->device = r->device;
++    out->queue = r->queue;
++    out->queue_family = pgraph_vk_find_queue_families(r->physical_device).queue_family;
++    out->api_version = r->vk_api_version;
++    out->get_instance_proc_addr = ps4_vk_get_instance_proc_addr();
++    return true;
++}
++
++bool nv2a_vk_ps4_get_display(VkImage *image, VkImageView *view, uint32_t *width,
++                             uint32_t *height)
++{
++    PGRAPHVkState *r = vk_state();
++    if (r == NULL || r->display.image == VK_NULL_HANDLE) {
++        return false;
++    }
++    *image = r->display.image;
++    *view = r->display.image_view;
++    *width = r->display.width;
++    *height = r->display.height;
++    return true;
++}
+diff --git a/hw/xbox/nv2a/pgraph/vk/renderer.c b/hw/xbox/nv2a/pgraph/vk/renderer.c
+index 4272bbceb6..49dc57e977 100644
+--- a/hw/xbox/nv2a/pgraph/vk/renderer.c
++++ b/hw/xbox/nv2a/pgraph/vk/renderer.c
+@@ -20,9 +20,9 @@
+ #include "hw/xbox/nv2a/nv2a_int.h"
+ #include "renderer.h"
+ 
++#if HAVE_EXTERNAL_MEMORY
+ #include "gloffscreen.h"
+ 
+-#if HAVE_EXTERNAL_MEMORY
+ static GloContext *g_gl_context;
+ #endif
+ 
+@@ -197,6 +197,15 @@ static int pgraph_vk_get_framebuffer_surface(NV2AState *d)
+     qemu_mutex_unlock(&d->pfifo.lock);
+     qemu_event_wait(&d->pgraph.sync_complete);
+     return r->display.gl_texture_id;
++#elif HAVE_SHARED_DISPLAY_IMAGE
++    /* The display image is rendered (and idle) when the sync completes; the
++     * frontend samples it until nv2a_release_framebuffer_surface (ps4.c). */
++    qemu_event_reset(&d->pgraph.sync_complete);
++    qatomic_set(&pg->sync_pending, true);
++    pfifo_kick(d);
++    qemu_mutex_unlock(&d->pfifo.lock);
++    qemu_event_wait(&d->pgraph.sync_complete);
++    return r->display.image != VK_NULL_HANDLE;
+ #else
+     qemu_mutex_unlock(&d->pfifo.lock);
+     pgraph_vk_wait_for_surface_download(surface);
+diff --git a/hw/xbox/nv2a/pgraph/vk/renderer.h b/hw/xbox/nv2a/pgraph/vk/renderer.h
+index deb8762225..52873ea96a 100644
+--- a/hw/xbox/nv2a/pgraph/vk/renderer.h
++++ b/hw/xbox/nv2a/pgraph/vk/renderer.h
+@@ -41,7 +41,22 @@
+ #include "constants.h"
+ #include "glsl.h"
+ 
++#ifdef __PS4__
++/*
++ * PS4: no OpenGL. The PS4 frontend (ui/ps4) presents the display image on this renderer's own
++ * device and queue (ps4.c), so the image is never exported.
++ */
++#define HAVE_EXTERNAL_MEMORY 0
++#define HAVE_SHARED_DISPLAY_IMAGE 1
++void pgraph_vk_queue_lock(void);
++void pgraph_vk_queue_unlock(void);
++PFN_vkGetInstanceProcAddr ps4_vk_get_instance_proc_addr(void); /* ui/ps4/ps4-wsi.cc */
++#else
+ #define HAVE_EXTERNAL_MEMORY 1
++#define HAVE_SHARED_DISPLAY_IMAGE 0
++static inline void pgraph_vk_queue_lock(void) {}
++static inline void pgraph_vk_queue_unlock(void) {}
++#endif
+ 
+ typedef struct QueueFamilyIndices {
+     int queue_family;
+@@ -286,6 +301,7 @@ typedef struct PGRAPHVkDisplayState {
+     int width, height;
+     int draw_time;
+ 
++#if HAVE_EXTERNAL_MEMORY
+     // OpenGL Interop
+ #ifdef WIN32
+     HANDLE handle;
+@@ -294,6 +310,7 @@ typedef struct PGRAPHVkDisplayState {
+ #endif
+     GLuint gl_memory_obj;
+     GLuint gl_texture_id;
++#endif
+ } PGRAPHVkDisplayState;
+ 
+ typedef struct ComputePipelineKey {
+diff --git a/include/qemu/osdep.h b/include/qemu/osdep.h
+index 4ca8ccb27c..29767da396 100644
+--- a/include/qemu/osdep.h
++++ b/include/qemu/osdep.h
+@@ -532,7 +532,7 @@ int qemu_shm_alloc(size_t size, Error **errp);
+ #ifdef _WIN32
+ #define HAVE_CHARDEV_SERIAL 1
+ #define HAVE_CHARDEV_PARALLEL 1
+-#else
++#elif !defined(__PS4__) /* no serial or parallel ports on the PS4 */
+ #if defined(__linux__) || defined(__sun__) || defined(__FreeBSD__)   \
+     || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__) \
+     || defined(__GLIBC__) || defined(__APPLE__)
+diff --git a/meson.build b/meson.build
+index 82e5f5af65..d3f0ff3580 100644
+--- a/meson.build
++++ b/meson.build
+@@ -80,6 +80,9 @@ cmake_macos_arch = host_machine.cpu() == 'aarch64' ? 'arm64' : host_machine.cpu(
+ 
+ cc = meson.get_compiler('c')
+ cxx = meson.get_compiler('cpp')
++# xemu-ps4: PlayStation 4 homebrew (OpenOrbis C library on the PS4's FreeBSD kernel): Vulkan
++# on RADV/GNM for the renderer and the display, no OpenGL, the PS4 frontend in ui/ps4
++ps4 = host_os == 'freebsd' and cc.get_define('__PS4__') != ''
+ all_languages = ['c', 'cpp']
+ if host_os == 'darwin' and \
+    add_languages('objc', required: true, native: false)
+@@ -1304,7 +1307,9 @@ endif
+ slirp = not_found
+ if not get_option('slirp').auto() or have_system
+   slirp = dependency('slirp', required: get_option('slirp'),
+-                     method: 'pkg-config')
++                     method: 'pkg-config',
++                     # ps4: one static program, no shared libraries
++                     default_options: ps4 ? ['default_library=static'] : [])
+   # slirp < 4.7 is incompatible with CFI support in QEMU.  This is because
+   # it passes function pointers within libslirp as callbacks for timers.
+   # When using a system-wide shared libslirp, the type information for the
+@@ -1882,10 +1887,10 @@ if not get_option('coreaudio').auto() or (host_os == 'darwin' and have_system)
+                          required: get_option('coreaudio'))
+ endif
+ 
+-epoxy = dependency('epoxy', required: true)
++epoxy = dependency('epoxy', required: not ps4)
+ 
+ opengl = not_found
+-if not get_option('opengl').auto() or have_system or have_vhost_user_gpu
++if not ps4 and (not get_option('opengl').auto() or have_system or have_vhost_user_gpu)
+   # FIXME: Use meson's 'gl' dep
+   if host_os == 'darwin'
+     opengl_libs=['-framework', 'OpenGL']
+@@ -2389,7 +2394,8 @@ libglslang = not_found
+ 
+ if host_os == 'windows'
+   vulkan = declare_dependency(compile_args: ['-DVK_USE_PLATFORM_WIN32_KHR'])
+-elif host_os == 'linux'
++elif host_os == 'linux' or ps4
++  # ps4: the Vulkan headers only (RADV is linked into the eboot at the end)
+   vulkan = dependency('vulkan')
+ endif
+ 
+@@ -2431,6 +2437,9 @@ endif
+ if host_os == 'windows'
+   libpcap = declare_dependency(include_directories: 'winpcap-loader/include',
+                                link_args: ['-lws2_32'])
++elif ps4
++  # no packet capture on the PS4: the network bridge (pcap backend) isn't offered
++  libpcap = not_found
+ else
+   libpcap = dependency('libpcap', method: 'pkg-config', required: true)
+ endif
+@@ -2445,10 +2454,10 @@ imgui_proj = subproject('imgui', required: true,
+                            'dx11=disabled',
+                            'dx12=disabled',
+                            'metal=disabled',
+-                           'opengl=enabled',
++                           ps4 ? 'opengl=disabled' : 'opengl=enabled',
+                            'sdl2_renderer=disabled',
+                            'sdl3_renderer=disabled',
+-                           'vulkan=disabled',
++                           'vulkan=disabled', # ps4: ui/ps4/imgui-impl-vulkan-ps4.cc
+                            'webgpu=disabled',
+                            'glfw=disabled',
+                            'sdl2=disabled',
+@@ -2892,7 +2901,7 @@ have_inotify_init1 = cc.has_header_symbol('sys/inotify.h', 'inotify_init1')
+ inotify = not_found
+ if (have_inotify_init or have_inotify_init1) and host_os == 'freebsd'
+   # libinotify-kqueue
+-  inotify = cc.find_library('inotify')
++  inotify = cc.find_library('inotify', required: not ps4)
+   if have_inotify_init
+     have_inotify_init = inotify.found()
+   endif
+diff --git a/net/meson.build b/net/meson.build
+index 804eb71f82..350adb21b7 100644
+--- a/net/meson.build
++++ b/net/meson.build
+@@ -54,7 +54,7 @@ if host_os == 'windows'
+   system_ss.add(files('capture_win_ifnames.c'))
+ elif host_os == 'linux'
+   system_ss.add(files('tap.c', 'tap-linux.c'))
+-elif host_os in bsd_oses
++elif host_os in bsd_oses and not ps4
+   system_ss.add(files('tap.c', 'tap-bsd.c'))
+ elif host_os == 'sunos'
+   system_ss.add(files('tap.c', 'tap-solaris.c'))
+@@ -62,7 +62,11 @@ else
+   system_ss.add(files('tap.c', 'tap-stub.c'))
+ endif
+ 
+-system_ss.add([libpcap, files('pcap.c')])
++if libpcap.found()
++  system_ss.add([libpcap, files('pcap.c')])
++else
++  system_ss.add(files('pcap-stub.c'))
++endif
+ 
+ if have_vhost_net_vdpa
+   system_ss.add(when: 'CONFIG_VIRTIO_NET', if_true: files('vhost-vdpa.c'), if_false: files('vhost-vdpa-stub.c'))
+diff --git a/net/pcap-stub.c b/net/pcap-stub.c
+new file mode 100644
+index 0000000000..f003d9ef5d
+--- /dev/null
++++ b/net/pcap-stub.c
+@@ -0,0 +1,18 @@
++/*
++ * QEMU libpcap network client, for hosts without libpcap (the PS4)
++ *
++ * This work is licensed under the terms of the GNU GPL, version 2 or later.
++ * See the COPYING file in the top-level directory.
++ */
++
++#include "qemu/osdep.h"
++#include "net/net.h"
++#include "clients.h"
++#include "qapi/error.h"
++
++int net_init_pcap(const Netdev *netdev, const char *name,
++                  NetClientState *peer, Error **errp)
++{
++    error_setg(errp, "pcap network backend is not available on this host");
++    return -1;
++}
+diff --git a/system/exit-with-parent.c b/system/exit-with-parent.c
+index df65d2231a..9895b198d4 100644
+--- a/system/exit-with-parent.c
++++ b/system/exit-with-parent.c
+@@ -56,7 +56,7 @@ set_exit_with_parent(void)
+     return prctl(PR_SET_PDEATHSIG, SIGTERM);
+ }
+ 
+-#elif defined(__FreeBSD__)
++#elif defined(__FreeBSD__) && !defined(__PS4__)
+ 
+ #include <sys/procctl.h>
+ 
+diff --git a/ui/meson.build b/ui/meson.build
+index ea46bf0f44..719cdc08a6 100644
+--- a/ui/meson.build
++++ b/ui/meson.build
+@@ -27,12 +27,13 @@ xemu_ss.add(files(
+   'xemu-settings.cc',
+   'xemu-controllers.cc',
+ 
+-  'xemu.c',
+   'xemu-data.c',
+   'xemu-snapshots.c',
+-  'xemu-thumbnail.cc',
+   'xemu-widescreen.c',
+ ))
++if not ps4
++  xemu_ss.add(files('xemu.c', 'xemu-thumbnail.cc'))
++endif
+ 
+ if host_os == 'windows'
+   d3d11 = cc.find_library('d3d11', required: true)
+@@ -40,14 +41,20 @@ if host_os == 'windows'
+   xemu_ss.add(nvapi, d3d11, dxgi)
+ endif
+ 
+-subdir('xui')
++if ps4
++  subdir('ps4')
++else
++  subdir('xui')
++endif
+ 
+ if host_os == 'darwin'
+   xemu_cocoa = dependency('appleframeworks', modules: 'Cocoa')
+   xemu_ss.add(xemu_cocoa)
+ endif
+ 
+-if host_os == 'linux'
++if ps4
++  # ui/ps4/xemu-os-utils-ps4.c
++elif host_os == 'linux'
+   xemu_ss.add([gtk, files('xemu-os-utils-linux.c')])
+ elif host_os == 'windows'
+   xemu_ss.add(files('xemu-os-utils-windows.c'))
+diff --git a/ui/ps4/imgui-impl-vulkan-ps4.cc b/ui/ps4/imgui-impl-vulkan-ps4.cc
+new file mode 100644
+index 0000000000..ed24aa5721
+--- /dev/null
++++ b/ui/ps4/imgui-impl-vulkan-ps4.cc
+@@ -0,0 +1,7 @@
++/*
++ * xemu-ps4: ImGui's Vulkan backend, built here rather than by the imgui subproject because it
++ * must not call the Vulkan prototypes (RADV is linked in without a loader): its functions come
++ * from ImGui_ImplVulkan_LoadFunctions (ps4-present.cc).
++ */
++#define IMGUI_IMPL_VULKAN_NO_PROTOTYPES
++#include "backends/imgui_impl_vulkan.cpp"
+diff --git a/ui/ps4/meson.build b/ui/ps4/meson.build
+new file mode 100644
+index 0000000000..e48c43205e
+--- /dev/null
++++ b/ui/ps4/meson.build
+@@ -0,0 +1,10 @@
++# xemu-ps4: the PS4 frontend (in place of ui/xemu.c and the OpenGL GUI in ui/xui)
++xemu_ss.add(volk, files(
++  'imgui-impl-vulkan-ps4.cc',
++  'ps4-hud.cc',
++  'ps4-present.cc',
++  'ps4-thumbnail.cc',
++  'ps4-wsi.cc',
++  'xemu-os-utils-ps4.c',
++  'xemu-ps4.c',
++))
+diff --git a/ui/ps4/ps4-frontend.h b/ui/ps4/ps4-frontend.h
+new file mode 100644
+index 0000000000..3ec4ab2527
+--- /dev/null
++++ b/ui/ps4/ps4-frontend.h
+@@ -0,0 +1,39 @@
++/*
++ * xemu-ps4: the PS4 frontend's pieces (xemu-ps4.c, ps4-present.cc, ps4-hud.cc)
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#ifndef UI_PS4_PS4_FRONTEND_H
++#define UI_PS4_PS4_FRONTEND_H
++
++#include <stdbool.h>
++#include <SDL3/SDL.h>
++#include "hw/xbox/nv2a/nv2a_vk_ps4.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* ps4-present.cc: VideoOut swapchain on the renderer's device, ImGui on top */
++bool ps4_present_ready(void);
++bool ps4_present_init(const NV2AVkDevice *dev);
++/* Draws one frame: the display image (between nv2a_get/release_framebuffer_surface) scaled to
++ * the screen, then the HUD's ImGui frame; returns once the GPU is done with the display image. */
++void ps4_present_frame(bool have_display);
++void ps4_present_shutdown(void);
++
++/* ps4-hud.cc: notifications, status and menus (ImGui), called with the main loop lock */
++void ps4_hud_process_sdl_event(const SDL_Event *event);
++void ps4_hud_update(void);
++/* between ImGui::NewFrame and ImGui::Render (presenter) */
++void ps4_hud_draw(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/ui/ps4/ps4-hud.cc b/ui/ps4/ps4-hud.cc
+new file mode 100644
+index 0000000000..bf4f85b198
+--- /dev/null
++++ b/ui/ps4/ps4-hud.cc
+@@ -0,0 +1,133 @@
++/*
++ * xemu-ps4: the HUD drawn over the emulated picture (ImGui): notifications and error messages
++ * (xemu-notifications.h, which the desktop's xui implements), and what is missing before a
++ * game can start. The home screen and menus (from Resonance's launcher) come on top of this.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include "ps4-frontend.h"
++#include "ui/xemu-notifications.h"
++#include "ui/xemu-settings.h"
++
++#include "imgui.h"
++
++#include <chrono>
++#include <deque>
++#include <mutex>
++#include <string>
++#include <unistd.h>
++
++namespace
++{
++using Clock = std::chrono::steady_clock;
++
++struct Message
++{
++    std::string text;
++    bool error;
++    Clock::time_point shown;
++};
++
++std::mutex sMutex;
++std::deque<Message> sQueue;     // waiting to be shown, oldest first
++Message sCurrent;
++bool sShowing;
++constexpr auto kShowTime = std::chrono::seconds(4);
++constexpr auto kErrorShowTime = std::chrono::seconds(10);
++
++void Queue(const char *msg, bool error)
++{
++    std::lock_guard<std::mutex> lock(sMutex);
++    sQueue.push_back({ msg, error, {} });
++}
++
++void DrawNotification()
++{
++    std::lock_guard<std::mutex> lock(sMutex);
++    const auto now = Clock::now();
++    if (sShowing && now - sCurrent.shown > (sCurrent.error ? kErrorShowTime : kShowTime)) {
++        sShowing = false;
++    }
++    if (!sShowing && !sQueue.empty()) {
++        sCurrent = sQueue.front();
++        sCurrent.shown = now;
++        sQueue.pop_front();
++        sShowing = true;
++    }
++    if (!sShowing) {
++        return;
++    }
++    const ImVec2 screen = ImGui::GetIO().DisplaySize;
++    ImGui::SetNextWindowPos(ImVec2(screen.x * 0.5f, screen.y - 80.0f), ImGuiCond_Always,
++                            ImVec2(0.5f, 1.0f));
++    ImGui::SetNextWindowBgAlpha(0.8f);
++    ImGui::Begin("##notification", nullptr,
++                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
++                     ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing |
++                     ImGuiWindowFlags_NoInputs);
++    if (sCurrent.error) {
++        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", sCurrent.text.c_str());
++    } else {
++        ImGui::TextUnformatted(sCurrent.text.c_str());
++    }
++    ImGui::End();
++}
++
++// Until the BIOS files are in place the Xbox can't start: say where they go
++void DrawSetupHelp()
++{
++    const bool haveBootrom = g_config.sys.files.bootrom_path[0] != '\0' &&
++                             access(g_config.sys.files.bootrom_path, R_OK) == 0;
++    const bool haveFlash = g_config.sys.files.flashrom_path[0] != '\0' &&
++                           access(g_config.sys.files.flashrom_path, R_OK) == 0;
++    if (haveBootrom && haveFlash) {
++        return;
++    }
++    const ImVec2 screen = ImGui::GetIO().DisplaySize;
++    ImGui::SetNextWindowPos(ImVec2(screen.x * 0.5f, screen.y * 0.5f), ImGuiCond_Always,
++                            ImVec2(0.5f, 0.5f));
++    ImGui::Begin("xemu for PS4", nullptr,
++                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize |
++                     ImGuiWindowFlags_NoMove);
++    ImGui::TextUnformatted("The Xbox BIOS files are missing.");
++    ImGui::Spacing();
++    ImGui::TextUnformatted("Copy them to /data/xemu/bios on the PS4 (FTP), then restart:");
++    ImGui::BulletText("MCPX boot ROM (512 bytes)%s", haveBootrom ? ": found" : "");
++    ImGui::BulletText("flash BIOS (256 KiB or 1 MiB)%s", haveFlash ? ": found" : "");
++    ImGui::Spacing();
++    ImGui::TextUnformatted("Hard disk image: /data/xemu/hdd/xbox_hdd.qcow2");
++    ImGui::TextUnformatted("Games (.iso): /data/xemu/games");
++    ImGui::End();
++}
++} // namespace
++
++extern "C" void xemu_queue_notification(const char *msg)
++{
++    fprintf(stderr, "notification: %s\n", msg);
++    Queue(msg, false);
++}
++
++extern "C" void xemu_queue_error_message(const char *msg)
++{
++    fprintf(stderr, "error: %s\n", msg);
++    Queue(msg, true);
++}
++
++extern "C" void ps4_hud_process_sdl_event(const SDL_Event *event)
++{
++    (void)event;
++}
++
++extern "C" void ps4_hud_update(void)
++{
++}
++
++extern "C" void ps4_hud_draw(void)
++{
++    DrawSetupHelp();
++    DrawNotification();
++}
+diff --git a/ui/ps4/ps4-present.cc b/ui/ps4/ps4-present.cc
+new file mode 100644
+index 0000000000..72b516a140
+--- /dev/null
++++ b/ui/ps4/ps4-present.cc
+@@ -0,0 +1,384 @@
++/*
++ * xemu-ps4: presents the emulated display on VideoOut, on the Vulkan renderer's own device and
++ * queue (the PS4 has no OpenGL to hand the picture to, as the desktop frontends do).
++ *
++ * Each frame: clear the swapchain image, blit the renderer's display image into it scaled to
++ * fit, draw the HUD with ImGui's Vulkan backend, present (ps4-wsi.cc: a VideoOut flip behind
++ * the GPU work). The display image belongs to the renderer again once the frame's commands have
++ * finished, so the frame waits for its fence before returning.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include "ps4-frontend.h"
++#include "ps4-wsi.h"
++
++#include <volk.h>
++#include "imgui.h"
++#include "backends/imgui_impl_vulkan.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstring>
++
++namespace
++{
++constexpr uint32_t kMaxImages = 4;
++
++struct Presenter
++{
++    bool ready = false;
++    NV2AVkDevice dev {};
++    VkSurfaceKHR surface = VK_NULL_HANDLE;
++    VkSwapchainKHR swapchain = VK_NULL_HANDLE;
++    uint32_t imageCount = 0;
++    VkImage images[kMaxImages] {};
++    VkImageView views[kMaxImages] {};
++    VkFramebuffer framebuffers[kMaxImages] {};
++    VkCommandBuffer commands[kMaxImages] {};
++    VkFence fences[kMaxImages] {};
++    VkRenderPass renderPass = VK_NULL_HANDLE;
++    VkCommandPool pool = VK_NULL_HANDLE;
++    bool imguiReady = false;
++    uint64_t frames = 0;
++} P;
++
++bool Check(VkResult r, const char *what)
++{
++    if (r != VK_SUCCESS) {
++        fprintf(stderr, "ps4-present: %s failed (%d)\n", what, r);
++        return false;
++    }
++    return true;
++}
++
++void ImageBarrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from, VkImageLayout to,
++                  VkAccessFlags srcAccess, VkAccessFlags dstAccess,
++                  VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage)
++{
++    VkImageMemoryBarrier b { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
++    b.srcAccessMask = srcAccess;
++    b.dstAccessMask = dstAccess;
++    b.oldLayout = from;
++    b.newLayout = to;
++    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    b.image = image;
++    b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++    vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &b);
++}
++
++bool CreateSwapchain()
++{
++    VkHeadlessSurfaceCreateInfoEXT sci { VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT };
++    if (!Check(vkCreateHeadlessSurfaceEXT(P.dev.instance, &sci, nullptr, &P.surface),
++               "vkCreateHeadlessSurfaceEXT")) {
++        return false;
++    }
++
++    VkSwapchainCreateInfoKHR ci { VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR };
++    ci.surface = P.surface;
++    ci.minImageCount = 3;
++    ci.imageFormat = VK_FORMAT_R8G8B8A8_UNORM;
++    ci.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
++    ci.imageExtent = { ps4wsi::kWidth, ps4wsi::kHeight };
++    ci.imageArrayLayers = 1;
++    ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++    ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    ci.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
++    ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
++    ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
++    ci.clipped = VK_TRUE;
++    if (!Check(vkCreateSwapchainKHR(P.dev.device, &ci, nullptr, &P.swapchain),
++               "vkCreateSwapchainKHR")) {
++        return false;
++    }
++    P.imageCount = kMaxImages;
++    if (!Check(vkGetSwapchainImagesKHR(P.dev.device, P.swapchain, &P.imageCount, P.images),
++               "vkGetSwapchainImagesKHR")) {
++        return false;
++    }
++
++    VkAttachmentDescription color {};
++    color.format = VK_FORMAT_R8G8B8A8_UNORM;
++    color.samples = VK_SAMPLE_COUNT_1_BIT;
++    color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;      // the picture blitted before
++    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++    color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++    color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
++    color.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++    color.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
++    VkAttachmentReference ref { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
++    VkSubpassDescription sub {};
++    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
++    sub.colorAttachmentCount = 1;
++    sub.pColorAttachments = &ref;
++    VkRenderPassCreateInfo rpi { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
++    rpi.attachmentCount = 1;
++    rpi.pAttachments = &color;
++    rpi.subpassCount = 1;
++    rpi.pSubpasses = &sub;
++    if (!Check(vkCreateRenderPass(P.dev.device, &rpi, nullptr, &P.renderPass),
++               "vkCreateRenderPass")) {
++        return false;
++    }
++
++    VkCommandPoolCreateInfo pci { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
++    pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
++    pci.queueFamilyIndex = P.dev.queue_family;
++    if (!Check(vkCreateCommandPool(P.dev.device, &pci, nullptr, &P.pool), "vkCreateCommandPool")) {
++        return false;
++    }
++    VkCommandBufferAllocateInfo cai { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
++    cai.commandPool = P.pool;
++    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++    cai.commandBufferCount = P.imageCount;
++    if (!Check(vkAllocateCommandBuffers(P.dev.device, &cai, P.commands),
++               "vkAllocateCommandBuffers")) {
++        return false;
++    }
++
++    for (uint32_t i = 0; i < P.imageCount; i++) {
++        VkImageViewCreateInfo vi { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
++        vi.image = P.images[i];
++        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
++        vi.format = VK_FORMAT_R8G8B8A8_UNORM;
++        vi.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++        if (!Check(vkCreateImageView(P.dev.device, &vi, nullptr, &P.views[i]),
++                   "vkCreateImageView")) {
++            return false;
++        }
++        VkFramebufferCreateInfo fi { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
++        fi.renderPass = P.renderPass;
++        fi.attachmentCount = 1;
++        fi.pAttachments = &P.views[i];
++        fi.width = ps4wsi::kWidth;
++        fi.height = ps4wsi::kHeight;
++        fi.layers = 1;
++        if (!Check(vkCreateFramebuffer(P.dev.device, &fi, nullptr, &P.framebuffers[i]),
++                   "vkCreateFramebuffer")) {
++            return false;
++        }
++        VkFenceCreateInfo fci { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
++        fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
++        if (!Check(vkCreateFence(P.dev.device, &fci, nullptr, &P.fences[i]), "vkCreateFence")) {
++            return false;
++        }
++    }
++    fprintf(stderr, "ps4-present: swapchain of %u images %ux%u\n", P.imageCount,
++            ps4wsi::kWidth, ps4wsi::kHeight);
++    return true;
++}
++
++PFN_vkVoidFunction ImGuiLoader(const char *name, void *)
++{
++    PFN_vkVoidFunction fn = vkGetDeviceProcAddr(P.dev.device, name);
++    return fn ? fn : vkGetInstanceProcAddr(P.dev.instance, name);
++}
++
++bool InitImGui()
++{
++    IMGUI_CHECKVERSION();
++    ImGui::CreateContext();
++    ImGuiIO &io = ImGui::GetIO();
++    io.IniFilename = nullptr;
++    io.DisplaySize = ImVec2((float)ps4wsi::kWidth, (float)ps4wsi::kHeight);
++    io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
++    io.FontGlobalScale = 2.0f;      // sized for a TV across the room
++    ImGui::StyleColorsDark();
++    ImGui::GetStyle().ScaleAllSizes(2.0f);
++
++    if (!ImGui_ImplVulkan_LoadFunctions(ImGuiLoader)) {
++        fprintf(stderr, "ps4-present: ImGui_ImplVulkan_LoadFunctions failed\n");
++        return false;
++    }
++    ImGui_ImplVulkan_InitInfo info {};
++    info.Instance = P.dev.instance;
++    info.PhysicalDevice = P.dev.physical_device;
++    info.Device = P.dev.device;
++    info.QueueFamily = P.dev.queue_family;
++    info.Queue = P.dev.queue;
++    info.RenderPass = P.renderPass;
++    info.MinImageCount = 2;
++    info.ImageCount = P.imageCount;
++    info.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
++    info.DescriptorPoolSize = 64;
++    if (!ImGui_ImplVulkan_Init(&info)) {
++        fprintf(stderr, "ps4-present: ImGui_ImplVulkan_Init failed\n");
++        return false;
++    }
++    return true;
++}
++
++// The display image's rectangle on the screen: as large as fits, its own aspect ratio
++VkRect2D FitRect(uint32_t w, uint32_t h)
++{
++    const float sx = (float)ps4wsi::kWidth / w, sy = (float)ps4wsi::kHeight / h;
++    const float s = std::min(sx, sy);
++    const uint32_t dw = (uint32_t)(w * s), dh = (uint32_t)(h * s);
++    VkRect2D r;
++    r.offset = { (int32_t)(ps4wsi::kWidth - dw) / 2, (int32_t)(ps4wsi::kHeight - dh) / 2 };
++    r.extent = { dw, dh };
++    return r;
++}
++
++void Record(VkCommandBuffer cmd, uint32_t index, bool haveDisplay, ImDrawData *drawData)
++{
++    VkCommandBufferBeginInfo bi { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
++    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++    vkBeginCommandBuffer(cmd, &bi);
++
++    VkImage target = P.images[index];
++    ImageBarrier(cmd, target, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                 VK_PIPELINE_STAGE_TRANSFER_BIT);
++    VkClearColorValue black {};
++    VkImageSubresourceRange all { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++    vkCmdClearColorImage(cmd, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &all);
++
++    VkImage display = VK_NULL_HANDLE;
++    VkImageView view;
++    uint32_t w, h;
++    if (haveDisplay && nv2a_vk_ps4_get_display(&display, &view, &w, &h) && w && h) {
++        ImageBarrier(cmd, display, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
++                     VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                     VK_PIPELINE_STAGE_TRANSFER_BIT);
++        ImageBarrier(cmd, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
++                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                     VK_PIPELINE_STAGE_TRANSFER_BIT);
++        const VkRect2D dst = FitRect(w, h);
++        VkImageBlit blit {};
++        blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
++        blit.srcOffsets[1] = { (int32_t)w, (int32_t)h, 1 };
++        blit.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
++        blit.dstOffsets[0] = { dst.offset.x, dst.offset.y, 0 };
++        blit.dstOffsets[1] = { dst.offset.x + (int32_t)dst.extent.width,
++                               dst.offset.y + (int32_t)dst.extent.height, 1 };
++        vkCmdBlitImage(cmd, display, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target,
++                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
++        // back to where the renderer left it
++        ImageBarrier(cmd, display, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, 0,
++                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
++    }
++
++    ImageBarrier(cmd, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                 VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
++                 VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
++                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
++
++    VkRenderPassBeginInfo rbi { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
++    rbi.renderPass = P.renderPass;
++    rbi.framebuffer = P.framebuffers[index];
++    rbi.renderArea.extent = { ps4wsi::kWidth, ps4wsi::kHeight };
++    vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
++    if (drawData) {
++        ImGui_ImplVulkan_RenderDrawData(drawData, cmd);
++    }
++    vkCmdEndRenderPass(cmd);
++    vkEndCommandBuffer(cmd);
++}
++} // namespace
++
++extern "C" bool ps4_present_ready(void)
++{
++    return P.ready;
++}
++
++extern "C" bool ps4_present_init(const NV2AVkDevice *dev)
++{
++    static bool failed;
++    if (failed) {
++        return false;
++    }
++    P.dev = *dev;
++    if (!CreateSwapchain() || !InitImGui()) {
++        failed = true;
++        return false;
++    }
++    P.imguiReady = true;
++    P.ready = true;
++    return true;
++}
++
++extern "C" void ps4_present_frame(bool have_display)
++{
++    if (!P.ready) {
++        return;
++    }
++
++    // the ImGui frame (its first NewFrame uploads the font texture through the shared queue)
++    nv2a_vk_ps4_queue_lock();
++    ImGui_ImplVulkan_NewFrame();
++    nv2a_vk_ps4_queue_unlock();
++    ImGui::NewFrame();
++    ps4_hud_draw();
++    ImGui::Render();
++
++    uint32_t index = 0;
++    nv2a_vk_ps4_queue_lock();
++    VkResult r = vkAcquireNextImageKHR(P.dev.device, P.swapchain, UINT64_MAX, VK_NULL_HANDLE,
++                                       VK_NULL_HANDLE, &index);
++    nv2a_vk_ps4_queue_unlock();
++    if (!Check(r, "vkAcquireNextImageKHR")) {
++        return;
++    }
++
++    vkWaitForFences(P.dev.device, 1, &P.fences[index], VK_TRUE, UINT64_MAX);
++    vkResetFences(P.dev.device, 1, &P.fences[index]);
++    VkCommandBuffer cmd = P.commands[index];
++    vkResetCommandBuffer(cmd, 0);
++    Record(cmd, index, have_display, ImGui::GetDrawData());
++
++    VkSubmitInfo si { VK_STRUCTURE_TYPE_SUBMIT_INFO };
++    si.commandBufferCount = 1;
++    si.pCommandBuffers = &cmd;
++    VkPresentInfoKHR pi { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
++    pi.swapchainCount = 1;
++    pi.pSwapchains = &P.swapchain;
++    pi.pImageIndices = &index;
++
++    nv2a_vk_ps4_queue_lock();
++    r = vkQueueSubmit(P.dev.queue, 1, &si, P.fences[index]);
++    if (Check(r, "vkQueueSubmit")) {
++        Check(vkQueuePresentKHR(P.dev.queue, &pi), "vkQueuePresentKHR");
++    }
++    nv2a_vk_ps4_queue_unlock();
++
++    // the display image is the renderer's again once the blit has run
++    if (have_display) {
++        vkWaitForFences(P.dev.device, 1, &P.fences[index], VK_TRUE, UINT64_MAX);
++    }
++    if (++P.frames == 1) {
++        fprintf(stderr, "ps4-present: first frame\n");
++    }
++}
++
++extern "C" void ps4_present_shutdown(void)
++{
++    if (!P.ready) {
++        return;
++    }
++    nv2a_vk_ps4_queue_lock();
++    vkQueueWaitIdle(P.dev.queue);
++    nv2a_vk_ps4_queue_unlock();
++    if (P.imguiReady) {
++        ImGui_ImplVulkan_Shutdown();
++        ImGui::DestroyContext();
++    }
++    for (uint32_t i = 0; i < P.imageCount; i++) {
++        vkDestroyFence(P.dev.device, P.fences[i], nullptr);
++        vkDestroyFramebuffer(P.dev.device, P.framebuffers[i], nullptr);
++        vkDestroyImageView(P.dev.device, P.views[i], nullptr);
++    }
++    vkDestroyCommandPool(P.dev.device, P.pool, nullptr);
++    vkDestroyRenderPass(P.dev.device, P.renderPass, nullptr);
++    vkDestroySwapchainKHR(P.dev.device, P.swapchain, nullptr);
++    vkDestroySurfaceKHR(P.dev.instance, P.surface, nullptr);
++    P.ready = false;
++}
+diff --git a/ui/ps4/ps4-thumbnail.cc b/ui/ps4/ps4-thumbnail.cc
+new file mode 100644
+index 0000000000..61355d2849
+--- /dev/null
++++ b/ui/ps4/ps4-thumbnail.cc
+@@ -0,0 +1,26 @@
++/*
++ * xemu-ps4: snapshot thumbnails (xemu-snapshots.h; the desktop's are in ui/xemu-thumbnail.cc,
++ * on OpenGL). Not made yet on the PS4: snapshots are saved without a picture.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "ui/xemu-snapshots.h"
++
++void xemu_snapshots_set_framebuffer_texture(GLuint tex, bool flip)
++{
++}
++
++bool xemu_snapshots_load_png_to_texture(GLuint tex, void *buf, size_t size)
++{
++    return false;
++}
++
++void *xemu_snapshots_create_framebuffer_thumbnail_png(size_t *size)
++{
++    return NULL;
++}
+diff --git a/ui/ps4/ps4-wsi.cc b/ui/ps4/ps4-wsi.cc
+new file mode 100644
+index 0000000000..906f52885d
+--- /dev/null
++++ b/ui/ps4/ps4-wsi.cc
+@@ -0,0 +1,551 @@
++/*
++	xemu-ps4: Vulkan window system integration on the PS4 (from Resonance's ps4_wsi.cpp, itself
++	from Crema's PS4WSI.cpp).
++
++	RADV (DolphinPS4's GNM port) is linked into the executable and has no WSI. This file adds
++	VK_EXT_headless_surface and VK_KHR_swapchain on top of it the way DolphinPS4 presents: the
++	swapchain images are linear R8G8B8A8 images in host-visible memory (GPU address = CPU address
++	on the PS4), registered as VideoOut buffers, and presenting queues a VideoOut flip behind the
++	GPU work submitted so far (ac_ps4_submit_flip in the Mesa winsys). xemu's Vulkan renderer
++	(through volk) and the PS4 presenter (ps4-present.cc) use the standard surface/swapchain API
++	through ps4_vk_get_instance_proc_addr(). vkAcquireNextImageKHR and vkQueuePresentKHR submit
++	to the graphics queue: callers hold nv2a_vk_ps4_queue_lock().
++
++	This program is free software: you can redistribute it and/or modify
++	it under the terms of the GNU General Public License as published by
++	the Free Software Foundation, either version 2 of the License, or
++	(at your option) any later version.
++ */
++#include "ps4-wsi.h"
++
++#include <vulkan/vulkan.h>
++#include <orbis/VideoOut.h>
++#include <orbis/libkernel.h>
++#include <orbis/SystemService.h>
++
++#include <algorithm>
++#include <chrono>
++#include <cstring>
++#include <mutex>
++#include <vector>
++
++extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInstance instance, const char *name);
++extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_common_GetDeviceProcAddr(VkDevice device, const char *name);
++// port/mesa/ac_ps4_drm.c: queues a VideoOut flip behind the submitted GPU work (GPU-side flip)
++extern "C" int ac_ps4_submit_flip(int video, unsigned buffer, unsigned mode, int64_t arg);
++
++namespace
++{
++constexpr u32 kMaxImages = 4;
++constexpr VkDeviceSize kFramebufferAlign = 2 << 20;	// VideoOut buffer alignment
++
++struct PS4Surface
++{
++	u32 magic = 0x50533453;
++};
++
++struct PS4Swapchain
++{
++	VkDevice device;
++	u32 imageCount;
++	VkImage images[kMaxImages] {};
++	VkDeviceMemory memory[kMaxImages] {};
++	int bufferSet = -1;
++	int firstBuffer = 0;
++	u32 nextImage = 0;
++	u32 flipMode = ORBIS_VIDEO_OUT_FLIP_VSYNC;
++};
++
++VkInstance sInstance = VK_NULL_HANDLE;
++VkPhysicalDevice sPhysicalDevice = VK_NULL_HANDLE;
++int sVideo = -1;
++OrbisKernelEqueue sFlipQueue;
++u64 sFlipsSubmitted = 0;
++int sNextFirstBuffer = 0;
++std::mutex sMutex;
++
++template<typename T>
++T Device(VkDevice device, const char *name) {
++	return (T)vk_common_GetDeviceProcAddr(device, name);
++}
++
++template<typename T>
++T Instance(const char *name) {
++	return (T)vk_icdGetInstanceProcAddr(sInstance, name);
++}
++
++bool OpenVideoOut()
++{
++	if (sVideo >= 0)
++		return true;
++	sVideo = sceVideoOutOpen(0xFF, 0, 0, nullptr);
++	if (sVideo < 0)
++	{
++		ERROR_LOG(RENDERER, "PS4WSI: sceVideoOutOpen failed: %x", sVideo);
++		return false;
++	}
++	sceKernelCreateEqueue(&sFlipQueue, "xemu flip");
++	sceVideoOutAddFlipEvent(sFlipQueue, sVideo, nullptr);
++	return true;
++}
++
++// appends one extension to an enumeration result (count/properties two-call idiom)
++VkResult AppendExtensions(std::vector<VkExtensionProperties>& list, std::initializer_list<std::pair<const char *, u32>> extra,
++		u32 *count, VkExtensionProperties *props)
++{
++	for (const auto& [name, specVersion] : extra)
++	{
++		VkExtensionProperties p {};
++		strncpy(p.extensionName, name, VK_MAX_EXTENSION_NAME_SIZE - 1);
++		p.specVersion = specVersion;
++		list.push_back(p);
++	}
++	if (props == nullptr)
++	{
++		*count = (u32)list.size();
++		return VK_SUCCESS;
++	}
++	const u32 n = std::min<u32>(*count, (u32)list.size());
++	memcpy(props, list.data(), n * sizeof(VkExtensionProperties));
++	*count = n;
++	return n < list.size() ? VK_INCOMPLETE : VK_SUCCESS;
++}
++
++std::vector<const char *> WithoutExtensions(u32 count, const char *const *names, std::initializer_list<const char *> drop)
++{
++	std::vector<const char *> result;
++	for (u32 i = 0; i < count; i++)
++		if (std::none_of(drop.begin(), drop.end(), [&](const char *d) { return strcmp(names[i], d) == 0; }))
++			result.push_back(names[i]);
++	return result;
++}
++
++// --- instance level ---
++
++VKAPI_ATTR VkResult VKAPI_CALL EnumerateInstanceExtensionProperties(const char *layer, u32 *count, VkExtensionProperties *props)
++{
++	auto real = (PFN_vkEnumerateInstanceExtensionProperties)vk_icdGetInstanceProcAddr(VK_NULL_HANDLE, "vkEnumerateInstanceExtensionProperties");
++	u32 n = 0;
++	real(layer, &n, nullptr);
++	std::vector<VkExtensionProperties> list(n);
++	real(layer, &n, list.data());
++	list.resize(n);
++	return AppendExtensions(list, { { VK_KHR_SURFACE_EXTENSION_NAME, 25 }, { VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME, 1 } }, count, props);
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL CreateInstance(const VkInstanceCreateInfo *info, const VkAllocationCallbacks *alloc, VkInstance *instance)
++{
++	auto real = (PFN_vkCreateInstance)vk_icdGetInstanceProcAddr(VK_NULL_HANDLE, "vkCreateInstance");
++	VkInstanceCreateInfo copy = *info;
++	auto names = WithoutExtensions(info->enabledExtensionCount, info->ppEnabledExtensionNames,
++			{ VK_KHR_SURFACE_EXTENSION_NAME, VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME });
++	copy.enabledExtensionCount = (u32)names.size();
++	copy.ppEnabledExtensionNames = names.data();
++	VkResult r = real(&copy, alloc, instance);
++	if (r == VK_SUCCESS)
++		sInstance = *instance;
++	return r;
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL EnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice, const char *layer, u32 *count, VkExtensionProperties *props)
++{
++	auto real = Instance<PFN_vkEnumerateDeviceExtensionProperties>("vkEnumerateDeviceExtensionProperties");
++	u32 n = 0;
++	real(physicalDevice, layer, &n, nullptr);
++	std::vector<VkExtensionProperties> list(n);
++	real(physicalDevice, layer, &n, list.data());
++	list.resize(n);
++	return AppendExtensions(list, { { VK_KHR_SWAPCHAIN_EXTENSION_NAME, 70 } }, count, props);
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *info, const VkAllocationCallbacks *alloc, VkDevice *device)
++{
++	auto real = Instance<PFN_vkCreateDevice>("vkCreateDevice");
++	VkDeviceCreateInfo copy = *info;
++	auto names = WithoutExtensions(info->enabledExtensionCount, info->ppEnabledExtensionNames, { VK_KHR_SWAPCHAIN_EXTENSION_NAME });
++	copy.enabledExtensionCount = (u32)names.size();
++	copy.ppEnabledExtensionNames = names.data();
++	sPhysicalDevice = physicalDevice;
++	return real(physicalDevice, &copy, alloc, device);
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL CreateHeadlessSurfaceEXT(VkInstance, const VkHeadlessSurfaceCreateInfoEXT *, const VkAllocationCallbacks *, VkSurfaceKHR *surface)
++{
++	*surface = (VkSurfaceKHR)new PS4Surface();
++	return VK_SUCCESS;
++}
++
++VKAPI_ATTR void VKAPI_CALL DestroySurfaceKHR(VkInstance, VkSurfaceKHR surface, const VkAllocationCallbacks *)
++{
++	delete (PS4Surface *)surface;
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceSurfaceSupportKHR(VkPhysicalDevice, u32 queueFamily, VkSurfaceKHR, VkBool32 *supported)
++{
++	*supported = queueFamily == 0 ? VK_TRUE : VK_FALSE;	// the graphics queue family
++	return VK_SUCCESS;
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice, VkSurfaceKHR, VkSurfaceCapabilitiesKHR *caps)
++{
++	*caps = {};
++	caps->minImageCount = 2;
++	caps->maxImageCount = 3;	// as DolphinPS4: render into one while one is shown and one is queued
++	caps->currentExtent = { ps4wsi::kWidth, ps4wsi::kHeight };
++	caps->minImageExtent = caps->currentExtent;
++	caps->maxImageExtent = caps->currentExtent;
++	caps->maxImageArrayLayers = 1;
++	caps->supportedTransforms = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
++	caps->currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
++	caps->supportedCompositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
++	caps->supportedUsageFlags = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++	return VK_SUCCESS;
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceSurfaceFormatsKHR(VkPhysicalDevice, VkSurfaceKHR, u32 *count, VkSurfaceFormatKHR *formats)
++{
++	// VideoOut A8B8G8R8 = R8G8B8A8 in memory (verified by DolphinPS4)
++	if (formats == nullptr)
++	{
++		*count = 1;
++		return VK_SUCCESS;
++	}
++	if (*count < 1)
++		return VK_INCOMPLETE;
++	formats[0] = { VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR };
++	*count = 1;
++	return VK_SUCCESS;
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceSurfacePresentModesKHR(VkPhysicalDevice, VkSurfaceKHR, u32 *count, VkPresentModeKHR *modes)
++{
++	const VkPresentModeKHR supported[] = { VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_MAILBOX_KHR };
++	if (modes == nullptr)
++	{
++		*count = std::size(supported);
++		return VK_SUCCESS;
++	}
++	const u32 n = std::min<u32>(*count, std::size(supported));
++	memcpy(modes, supported, n * sizeof(VkPresentModeKHR));
++	*count = n;
++	return n < std::size(supported) ? VK_INCOMPLETE : VK_SUCCESS;
++}
++
++// --- device level ---
++
++u32 HostVisibleMemoryType(u32 typeBits)
++{
++	VkPhysicalDeviceMemoryProperties props;
++	Instance<PFN_vkGetPhysicalDeviceMemoryProperties>("vkGetPhysicalDeviceMemoryProperties")(sPhysicalDevice, &props);
++	const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++	for (u32 i = 0; i < props.memoryTypeCount; i++)
++		if ((typeBits & (1u << i)) && (props.memoryTypes[i].propertyFlags & want) == want)
++			return i;
++	return UINT32_MAX;
++}
++
++void FreeSwapchain(PS4Swapchain *sc)
++{
++	if (sc->bufferSet >= 0)
++		sceVideoOutUnregisterBuffers(sVideo, sc->bufferSet);
++	auto destroyImage = Device<PFN_vkDestroyImage>(sc->device, "vkDestroyImage");
++	auto freeMemory = Device<PFN_vkFreeMemory>(sc->device, "vkFreeMemory");
++	for (u32 i = 0; i < sc->imageCount; i++)
++	{
++		if (sc->images[i])
++			destroyImage(sc->device, sc->images[i], nullptr);
++		if (sc->memory[i])
++			freeMemory(sc->device, sc->memory[i], nullptr);
++	}
++	delete sc;
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *info, const VkAllocationCallbacks *, VkSwapchainKHR *swapchain)
++{
++	std::lock_guard<std::mutex> _(sMutex);
++	if (!OpenVideoOut())
++		return VK_ERROR_INITIALIZATION_FAILED;
++	auto sc = new PS4Swapchain();
++	sc->device = device;
++	sc->imageCount = std::clamp<u32>(info->minImageCount, 2, kMaxImages);
++	sc->flipMode = info->presentMode == VK_PRESENT_MODE_FIFO_KHR ? ORBIS_VIDEO_OUT_FLIP_VSYNC : ORBIS_VIDEO_OUT_FLIP_HSYNC;
++	auto createImage = Device<PFN_vkCreateImage>(device, "vkCreateImage");
++	auto getRequirements = Device<PFN_vkGetImageMemoryRequirements>(device, "vkGetImageMemoryRequirements");
++	auto allocateMemory = Device<PFN_vkAllocateMemory>(device, "vkAllocateMemory");
++	auto mapMemory = Device<PFN_vkMapMemory>(device, "vkMapMemory");
++	auto bindMemory = Device<PFN_vkBindImageMemory>(device, "vkBindImageMemory");
++	auto getLayout = Device<PFN_vkGetImageSubresourceLayout>(device, "vkGetImageSubresourceLayout");
++	void *addresses[kMaxImages] {};
++	u32 pitch = ps4wsi::kWidth;
++	for (u32 i = 0; i < sc->imageCount; i++)
++	{
++		VkImageCreateInfo ici { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
++		ici.imageType = VK_IMAGE_TYPE_2D;
++		ici.format = VK_FORMAT_R8G8B8A8_UNORM;
++		ici.extent = { ps4wsi::kWidth, ps4wsi::kHeight, 1 };
++		ici.mipLevels = 1;
++		ici.arrayLayers = 1;
++		ici.samples = VK_SAMPLE_COUNT_1_BIT;
++		ici.tiling = VK_IMAGE_TILING_LINEAR;
++		ici.usage = info->imageUsage | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
++		ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++		VkResult r = createImage(device, &ici, nullptr, &sc->images[i]);
++		if (r != VK_SUCCESS)
++		{
++			ERROR_LOG(RENDERER, "PS4WSI: vkCreateImage failed: %d", r);
++			FreeSwapchain(sc);
++			return r;
++		}
++		VkMemoryRequirements req;
++		getRequirements(device, sc->images[i], &req);
++		// VideoOut wants 2 MiB aligned buffers: over-allocate, bind at an aligned offset
++		VkMemoryAllocateInfo mai { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
++		mai.allocationSize = req.size + kFramebufferAlign;
++		mai.memoryTypeIndex = HostVisibleMemoryType(req.memoryTypeBits);
++		u8 *base = nullptr;
++		r = allocateMemory(device, &mai, nullptr, &sc->memory[i]);
++		if (r == VK_SUCCESS)
++			r = mapMemory(device, sc->memory[i], 0, VK_WHOLE_SIZE, 0, (void **)&base);
++		if (r != VK_SUCCESS)
++		{
++			ERROR_LOG(RENDERER, "PS4WSI: swapchain memory failed: %d", r);
++			FreeSwapchain(sc);
++			return r;
++		}
++		const uintptr_t baseAddress = (uintptr_t)base;
++		VkDeviceSize offset = ((baseAddress + kFramebufferAlign - 1) & ~(kFramebufferAlign - 1)) - baseAddress;
++		offset = (offset + req.alignment - 1) & ~(req.alignment - 1);
++		bindMemory(device, sc->images[i], sc->memory[i], offset);
++		VkImageSubresource sub { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0 };
++		VkSubresourceLayout layout;
++		getLayout(device, sc->images[i], &sub, &layout);
++		addresses[i] = base + offset + layout.offset;
++		pitch = (u32)(layout.rowPitch / 4);
++	}
++	OrbisVideoOutBufferAttribute attribute;
++	sceVideoOutSetBufferAttribute(&attribute, ORBIS_VIDEO_OUT_PIXEL_FORMAT_A8B8G8R8_SRGB, ORBIS_VIDEO_OUT_TILING_MODE_LINEAR, 0,
++			ps4wsi::kWidth, ps4wsi::kHeight, pitch);
++	// alternate between two buffer index ranges so a new swapchain can register while the old one is still on screen
++	sc->firstBuffer = sNextFirstBuffer;
++	sNextFirstBuffer = sNextFirstBuffer == 0 ? 8 : 0;
++	sc->bufferSet = sceVideoOutRegisterBuffers(sVideo, sc->firstBuffer, addresses, (int)sc->imageCount, &attribute);
++	if (sc->bufferSet < 0)
++	{
++		ERROR_LOG(RENDERER, "PS4WSI: sceVideoOutRegisterBuffers failed: %x", sc->bufferSet);
++		FreeSwapchain(sc);
++		return VK_ERROR_INITIALIZATION_FAILED;
++	}
++	NOTICE_LOG(RENDERER, "PS4WSI: swapchain of %u images %ux%u pitch %u, buffers %d+", sc->imageCount, ps4wsi::kWidth, ps4wsi::kHeight,
++			pitch, sc->firstBuffer);
++	*swapchain = (VkSwapchainKHR)sc;
++	return VK_SUCCESS;
++}
++
++VKAPI_ATTR void VKAPI_CALL DestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain, const VkAllocationCallbacks *)
++{
++	if (!swapchain)
++		return;
++	std::lock_guard<std::mutex> _(sMutex);
++	Device<PFN_vkDeviceWaitIdle>(device, "vkDeviceWaitIdle")(device);
++	FreeSwapchain((PS4Swapchain *)swapchain);
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL GetSwapchainImagesKHR(VkDevice, VkSwapchainKHR swapchain, u32 *count, VkImage *images)
++{
++	auto sc = (PS4Swapchain *)swapchain;
++	if (images == nullptr)
++	{
++		*count = sc->imageCount;
++		return VK_SUCCESS;
++	}
++	const u32 n = std::min(*count, sc->imageCount);
++	memcpy(images, sc->images, n * sizeof(VkImage));
++	*count = n;
++	return n < sc->imageCount ? VK_INCOMPLETE : VK_SUCCESS;
++}
++
++// present statistics, logged every 10 s
++struct
++{
++	std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
++	u64 flips = 0;
++	u64 waitNs = 0;
++	u32 timeouts = 0;
++	s64 lastFlipArg = 0;
++} sStats;
++
++// The image about to be rendered into must be off screen: with N images in rotation it was
++// shown by flip n-N+1 and replaced on screen by flip n-N+2 (n = flips submitted).
++void WaitImageOffScreen(u32 imageCount)
++{
++	if (sFlipsSubmitted < imageCount - 1)
++		return;
++	const s64 needed = (s64)(sFlipsSubmitted - (imageCount - 2));
++	const auto t0 = std::chrono::steady_clock::now();
++	bool done = false;
++	for (int tries = 0; tries < 40 && !done; tries++)
++	{
++		OrbisVideoOutFlipStatus status {};
++		if (sceVideoOutGetFlipStatus(sVideo, &status) < 0)
++			break;
++		sStats.lastFlipArg = status.flipArg;
++		if (status.flipArg >= needed)
++		{
++			done = true;
++			break;
++		}
++		OrbisKernelEvent ev;
++		int got = 0;
++		OrbisKernelUseconds timeout = 5000;
++		sceKernelWaitEqueue(sFlipQueue, &ev, 1, &got, &timeout);
++	}
++	if (!done)
++		sStats.timeouts++;
++	sStats.waitNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
++}
++
++void CountPresent()
++{
++	sStats.flips++;
++	const auto now = std::chrono::steady_clock::now();
++	const double secs = std::chrono::duration<double>(now - sStats.start).count();
++	if (secs < 10.0)
++		return;
++	INFO_LOG(RENDERER, "PS4WSI: %.1f flips/s, acquire waits %.0f ms/s, %u timeouts, flipArg %lld of %llu submitted",
++			sStats.flips / secs, sStats.waitNs / 1e6 / secs, sStats.timeouts, (long long)sStats.lastFlipArg,
++			(unsigned long long)sFlipsSubmitted);
++	sStats.start = now;
++	sStats.flips = 0;
++	sStats.waitNs = 0;
++	sStats.timeouts = 0;
++}
++
++VkQueue GraphicsQueue(VkDevice device)
++{
++	VkQueue queue = VK_NULL_HANDLE;
++	Device<PFN_vkGetDeviceQueue>(device, "vkGetDeviceQueue")(device, 0, 0, &queue);
++	return queue;
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain, u64, VkSemaphore semaphore, VkFence fence, u32 *index)
++{
++	auto sc = (PS4Swapchain *)swapchain;
++	WaitImageOffScreen(sc->imageCount);
++	*index = sc->nextImage;
++	sc->nextImage = (sc->nextImage + 1) % sc->imageCount;
++	if (semaphore || fence)
++	{
++		// signal the acquire semaphore/fence right away: the image is free
++		VkSubmitInfo si { VK_STRUCTURE_TYPE_SUBMIT_INFO };
++		si.signalSemaphoreCount = semaphore ? 1 : 0;
++		si.pSignalSemaphores = &semaphore;
++		const VkResult r = Device<PFN_vkQueueSubmit>(device, "vkQueueSubmit")(GraphicsQueue(device), 1, &si, fence);
++		if (r != VK_SUCCESS)
++			ERROR_LOG(RENDERER, "PS4WSI: acquire signal submit failed: %d", r);
++		return r;
++	}
++	return VK_SUCCESS;
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *info)
++{
++	VkResult result = VK_SUCCESS;
++	for (u32 i = 0; i < info->swapchainCount; i++)
++	{
++		auto sc = (PS4Swapchain *)info->pSwapchains[i];
++		auto queueSubmit = Device<PFN_vkQueueSubmit>(sc->device, "vkQueueSubmit");
++		// consume the wait semaphores (one queue, in order: the rendering was submitted before)
++		std::vector<VkPipelineStageFlags> stages(info->waitSemaphoreCount, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
++		VkSubmitInfo si { VK_STRUCTURE_TYPE_SUBMIT_INFO };
++		si.waitSemaphoreCount = i == 0 ? info->waitSemaphoreCount : 0;
++		si.pWaitSemaphores = info->pWaitSemaphores;
++		si.pWaitDstStageMask = stages.data();
++		const u32 buffer = (u32)sc->firstBuffer + info->pImageIndices[i];
++		const s64 arg = (s64)(sFlipsSubmitted + 1);
++		if (si.waitSemaphoreCount)
++		{
++			const VkResult sr = queueSubmit(queue, 1, &si, VK_NULL_HANDLE);
++			if (sr != VK_SUCCESS)
++				ERROR_LOG(RENDERER, "PS4WSI: present semaphore submit failed: %d", sr);
++		}
++		// the flip goes to the GPU behind the frame's commands: no CPU wait for the GPU or vblank
++		int r = ac_ps4_submit_flip(sVideo, buffer, sc->flipMode, arg);
++		const bool gpuFlip = r == 0;
++		if (!gpuFlip)
++		{
++			// fallback: wait for the GPU on the CPU, then flip
++			Device<PFN_vkQueueWaitIdle>(sc->device, "vkQueueWaitIdle")(queue);
++			r = sceVideoOutSubmitFlip(sVideo, (int)buffer, sc->flipMode, arg);
++		}
++		if (r < 0)
++		{
++			ERROR_LOG(RENDERER, "PS4WSI: flip failed: %x", r);
++			result = VK_ERROR_SURFACE_LOST_KHR;
++		}
++		else
++		{
++			sFlipsSubmitted++;
++			CountPresent();
++			// the PS4 keeps its boot splash (the app's picture) over everything until the app
++			// says it has a picture of its own
++			if (sFlipsSubmitted == 1)
++				sceSystemServiceHideSplashScreen();
++			if (sFlipsSubmitted <= 3)
++				NOTICE_LOG(RENDERER, "PS4WSI: flip %llu of buffer %u (%s)", (unsigned long long)sFlipsSubmitted, buffer,
++						gpuFlip ? "GPU-side" : "CPU wait");
++		}
++		if (info->pResults)
++			info->pResults[i] = r < 0 ? VK_ERROR_SURFACE_LOST_KHR : VK_SUCCESS;
++	}
++	return result;
++}
++
++PFN_vkVoidFunction Intercept(const char *name)
++{
++#define PS4WSI_ENTRY(fn) if (strcmp(name, "vk" #fn) == 0) return (PFN_vkVoidFunction)&fn
++	PS4WSI_ENTRY(EnumerateInstanceExtensionProperties);
++	PS4WSI_ENTRY(CreateInstance);
++	PS4WSI_ENTRY(EnumerateDeviceExtensionProperties);
++	PS4WSI_ENTRY(CreateDevice);
++	PS4WSI_ENTRY(CreateHeadlessSurfaceEXT);
++	PS4WSI_ENTRY(DestroySurfaceKHR);
++	PS4WSI_ENTRY(GetPhysicalDeviceSurfaceSupportKHR);
++	PS4WSI_ENTRY(GetPhysicalDeviceSurfaceCapabilitiesKHR);
++	PS4WSI_ENTRY(GetPhysicalDeviceSurfaceFormatsKHR);
++	PS4WSI_ENTRY(GetPhysicalDeviceSurfacePresentModesKHR);
++	PS4WSI_ENTRY(CreateSwapchainKHR);
++	PS4WSI_ENTRY(DestroySwapchainKHR);
++	PS4WSI_ENTRY(GetSwapchainImagesKHR);
++	PS4WSI_ENTRY(AcquireNextImageKHR);
++	PS4WSI_ENTRY(QueuePresentKHR);
++#undef PS4WSI_ENTRY
++	return nullptr;
++}
++
++VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL GetDeviceProcAddr(VkDevice device, const char *name)
++{
++	// vulkan.hpp's DispatchLoaderDynamic::init(device) looks vkGetDeviceProcAddr up again through
++	// itself: RADV's would then resolve the swapchain functions, and it has none (all null)
++	if (strcmp(name, "vkGetDeviceProcAddr") == 0)
++		return (PFN_vkVoidFunction)&GetDeviceProcAddr;
++	if (auto fn = Intercept(name))
++		return fn;
++	return vk_common_GetDeviceProcAddr(device, name);
++}
++
++VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL GetInstanceProcAddr(VkInstance instance, const char *name)
++{
++	if (strcmp(name, "vkGetInstanceProcAddr") == 0)
++		return (PFN_vkVoidFunction)&GetInstanceProcAddr;
++	if (strcmp(name, "vkGetDeviceProcAddr") == 0)
++		return (PFN_vkVoidFunction)&GetDeviceProcAddr;
++	if (auto fn = Intercept(name))
++		return fn;
++	return vk_icdGetInstanceProcAddr(instance, name);
++}
++
++} // namespace
++
++extern "C" PFN_vkGetInstanceProcAddr ps4_vk_get_instance_proc_addr(void) {
++	return &GetInstanceProcAddr;
++}
+diff --git a/ui/ps4/ps4-wsi.h b/ui/ps4/ps4-wsi.h
+new file mode 100644
+index 0000000000..aa57a1572b
+--- /dev/null
++++ b/ui/ps4/ps4-wsi.h
+@@ -0,0 +1,44 @@
++/*
++ * xemu-ps4: Vulkan window system integration on the PS4 (ps4-wsi.cc)
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 2 of the License, or
++ * (at your option) any later version.
++ */
++#ifndef UI_PS4_PS4_WSI_H
++#define UI_PS4_PS4_WSI_H
++
++#include <stdint.h>
++#include <stdio.h>
++#include <vulkan/vulkan.h>
++
++#ifdef __cplusplus
++namespace ps4wsi
++{
++// VideoOut's 1080p output (the system scales it for a 720p TV)
++constexpr unsigned kWidth = 1920;
++constexpr unsigned kHeight = 1080;
++}
++
++typedef uint8_t u8;
++typedef uint32_t u32;
++typedef int64_t s64;
++typedef uint64_t u64;
++
++#define ERROR_LOG(cat, fmt, ...) fprintf(stderr, "ps4-wsi: " fmt "\n", ##__VA_ARGS__)
++#define NOTICE_LOG(cat, fmt, ...) fprintf(stderr, "ps4-wsi: " fmt "\n", ##__VA_ARGS__)
++#define INFO_LOG(cat, fmt, ...) fprintf(stderr, "ps4-wsi: " fmt "\n", ##__VA_ARGS__)
++
++extern "C" {
++#endif
++
++/* vkGetInstanceProcAddr of the statically linked RADV, with the PS4 surface and swapchain
++   (VK_EXT_headless_surface + VK_KHR_swapchain on VideoOut) added. */
++PFN_vkGetInstanceProcAddr ps4_vk_get_instance_proc_addr(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/ui/ps4/xemu-os-utils-ps4.c b/ui/ps4/xemu-os-utils-ps4.c
+new file mode 100644
+index 0000000000..24e9598a97
+--- /dev/null
++++ b/ui/ps4/xemu-os-utils-ps4.c
+@@ -0,0 +1,16 @@
++/*
++ * xemu-ps4: OS-specific helpers (xemu-os-utils.h)
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "ui/xemu-os-utils.h"
++
++const char *xemu_get_os_info(void)
++{
++    return "PlayStation 4";
++}
+diff --git a/ui/ps4/xemu-ps4.c b/ui/ps4/xemu-ps4.c
+new file mode 100644
+index 0000000000..512cf47ae5
+--- /dev/null
++++ b/ui/ps4/xemu-ps4.c
+@@ -0,0 +1,435 @@
++/*
++ * xemu-ps4: the PS4 frontend (replaces ui/xemu.c and its SDL window + OpenGL).
++ *
++ *   /app0                     packaged files (eboot.bin, data/: fonts and pictures)
++ *   /data/xemu                xemu.toml, eeprom.bin, logs (boot-trace.log, crash.log, xemu.log)
++ *   /data/xemu/bios           the MCPX boot ROM (512 bytes) and the flash BIOS (256 KiB or 1 MiB)
++ *   /data/xemu/hdd            the hard disk image (xbox_hdd.qcow2)
++ *   /data/xemu/games          games (.iso, XISO)
++ *
++ * The emulator runs on its own thread as on the desktop; this thread presents the Vulkan
++ * renderer's display image on VideoOut (ps4-present.cc) with the HUD and menus drawn by ImGui
++ * (ps4-hud.cc), and polls the pads through SDL (xemu-input.c).
++ *
++ * Copyright (c) 2020-2025 Matt Borgerson (ui/xemu.c, which this follows)
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/module.h"
++#include "qemu/thread.h"
++#include "qemu/main-loop.h"
++#include "qemu/rcu.h"
++#include "qapi/error.h"
++#include "qapi/qapi-commands-block.h"
++#include "ui/console.h"
++#include "system/runstate.h"
++#include "system/system.h"
++#include "ui/xemu-input.h"
++#include "ui/xemu-settings.h"
++#include "xemu-version.h"
++#include "ui/xemu-os-utils.h"
++#include "ui/xemu-notifications.h"
++#include "hw/xbox/smbus.h"
++#include "hw/xbox/nv2a/nv2a.h"
++#include "hw/xbox/nv2a/nv2a_vk_ps4.h"
++#include "ps4-frontend.h"
++
++#include <SDL3/SDL.h>
++#include <dirent.h>
++#include <locale.h>
++#include <orbis/Sysmodule.h>
++#include <orbis/libkernel.h>
++
++void ps4_boot_trace(const char *line);  /* port/ps4_crashlog.cpp */
++void tcg_register_init_ctx(void);       /* tcg.c */
++
++#define XEMU_DATA "/data/xemu"
++
++/* port/ps4_crashlog.cpp, after the host stacks: the emulator's view of the crash. No
++ * allocation or locks here. (The guest CPU's registers are for later: they live in target
++ * code this file doesn't see.) */
++void ps4_crash_guest_info(void)
++{
++    int fd = open(XEMU_DATA "/crash.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
++    if (fd < 0) {
++        return;
++    }
++    char line[512];
++    int n = snprintf(line, sizeof(line), "\n== xemu at the crash: disc %s\n",
++                     g_config.sys.files.dvd_path ? g_config.sys.files.dvd_path : "");
++    if (n > 0) {
++        write(fd, line, MIN(n, (int)sizeof(line) - 1));
++    }
++    close(fd);
++}
++
++uint64_t vblank_interval_ns = 16666666LL;
++
++struct xemu_console {
++    DisplayChangeListener dcl;
++    DisplaySurface *surface;
++};
++
++static struct xemu_console scon;
++static QemuSemaphore display_init_sem;
++static QemuSemaphore display_shutdown_sem;
++static QemuThread vblank_thread;
++static bool qemu_exiting;
++static int exit_status;
++
++void xemu_main_loop_lock(void)
++{
++    qemu_mutex_lock_main_loop();
++    bql_lock();
++}
++
++void xemu_main_loop_unlock(void)
++{
++    bql_unlock();
++    qemu_mutex_unlock_main_loop();
++}
++
++/* xemu-hud.h compatibility for code shared with the desktop frontend */
++int xemu_is_fullscreen(void)
++{
++    return 1;
++}
++
++void xemu_toggle_fullscreen(void)
++{
++}
++
++static void trace(const char *fmt, ...) G_GNUC_PRINTF(1, 2);
++static void trace(const char *fmt, ...)
++{
++    va_list ap;
++    va_start(ap, fmt);
++    g_autofree char *line = g_strdup_vprintf(fmt, ap);
++    va_end(ap);
++    ps4_boot_trace(line);
++    fprintf(stderr, "%s\n", line);
++}
++
++static void load_system_modules(void)
++{
++    /* calling into a system library whose module isn't loaded kills the app silently */
++    static const struct {
++        const char *name;
++        uint32_t id;
++    } modules[] = {
++        { "SystemService", 0x80000010 }, { "UserService", 0x80000011 },
++        { "VideoOut", 0x80000022 },      { "AudioOut", 0x80000001 },
++        { "Pad", 0x80000024 },           { "Net", 0x8000001C },
++    };
++    for (size_t i = 0; i < ARRAY_SIZE(modules); i++) {
++        int r = sceSysmoduleLoadModuleInternal(modules[i].id);
++        if (r != 0) {
++            trace("loading system module %s failed (%x)", modules[i].name,
++                  (unsigned)r);
++        }
++    }
++}
++
++/* stdout/stderr into /data/xemu/xemu.log: QEMU and xemu report everything there */
++static void redirect_output(void)
++{
++    if (freopen(XEMU_DATA "/xemu.log", "w", stderr) != NULL) {
++        setvbuf(stderr, NULL, _IOLBF, 0);
++        dup2(fileno(stderr), fileno(stdout));
++    }
++}
++
++/* The first file in /data/xemu/bios whose size matches, for a setting left empty */
++static void find_bios_file(const char **setting, const char *what,
++                           const off_t *sizes, int num_sizes)
++{
++    if ((*setting)[0] != '\0' && access(*setting, R_OK) == 0) {
++        return;
++    }
++    DIR *dir = opendir(XEMU_DATA "/bios");
++    if (dir == NULL) {
++        return;
++    }
++    struct dirent *e;
++    while ((e = readdir(dir)) != NULL) {
++        if (e->d_name[0] == '.') {
++            continue;
++        }
++        g_autofree char *path = g_strdup_printf(XEMU_DATA "/bios/%s", e->d_name);
++        struct stat st;
++        if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
++            continue;
++        }
++        for (int i = 0; i < num_sizes; i++) {
++            if (st.st_size == sizes[i]) {
++                xemu_settings_set_string(setting, path);
++                trace("%s: %s", what, path);
++                closedir(dir);
++                return;
++            }
++        }
++    }
++    closedir(dir);
++    trace("%s: none in " XEMU_DATA "/bios", what);
++}
++
++/* PS4 defaults: the renderer that can run here, files where the user puts them */
++static void apply_ps4_settings(void)
++{
++    g_config.display.renderer = CONFIG_DISPLAY_RENDERER_VULKAN;
++    /* the welcome screen is the desktop GUI's; the PS4 home screen explains instead */
++    g_config.general.show_welcome = false;
++
++    static const off_t bootrom_sizes[] = { 512 };
++    static const off_t flash_sizes[] = { 256 * 1024, 1024 * 1024 };
++    find_bios_file(&g_config.sys.files.bootrom_path, "MCPX boot ROM",
++                   bootrom_sizes, ARRAY_SIZE(bootrom_sizes));
++    find_bios_file(&g_config.sys.files.flashrom_path, "flash BIOS",
++                   flash_sizes, ARRAY_SIZE(flash_sizes));
++    if (g_config.sys.files.hdd_path[0] == '\0') {
++        xemu_settings_set_string(&g_config.sys.files.hdd_path,
++                                 XEMU_DATA "/hdd/xbox_hdd.qcow2");
++    }
++}
++
++static void process_vblank(void)
++{
++    assert(bql_locked());
++    graphic_hw_update(scon.dcl.con);
++}
++
++static void *vblank_timer_thread(void *opaque)
++{
++    int64_t next_vblank = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++
++    while (!qatomic_read(&qemu_exiting)) {
++        next_vblank += vblank_interval_ns;
++        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++        if (now < next_vblank) {
++            SDL_DelayPrecise(next_vblank - now);
++        } else if (now > next_vblank + vblank_interval_ns) {
++            next_vblank = now;
++        }
++        if (!qatomic_read(&qemu_exiting)) {
++            xemu_main_loop_lock();
++            process_vblank();
++            xemu_main_loop_unlock();
++        }
++    }
++    return NULL;
++}
++
++static void ps4_gfx_switch(DisplayChangeListener *dcl, DisplaySurface *new_surface)
++{
++    scon.surface = new_surface;
++}
++
++static bool ps4_check_format(DisplayChangeListener *dcl, pixman_format_code_t format)
++{
++    switch (format) {
++    case PIXMAN_BE_b8g8r8x8:
++    case PIXMAN_BE_b8g8r8a8:
++    case PIXMAN_r5g6b5:
++        return true;
++    default:
++        return false;
++    }
++}
++
++static const DisplayChangeListenerOps dcl_ops = {
++    .dpy_name = "xemu-ps4",
++    .dpy_gfx_switch = ps4_gfx_switch,
++    .dpy_gfx_check_format = ps4_check_format,
++};
++
++static void display_early_init(DisplayOptions *o)
++{
++    assert(o->type == DISPLAY_TYPE_XEMU);
++}
++
++static void display_init(DisplayState *ds, DisplayOptions *o)
++{
++    assert(o->type == DISPLAY_TYPE_XEMU);
++
++    QemuConsole *con = qemu_console_lookup_by_index(0);
++    assert(con != NULL);
++    scon.dcl.ops = &dcl_ops;
++    scon.dcl.con = con;
++    register_displaychangelistener(&scon.dcl);
++
++    qemu_thread_create(&vblank_thread, "vblank-timer", vblank_timer_thread,
++                       NULL, QEMU_THREAD_JOINABLE);
++
++    /* the main thread may now start presenting */
++    qemu_sem_post(&display_init_sem);
++}
++
++static QemuDisplay qemu_display_xemu = {
++    .type = DISPLAY_TYPE_XEMU,
++    .early_init = display_early_init,
++    .init = display_init,
++};
++
++static void register_xemu_display(void)
++{
++    qemu_display_register(&qemu_display_xemu);
++}
++
++type_init(register_xemu_display);
++
++static int g_argc;
++static char **g_argv;
++
++static void *qemu_main(void *opaque)
++{
++    qemu_init(g_argc, g_argv);
++    exit_status = qemu_main_loop();
++    qatomic_set(&qemu_exiting, true);
++    bql_unlock();
++    qemu_mutex_unlock_main_loop();
++
++    qemu_sem_wait(&display_shutdown_sem);
++    bql_lock();
++    qemu_cleanup(exit_status);
++    bql_unlock();
++    return NULL;
++}
++
++static void poll_events(void)
++{
++    SDL_Event ev;
++    while (SDL_PollEvent(&ev)) {
++        xemu_main_loop_lock();
++        ps4_hud_process_sdl_event(&ev);
++        xemu_input_process_sdl_events(&ev);
++        xemu_main_loop_unlock();
++    }
++    xemu_main_loop_lock();
++    xemu_input_update_controllers();
++    xemu_main_loop_unlock();
++}
++
++static void render_frame(void)
++{
++    /* the device appears once the machine's NV2A has brought the Vulkan renderer up */
++    if (!ps4_present_ready()) {
++        NV2AVkDevice dev;
++        if (!nv2a_vk_ps4_get_device(&dev) || !ps4_present_init(&dev)) {
++            SDL_Delay(10);
++            return;
++        }
++        trace("presenting on VideoOut");
++    }
++
++    /* Fast path as on the desktop: the renderer's display image. Frames the guest draws without
++     * the GPU (VGA framebuffer) are not shown yet. */
++    bool have_display = nv2a_get_framebuffer_surface() != 0;
++
++    xemu_main_loop_lock();
++    ps4_hud_update();
++    xemu_main_loop_unlock();
++
++    ps4_present_frame(have_display);
++    nv2a_release_framebuffer_surface();
++}
++
++int main(int argc, char **argv)
++{
++    QemuThread thread;
++
++    load_system_modules();
++    mkdir(XEMU_DATA, 0777);
++    mkdir(XEMU_DATA "/bios", 0777);
++    mkdir(XEMU_DATA "/hdd", 0777);
++    mkdir(XEMU_DATA "/games", 0777);
++    redirect_output();
++    setlocale(LC_NUMERIC, "C");
++
++    trace("xemu-ps4 %s (%s %s) starting", xemu_version, xemu_commit, xemu_date);
++    trace("CPU: %s, OS: %s", xemu_get_cpu_info(), xemu_get_os_info());
++
++    xemu_settings_set_path(XEMU_DATA "/xemu.toml");
++    if (!xemu_settings_load()) {
++        trace("xemu.toml: %s", xemu_settings_get_error_message());
++    }
++    apply_ps4_settings();
++    xemu_settings_save();
++    atexit(xemu_settings_save);
++
++    if (!SDL_Init(SDL_INIT_AUDIO | SDL_INIT_GAMEPAD | SDL_INIT_EVENTS)) {
++        trace("SDL_Init: %s", SDL_GetError());
++    }
++
++    /* QEMU parses no command line here: the machine comes from xemu.toml (system/vl.c) */
++    static char *default_argv[] = { (char *)"xemu", NULL };
++    g_argc = 1;
++    g_argv = default_argv;
++
++    nv2a_context_init();
++
++    qemu_sem_init(&display_init_sem, 0);
++    qemu_sem_init(&display_shutdown_sem, 0);
++    trace("starting the emulator");
++    qemu_thread_create(&thread, "qemu_main", qemu_main, NULL, QEMU_THREAD_JOINABLE);
++    qemu_sem_wait(&display_init_sem);
++
++    tcg_register_init_ctx();
++    qemu_set_current_aio_context(qemu_get_aio_context());
++
++    xemu_main_loop_lock();
++    xemu_input_init();
++    xemu_main_loop_unlock();
++
++    trace("main loop");
++    while (!qatomic_read(&qemu_exiting)) {
++        poll_events();
++        render_frame();
++    }
++    trace("exiting (%d)", exit_status);
++    qemu_sem_post(&display_shutdown_sem);
++    qemu_thread_join(&thread);
++    qemu_thread_join(&vblank_thread);
++    ps4_present_shutdown();
++    SDL_Quit();
++    return exit_status;
++}
++
++void xemu_eject_disc(Error **errp)
++{
++    Error *error = NULL;
++
++    xbox_smc_eject_button();
++    xemu_settings_set_string(&g_config.sys.files.dvd_path, "");
++
++    /* Xbox software may request that the drive open, but do it now anyway */
++    qmp_eject("ide0-cd1", NULL, true, false, &error);
++    if (error) {
++        error_propagate(errp, error);
++    }
++
++    xbox_smc_update_tray_state();
++}
++
++void xemu_load_disc(const char *path, Error **errp)
++{
++    Error *error = NULL;
++
++    /* Ensure an eject sequence is always triggered so Xbox software reloads */
++    xbox_smc_eject_button();
++    xemu_settings_set_string(&g_config.sys.files.dvd_path, "");
++
++    qmp_blockdev_change_medium("ide0-cd1", NULL, path, "raw", false, false,
++                               false, 0, &error);
++    if (error) {
++        error_propagate(errp, error);
++    } else {
++        xemu_settings_set_string(&g_config.sys.files.dvd_path, path);
++    }
++
++    xbox_smc_update_tray_state();
++}
+diff --git a/ui/xemu-data.c b/ui/xemu-data.c
+index b0972ce280..1e9d516ca9 100644
+--- a/ui/xemu-data.c
++++ b/ui/xemu-data.c
+@@ -42,7 +42,12 @@ const char *xemu_get_resource_path(const char *filename)
+ 	static char *resource_path = NULL;
+ 
+ 	if (!sdl_base_path) {
++#ifdef __PS4__
++		/* the package's files */
++		sdl_base_path = "/app0/";
++#else
+ 		sdl_base_path = SDL_GetBasePath();
++#endif
+ 	}
+ 
+ 	if (!resource_path) {
+diff --git a/ui/xemu-settings.cc b/ui/xemu-settings.cc
+index 5f9148af8a..d7661813f3 100644
+--- a/ui/xemu-settings.cc
++++ b/ui/xemu-settings.cc
+@@ -77,6 +77,14 @@ const char *xemu_settings_get_base_path(void)
+         return base_path;
+     }
+ 
++#ifdef __PS4__
++    /* settings, EEPROM, caches; BIOS, HDD and games by default (ui/ps4/xemu-ps4.c) */
++    base_path = "/data/xemu/";
++    if (base_path != NULL) {
++        return base_path;
++    }
++#endif
++
+     if (xemu_settings_detect_portable_mode()) {
+         const char *base = SDL_GetBasePath();
+         assert(base != NULL);
+diff --git a/ui/xemu-snapshots.c b/ui/xemu-snapshots.c
+index 9d40864e66..01b26c68bd 100644
+--- a/ui/xemu-snapshots.c
++++ b/ui/xemu-snapshots.c
+@@ -22,7 +22,9 @@
+ #include "xemu-xbe.h"
+ 
+ #include <SDL3/SDL.h>
++#ifndef __PS4__
+ #include <epoxy/gl.h>
++#endif
+ 
+ #include "block/aio.h"
+ #include "block/block_int.h"
+@@ -115,15 +117,23 @@ static void xemu_snapshots_load_data(BlockDriverState *bs_ro,
+     offset += 4;
+ 
+     if (thumbnail_size) {
++        assert(size >= (offset + thumbnail_size));
++#ifdef __PS4__
++        GLuint thumbnail = 0;
++        if (xemu_snapshots_load_png_to_texture(thumbnail, &buf[offset],
++                                               thumbnail_size)) {
++            data->gl_thumbnail = thumbnail;
++        }
++#else
+         GLuint thumbnail;
+         glGenTextures(1, &thumbnail);
+-        assert(size >= (offset + thumbnail_size));
+         if (xemu_snapshots_load_png_to_texture(thumbnail, &buf[offset],
+                                                thumbnail_size)) {
+             data->gl_thumbnail = thumbnail;
+         } else {
+             glDeleteTextures(1, &thumbnail);
+         }
++#endif
+         offset += thumbnail_size;
+     }
+ 
+@@ -142,9 +152,11 @@ static void xemu_snapshots_all_load_data(QEMUSnapshotInfo **info,
+     if (*data) {
+         for (int i = 0; i < xemu_snapshots_len; ++i) {
+             g_free((*data)[i].xbe_title_name);
++#ifndef __PS4__
+             if ((*data)[i].gl_thumbnail) {
+                 glDeleteTextures(1, &((*data)[i].gl_thumbnail));
+             }
++#endif
+         }
+         g_free(*data);
+     }
+diff --git a/ui/xemu-snapshots.h b/ui/xemu-snapshots.h
+index 9d793f0ced..7e5137aab0 100644
+--- a/ui/xemu-snapshots.h
++++ b/ui/xemu-snapshots.h
+@@ -27,7 +27,12 @@ extern "C" {
+ #endif
+ 
+ #include "block/snapshot.h"
++#ifdef __PS4__
++/* no OpenGL: thumbnails are the PS4 frontend's (ui/ps4/ps4-thumbnail.cc), 0 = none */
++typedef unsigned int GLuint;
++#else
+ #include <epoxy/gl.h>
++#endif
+ 
+ #define XEMU_SNAPSHOT_DATA_MAGIC 0x78656d75 // 'xemu'
+ #define XEMU_SNAPSHOT_DATA_VERSION 1
+diff --git a/util/cutils.c b/util/cutils.c
+index 9803f11a59..2cebf29d17 100644
+--- a/util/cutils.c
++++ b/util/cutils.c
+@@ -28,8 +28,10 @@
+ 
+ #ifdef __FreeBSD__
+ #include <sys/sysctl.h>
++#ifndef __PS4__
+ #include <sys/user.h>
+ #endif
++#endif
+ 
+ #ifdef __NetBSD__
+ #include <sys/sysctl.h>
+diff --git a/util/oslib-posix.c b/util/oslib-posix.c
+index 3c14b72665..08488e9009 100644
+--- a/util/oslib-posix.c
++++ b/util/oslib-posix.c
+@@ -48,7 +48,10 @@
+ #include <sys/syscall.h>
+ #endif
+ 
+-#ifdef __FreeBSD__
++#ifdef __PS4__
++#include <pthread_np.h>
++#endif
++#if defined(__FreeBSD__) && !defined(__PS4__)
+ #include <sys/thr.h>
+ #include <sys/user.h>
+ #include <libutil.h>
+@@ -98,6 +101,8 @@ int qemu_get_thread_id(void)
+ {
+ #if defined(__linux__)
+     return syscall(SYS_gettid);
++#elif defined(__PS4__)
++    return pthread_getthreadid_np();
+ #elif defined(__FreeBSD__)
+     /* thread id is up to INT_MAX */
+     long tid;
+@@ -116,6 +121,9 @@ int qemu_kill_thread(int tid, int sig)
+ {
+ #if defined(__linux__)
+     return syscall(__NR_tgkill, getpid(), tid, sig);
++#elif defined(__PS4__)
++    errno = ENOSYS;     /* only the user-mode gdbstub signals threads by id */
++    return -1;
+ #elif defined(__FreeBSD__)
+     return thr_kill2(getpid(), tid, sig);
+ #elif defined(__NetBSD__)
+@@ -685,7 +693,7 @@ char *qemu_get_pid_name(pid_t pid)
+ {
+     char *name = NULL;
+ 
+-#if defined(__FreeBSD__)
++#if defined(__FreeBSD__) && !defined(__PS4__)
+     /* BSDs don't have /proc, but they provide a nice substitute */
+     struct kinfo_proc *proc = kinfo_getproc(pid);
+ 

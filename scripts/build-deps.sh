@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Cross-build xemu's libraries that the seeded sysroot lacks, into $PS4_SYSROOT.
-#   build-deps.sh [venv|overlay|vulkan|samplerate|pixman|glib|all]...
+#   build-deps.sh [venv|overlay|vulkan|samplerate|pixman|glib|sdl3|all]...
 # Sources go to ~/xemups4-build/src/deps, builds to ~/xemups4-build/build/<name>.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -14,6 +14,7 @@ unset PKG_CONFIG_PATH
 
 PIXMAN_VER=0.46.4
 GLIB_VER=2.84.4
+SDL3_REV=829a65d769d935c4852f8159e964312c0957260a     # xemu's subprojects/sdl3.wrap
 
 fetch() {   # fetch <url> <dir name>
     local url="$1" dir="$2"
@@ -89,10 +90,27 @@ dep_glib() {
         -Dlibelf=disabled -Dfile_monitor_backend=auto -Dpcre2:jit=disabled -Dpcre2:grep=false -Dpcre2:test=false
 }
 
+# SDL3 (xemu's audio streams, gamepads, events): a console build (no video: the PS4 frontend
+# presents through Vulkan) with the PS4 audio and pad drivers from port/sdl3 (patches/sdl3-ps4.patch)
+dep_sdl3() {
+    local src="$DEPS/SDL3"
+    if [ ! -d "$src" ]; then
+        git clone -q https://github.com/libsdl-org/SDL "$src"
+        git -C "$src" checkout -q "$SDL3_REV"
+        git -C "$src" checkout -q -b ps4
+        [ -s "$HERE/../patches/sdl3-ps4.patch" ] && git -C "$src" apply "$HERE/../patches/sdl3-ps4.patch"
+    fi
+    local b="$PSB/build/sdl3"
+    rm -rf "$b"
+    cmake -S "$src" -B "$b" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$HERE/../toolchain/ps4-wrapper.cmake"         -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PS4_SYSROOT" -DCMAKE_INSTALL_LIBDIR=lib         -DSDL_STATIC=ON -DSDL_SHARED=OFF -DSDL_TEST_LIBRARY=OFF -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF         -DSDL_UNIX_CONSOLE_BUILD=ON -DSDL_VIDEO=OFF -DSDL_RENDER=OFF -DSDL_GPU=OFF -DSDL_CAMERA=OFF         -DSDL_DIALOG=OFF -DSDL_TRAY=OFF -DSDL_SENSOR=OFF -DSDL_POWER=OFF -DSDL_HIDAPI=OFF         -DSDL_VIRTUAL_JOYSTICK=OFF -DSDL_DBUS=OFF -DSDL_IBUS=OFF -DSDL_LIBUDEV=OFF -DSDL_DISKAUDIO=OFF         -DSDL_OSS=OFF -DSDL_ALSA=OFF -DSDL_JACK=OFF -DSDL_PIPEWIRE=OFF -DSDL_PULSEAUDIO=OFF         -DSDL_SNDIO=OFF -DSDL_LIBICONV=OFF -DSDL_USB=OFF -DSDL_LIBURING=OFF -DSDL_RPATH=OFF
+    ninja -C "$b" -j"$JOBS"
+    ninja -C "$b" install
+}
+
 [ $# -eq 0 ] && set -- all
 for d in "$@"; do
     if [ "$d" = all ]; then
-        for x in venv overlay vulkan samplerate pixman glib; do echo "== $x"; "dep_$x"; done
+        for x in venv overlay vulkan samplerate pixman glib sdl3; do echo "== $x"; "dep_$x"; done
     else
         echo "== $d"; "dep_$d"
     fi

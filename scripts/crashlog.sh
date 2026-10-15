@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fetch /data/Resonance/{boot-trace,crash,hang}.log and Flycast's data/flycast.log from the console
+# Fetch /data/xemu/{boot-trace,crash,hang}.log and xemu.log (xemu's and QEMU's output) from the console
 # and symbolize the crash and hang addresses against the ELF (default: the newest packaged
 # version's, from oelf/).
 #   crashlog.sh [elf]
@@ -10,14 +10,10 @@ ELF="${1:-$(ls -t "$PS4_BUILD_ROOT"/oelf/v*.elf 2>/dev/null | head -1)}"
 HOST="ftp://${PS4_HOST:-192.168.0.90}:${PS4_FTP_PORT:-2121}"
 OUT="$PS4_BUILD_ROOT/logs"
 mkdir -p "$OUT"
-for f in boot-trace.log crash.log hang.log data/flycast.log; do
-    curl -s --max-time 30 -o "$OUT/$(basename "$f")" "$HOST/data/Resonance/$f" || rm -f "$OUT/$(basename "$f")"
+for f in boot-trace.log crash.log hang.log xemu.log; do
+    curl -s --max-time 30 -o "$OUT/$(basename "$f")" "$HOST/data/xemu/$f" || rm -f "$OUT/$(basename "$f")"
 done
-# symbolize against the build that ran (boot-trace.log: "Resonance XX.YY starting")
-if [ -z "${1:-}" ]; then
-    ran="$(grep -oE "Resonance [0-9]{2}\.[0-9]{2} starting" "$OUT/boot-trace.log" 2>/dev/null | head -1 | cut -d' ' -f2 || true)"
-    [ -n "$ran" ] && [ -f "$PS4_BUILD_ROOT/oelf/v$ran.elf" ] && ELF="$PS4_BUILD_ROOT/oelf/v$ran.elf"
-fi
+# symbolize against the newest packaged build
 echo "== symbols from $(basename "$ELF")"
 symbolize() {
     llvm-symbolizer-21 --obj="$ELF" --functions=linkage --demangle --no-inlines "$1" | head -2 | paste -sd' '
@@ -40,11 +36,9 @@ print_thread_dump() {
         esac
     done
 }
-# screenshots taken from Flycast's menu
-echo "== screenshots: $(curl -s --max-time 30 --list-only "$HOST/data/Resonance/screenshots/" | tr '
 ' ' ')"
 echo "== boot-trace.log"; cat "$OUT/boot-trace.log" 2>/dev/null || echo "(none)"
-echo "== flycast.log (last 60 lines)"; tail -60 "$OUT/flycast.log" 2>/dev/null || echo "(none)"
+echo "== xemu.log (last 60 lines)"; tail -60 "$OUT/xemu.log" 2>/dev/null || echo "(none)"
 # crash.log collects every run's crashes: only the last one, and only if this run crashed
 if [ -s "$OUT/crash.log" ] && grep -q "crashed" "$OUT/boot-trace.log" 2>/dev/null; then
     echo "== crash.log (last crash)"

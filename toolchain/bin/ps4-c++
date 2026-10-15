@@ -8,8 +8,10 @@ lang_cxx=0
 
 compile_only=0
 for a in "$@"; do
-    case "$a" in -c|-E|-S|-M|-MM|--version|-v|-dumpversion|-dumpmachine|-print-*) compile_only=1 ;; esac
+    case "$a" in -c|-E|-S|-M|-MM|--version|-dumpversion|-dumpmachine|-print-*) compile_only=1 ;; esac
 done
+# a bare -v prints the version; with inputs it's verbose (CMake links its ABI probe with -v)
+[ "$*" = "-v" ] && compile_only=1
 
 cxxflags=()
 if (( lang_cxx )); then
@@ -21,6 +23,17 @@ fi
 # shellcheck disable=SC2206
 base=($PS4_BASE_FLAGS -isystem "$PS4_SYSROOT/include")
 
+# shared libraries (meson builds some alongside the static ones, e.g. libslirp): the PS4
+# program links the static ones and never loads a .so, so the target is only an empty file
+for a in "$@"; do
+    if [ "$a" = -shared ]; then
+        out=""; prev=""
+        for b in "$@"; do [ "$prev" = -o ] && out="$b"; prev="$b"; done
+        [ -n "$out" ] && : > "$out"
+        exit 0
+    fi
+done
+
 if (( compile_only )) || (( $# == 0 )); then
     exec "$cc" "${cxxflags[@]}" "${base[@]}" "$@"
 fi
@@ -29,10 +42,15 @@ libs=()
 if (( lang_cxx )); then
     libs=("$PS4_SYSROOT/lib/libc++.a" "$PS4_SYSROOT/lib/libc++abi.a" "$OPENORBIS/lib/libunwind.a")
 fi
+# The app's own link (scripts/build-xemu.sh) brings its runtime: PS4_CRT1 (malloc-replacing
+# crt1.o), PS4_APP_LDFLAGS (port runtime, RADV, system libraries, --wrap flags) and
+# PS4_RT_LIB= (no PSChrome malloc next to the port's heap), PS4_APP_LDFLAGS_END (searched last).
+rt_lib="${PS4_RT_LIB-$PS4_SYSROOT/lib/libdolphinps4_rt.a}"
+# shellcheck disable=SC2086
 exec "$cc" "${cxxflags[@]}" "${base[@]}" -fuse-ld=lld -nostdlib -Wl,--no-dynamic-linker -Wl,-m,elf_x86_64 -Wl,-pie \
-    -Wl,--script,"$(dirname "$(readlink -f "$0")")/../ps4-link.x" -Wl,--eh-frame-hdr \
-    "$OPENORBIS/lib/crt1.o" "$OPENORBIS/lib/crti.o" \
+    -Wl,--script,"$PS4_SYSROOT/lib/ps4-link.x" -Wl,--eh-frame-hdr \
+    "${PS4_CRT1:-$OPENORBIS/lib/crt1.o}" "$OPENORBIS/lib/crti.o" \
     -L"$PS4_SYSROOT/lib" -L"$OPENORBIS/usr/lib" -L"$OPENORBIS/lib" \
-    "$@" \
-    -Wl,--start-group "${libs[@]}" "$PS4_SYSROOT/lib/libdolphinps4_rt.a" "$PS4_SYSROOT/lib/libps4compat.a" -lkernel -lc -lSceLibcInternal -lSceNet "$OPENORBIS/lib/libclang_rt.builtins-x86_64.a" -Wl,--end-group \
-    "$OPENORBIS/lib/crtn.o"
+    "$@" ${PS4_APP_LDFLAGS:-} \
+    -Wl,--start-group "${libs[@]}" ${rt_lib:+"$rt_lib"} "$PS4_SYSROOT/lib/libps4compat.a" -lkernel -lc -lSceLibcInternal -lSceNet "$OPENORBIS/lib/libclang_rt.builtins-x86_64.a" -Wl,--end-group \
+    ${PS4_APP_LDFLAGS_END:-} "$OPENORBIS/lib/crtn.o"

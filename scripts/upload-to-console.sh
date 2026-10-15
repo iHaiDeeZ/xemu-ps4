@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Puts a Resonance package in the console's /data/pkg and removes this app's older packages there
-# (Resonance-v*, DeCast-S4-v*, IV0000-DCST00001*; other apps' are left alone).
-#   scripts/upload-to-console.sh out/Resonance-vXX.YY.pkg
+# Puts an xemu-ps4 package in the console's /data/pkg and removes this app's older packages there
+# (xemu-ps4-v*, IV0000-XEMU00001*; other apps' are left alone).
+#   scripts/upload-to-console.sh out/xemu-ps4-vXX.YY.pkg
 # Run it from Windows (Git Bash), not from WSL: on 2026-10-12 every upload sent from inside WSL
 # (even through Windows' curl.exe) was undone on the console a minute later (the old package back,
 # the new one gone), while the same steps from Windows stayed.
@@ -23,9 +23,9 @@ for try in 1 2 3; do
     settled && break
     echo "console: $NAME didn't stay, uploading again"
 done
-for old in $(listing | grep -E '^(Resonance-v[0-9.]+|DeCast-S4-v[0-9.]+|IV0000-DCST00001_00-[A-Z0-9]+)[.]pkg$' | grep -vx "$NAME"); do
+for old in $(listing | grep -E '^(xemu-ps4-v[0-9.]+|IV0000-XEMU00001_00-[A-Z0-9]+)[.]pkg$' | grep -vx "$NAME"); do
     if curl -sS "$HOST/" -Q "DELE /data/pkg/$old" > /dev/null; then echo "console: removed old $old"; else echo "console: could not remove $old"; fi
     sleep 15
 done
 settled || { echo "console: $NAME went missing after the cleanup, uploading again"; curl -sS -T "$PKG" "$HOST/data/pkg/"; settled; }
-listing | grep -E '^(Resonance|DeCast)' | sed 's/^/console has: /'
+listing | grep -E '^(xemu-ps4|IV0000-XEMU00001)' | sed 's/^/console has: /'
