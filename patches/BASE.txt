@@ -1,0 +1,4 @@
+Upstream xemu the PS4 patch applies to (cloned with submodules by scripts/clone-xemu.sh):
+url: https://github.com/xemu-project/xemu
+base: 36334d95b8
+qemu: 10.2.0
