@@ -825,10 +825,10 @@ index 0000000000..e48c43205e
 +))
 diff --git a/ui/ps4/ps4-frontend.h b/ui/ps4/ps4-frontend.h
 new file mode 100644
-index 0000000000..3ec4ab2527
+index 0000000000..918ff98f12
 --- /dev/null
 +++ b/ui/ps4/ps4-frontend.h
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,41 @@
 +/*
 + * xemu-ps4: the PS4 frontend's pieces (xemu-ps4.c, ps4-present.cc, ps4-hud.cc)
 + *
@@ -856,6 +856,8 @@ index 0000000000..3ec4ab2527
 + * the screen, then the HUD's ImGui frame; returns once the GPU is done with the display image. */
 +void ps4_present_frame(bool have_display);
 +void ps4_present_shutdown(void);
++/* frames presented so far, and those that had the emulated display in them */
++void ps4_present_stats(uint64_t *frames, uint64_t *display_frames);
 +
 +/* ps4-hud.cc: notifications, status and menus (ImGui), called with the main loop lock */
 +void ps4_hud_process_sdl_event(const SDL_Event *event);
@@ -1009,10 +1011,10 @@ index 0000000000..bf4f85b198
 +}
 diff --git a/ui/ps4/ps4-present.cc b/ui/ps4/ps4-present.cc
 new file mode 100644
-index 0000000000..72b516a140
+index 0000000000..793a57a4e4
 --- /dev/null
 +++ b/ui/ps4/ps4-present.cc
-@@ -0,0 +1,384 @@
+@@ -0,0 +1,392 @@
 +/*
 + * xemu-ps4: presents the emulated display on VideoOut, on the Vulkan renderer's own device and
 + * queue (the PS4 has no OpenGL to hand the picture to, as the desktop frontends do).
@@ -1059,6 +1061,7 @@ index 0000000000..72b516a140
 +    VkCommandPool pool = VK_NULL_HANDLE;
 +    bool imguiReady = false;
 +    uint64_t frames = 0;
++    uint64_t displayFrames = 0;
 +} P;
 +
 +bool Check(VkResult r, const char *what)
@@ -1369,9 +1372,16 @@ index 0000000000..72b516a140
 +    if (have_display) {
 +        vkWaitForFences(P.dev.device, 1, &P.fences[index], VK_TRUE, UINT64_MAX);
 +    }
++    P.displayFrames += have_display;
 +    if (++P.frames == 1) {
 +        fprintf(stderr, "ps4-present: first frame\n");
 +    }
++}
++
++extern "C" void ps4_present_stats(uint64_t *frames, uint64_t *display_frames)
++{
++    *frames = P.frames;
++    *display_frames = P.displayFrames;
 +}
 +
 +extern "C" void ps4_present_shutdown(void)
@@ -2060,10 +2070,10 @@ index 0000000000..24e9598a97
 +}
 diff --git a/ui/ps4/xemu-ps4.c b/ui/ps4/xemu-ps4.c
 new file mode 100644
-index 0000000000..beab1311f3
+index 0000000000..8927bfbb5b
 --- /dev/null
 +++ b/ui/ps4/xemu-ps4.c
-@@ -0,0 +1,467 @@
+@@ -0,0 +1,529 @@
 +/*
 + * xemu-ps4: the PS4 frontend (replaces ui/xemu.c and its SDL window + OpenGL).
 + *
@@ -2103,6 +2113,10 @@ index 0000000000..beab1311f3
 +#include "hw/xbox/smbus.h"
 +#include "hw/xbox/nv2a/nv2a.h"
 +#include "hw/xbox/nv2a/nv2a_vk_ps4.h"
++#include "hw/xbox/nv2a/debug.h"
++#include "hw/core/cpu.h"
++#include "system/cpus.h"
++#include "qemu/timer.h"
 +#include "ps4-frontend.h"
 +
 +#include <SDL3/SDL.h>
@@ -2363,6 +2377,48 @@ index 0000000000..beab1311f3
 +
 +type_init(register_xemu_display);
 +
++/*
++ * Every 5 s in boot-trace.log: frames presented (and with the emulated display in them),
++ * frames the guest flipped on the NV2A, the guest's clock and where its CPU is. Racy reads,
++ * for diagnosis only.
++ */
++static void *monitor_thread(void *opaque)
++{
++    uint64_t last_frames = 0, last_display = 0;
++    unsigned int last_flips = 0;
++    int64_t last_guest_ns = 0;
++    while (!qatomic_read(&qemu_exiting)) {
++        g_usleep(5 * G_USEC_PER_SEC);
++        uint64_t frames, display;
++        ps4_present_stats(&frames, &display);
++        unsigned int flips = g_nv2a_stats.frame_count;
++        int64_t guest_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++        CPUState *cpu = first_cpu;
++        uint64_t pc = 0;
++        if (cpu != NULL && CPU_GET_CLASS(cpu)->get_pc) {
++            pc = CPU_GET_CLASS(cpu)->get_pc(cpu);
++        }
++        trace("monitor: presented %.1f/s (display in %.1f/s), guest flips %.1f/s, "
++              "guest clock +%.2f s, runstate %s, cpu pc 0x%08" PRIx64 "%s",
++              (frames - last_frames) / 5.0, (display - last_display) / 5.0,
++              (flips - last_flips) / 5.0, (guest_ns - last_guest_ns) / 1e9,
++              RunState_str(runstate_get()), pc,
++              cpu != NULL && cpu->halted ? " (halted)" : "");
++        /* the guest CPU's whole state: in xemu.log, the first minute, then every minute */
++        static int dumps;
++        if (cpu != NULL && (dumps < 12 || dumps % 12 == 0)) {
++            fprintf(stderr, "== guest CPU at %.1f s of guest time\n", guest_ns / 1e9);
++            cpu_dump_state(cpu, stderr, CPU_DUMP_FPU);
++        }
++        dumps++;
++        last_frames = frames;
++        last_display = display;
++        last_flips = flips;
++        last_guest_ns = guest_ns;
++    }
++    return NULL;
++}
++
 +static int g_argc;
 +static char **g_argv;
 +
@@ -2463,10 +2519,23 @@ index 0000000000..beab1311f3
 +        }
 +    }
 +
-+    /* QEMU parses no command line here: the machine comes from xemu.toml (system/vl.c) */
-+    static char *default_argv[] = { (char *)"xemu", NULL };
-+    g_argc = 1;
-+    g_argv = default_argv;
++    /* QEMU parses no command line here: the machine comes from xemu.toml (system/vl.c). Extra
++     * QEMU options, one per line, from /data/xemu/qemu-args.txt (e.g. -d in_asm,int -D file). */
++    GPtrArray *args = g_ptr_array_new();
++    g_ptr_array_add(args, (char *)"xemu");
++    g_autofree char *extra = NULL;
++    if (g_file_get_contents(XEMU_DATA "/qemu-args.txt", &extra, NULL, NULL)) {
++        for (char **line = g_strsplit(extra, "\n", -1), **l = line; *l; l++) {
++            g_strstrip(*l);
++            if (**l != '\0' && **l != '#') {
++                trace("extra QEMU argument: %s", *l);
++                g_ptr_array_add(args, *l);
++            }
++        }
++    }
++    g_ptr_array_add(args, NULL);
++    g_argc = args->len - 1;
++    g_argv = (char **)args->pdata;
 +
 +    nv2a_context_init();
 +
@@ -2482,6 +2551,9 @@ index 0000000000..beab1311f3
 +    xemu_main_loop_lock();
 +    xemu_input_init();
 +    xemu_main_loop_unlock();
++
++    QemuThread monitor;
++    qemu_thread_create(&monitor, "ps4-monitor", monitor_thread, NULL, QEMU_THREAD_DETACHED);
 +
 +    trace("main loop");
 +    while (!qatomic_read(&qemu_exiting)) {
