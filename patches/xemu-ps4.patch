@@ -826,10 +826,10 @@ index 0000000000..feb4ee519d
 +))
 diff --git a/ui/ps4/ps4-frontend.h b/ui/ps4/ps4-frontend.h
 new file mode 100644
-index 0000000000..8b6dd02a6e
+index 0000000000..e0e11a3775
 --- /dev/null
 +++ b/ui/ps4/ps4-frontend.h
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,54 @@
 +/*
 + * xemu-ps4: the PS4 frontend's pieces (xemu-ps4.c, ps4-present.cc, ps4-hud.cc)
 + *
@@ -864,6 +864,8 @@ index 0000000000..8b6dd02a6e
 +void ps4_pad_init(void);
 +/* its SDL joystick id (0 if it couldn't be set up) */
 +SDL_JoystickID ps4_pad_joystick_id(void);
++/* reads, failures, reopens and the last buttons, for the monitor */
++void ps4_pad_stats(char *out, size_t size);
 +
 +/* xemu-ps4.c: the busiest threads over the last 5 s ("name N%, ..."), for the overlay */
 +extern char ps4_perf_threads[256];
@@ -1068,10 +1070,10 @@ index 0000000000..0ab2702976
 +}
 diff --git a/ui/ps4/ps4-pad.c b/ui/ps4/ps4-pad.c
 new file mode 100644
-index 0000000000..183f590c8b
+index 0000000000..04de3496fa
 --- /dev/null
 +++ b/ui/ps4/ps4-pad.c
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,184 @@
 +/*
 + * xemu-ps4: the DualShock 4 as an SDL gamepad. SDL has no PS4 joystick driver; its virtual
 + * gamepad stands in, fed from ScePad each time SDL updates its joysticks, so xemu-input.c binds,
@@ -1099,12 +1101,18 @@ index 0000000000..183f590c8b
 +void ps4_boot_trace(const char *line); /* port/ps4_crashlog.cpp */
 +
 +typedef struct PS4Pad {
++    int user;
 +    int handle;
 +    SDL_JoystickID id;
 +    SDL_Joystick *joystick;
++    /* reads since start: for the monitor (v00.12: SDL stopped seeing the pad change) */
++    unsigned reads, failures, disconnected, reopens;
++    int last_error;
++    uint32_t last_buttons;
++    unsigned failures_in_a_row;
 +} PS4Pad;
 +
-+static PS4Pad pad = { .handle = -1 };
++static PS4Pad pad = { .user = -1, .handle = -1 };
 +
 +static const struct {
 +    uint32_t ps4;
@@ -1143,10 +1151,30 @@ index 0000000000..183f590c8b
 +{
 +    OrbisPadData data;
 +    memset(&data, 0, sizeof(data));
-+    if (pad.joystick == NULL || scePadReadState(pad.handle, &data) != 0) {
++    if (pad.joystick == NULL) {
 +        return;
 +    }
++    int r = scePadReadState(pad.handle, &data);
++    if (r != 0) {
++        pad.failures++;
++        pad.last_error = r;
++        /* a handle gone bad (the pad reconnected, ...): open it again after a second */
++        if (++pad.failures_in_a_row >= 60) {
++            scePadClose(pad.handle);
++            pad.handle = scePadOpen(pad.user, ORBIS_PAD_PORT_TYPE_STANDARD, 0, NULL);
++            if (pad.handle < 0) {
++                pad.handle = scePadGetHandle(pad.user, ORBIS_PAD_PORT_TYPE_STANDARD, 0);
++            }
++            pad.reopens++;
++            pad.failures_in_a_row = 0;
++        }
++        return;
++    }
++    pad.failures_in_a_row = 0;
++    pad.reads++;
++    pad.last_buttons = data.buttons;
 +    if (!data.connected) {
++        pad.disconnected++;
 +        data.buttons = 0;
 +        data.leftStick.x = data.leftStick.y = 128;
 +        data.rightStick.x = data.rightStick.y = 128;
@@ -1182,6 +1210,7 @@ index 0000000000..183f590c8b
 +        ps4_boot_trace("pad: no initial user");
 +        return;
 +    }
++    pad.user = user;
 +    pad.handle = scePadOpen(user, ORBIS_PAD_PORT_TYPE_STANDARD, 0, NULL);
 +    if (pad.handle < 0) {
 +        snprintf(line, sizeof(line), "pad: scePadOpen(user %x) failed (%x)", user,
@@ -1221,6 +1250,13 @@ index 0000000000..183f590c8b
 +SDL_JoystickID ps4_pad_joystick_id(void)
 +{
 +    return pad.id;
++}
++
++void ps4_pad_stats(char *out, size_t size)
++{
++    snprintf(out, size, "pad: %u reads, %u failed (last %x), %u disconnected, %u reopens, "
++             "buttons %x", pad.reads, pad.failures, (unsigned)pad.last_error, pad.disconnected,
++             pad.reopens, pad.last_buttons);
 +}
 diff --git a/ui/ps4/ps4-present.cc b/ui/ps4/ps4-present.cc
 new file mode 100644
@@ -2399,10 +2435,10 @@ index 0000000000..24e9598a97
 +}
 diff --git a/ui/ps4/xemu-ps4.c b/ui/ps4/xemu-ps4.c
 new file mode 100644
-index 0000000000..f1404b20b3
+index 0000000000..cc2551fbe4
 --- /dev/null
 +++ b/ui/ps4/xemu-ps4.c
-@@ -0,0 +1,709 @@
+@@ -0,0 +1,746 @@
 +/*
 + * xemu-ps4: the PS4 frontend (replaces ui/xemu.c and its SDL window + OpenGL).
 + *
@@ -2805,6 +2841,36 @@ index 0000000000..f1404b20b3
 +type_init(register_xemu_display);
 +
 +void ps4_thread_busy_report(char *out, size_t size, int min_percent); /* port/ps4_sampler.cpp */
++void ps4_watch_thread(const char *name);
++void ps4_sampler_register_thread(const char *name);
++void ps4_sampler_start(void);
++
++/* /data/xemu/profile.txt exists: the sampling profiler writes /data/xemu/samples.log */
++static bool profiling;
++
++/*
++ * Every QEMU thread, first thing (util/qemu-thread-posix.c). The emulation's busy threads go
++ * to the sampler when profiling (it keeps the name pointer: a copy; QEMU starts its threads
++ * with every signal blocked, the sampler's SIGPROF must come through).
++ */
++void ps4_thread_started(const char *name)
++{
++    static const char *const sampled[] = { "ALL CPUs/TCG", "nv2a.pfifo_thread",
++                                           "mcpx.apu_thread", "qemu_main" };
++    bool sample = false;
++    for (size_t i = 0; i < ARRAY_SIZE(sampled); i++) {
++        sample |= profiling && strcmp(name, sampled[i]) == 0;
++    }
++    if (!sample) {
++        ps4_watch_thread(name);
++        return;
++    }
++    sigset_t prof;
++    sigemptyset(&prof);
++    sigaddset(&prof, SIGPROF);
++    pthread_sigmask(SIG_UNBLOCK, &prof, NULL);
++    ps4_sampler_register_thread(g_strdup(name));
++}
 +
 +/* the busiest threads over the last 5 s, for the HUD's overlay (ps4-frontend.h) */
 +char ps4_perf_threads[256];
@@ -2833,12 +2899,14 @@ index 0000000000..f1404b20b3
 +        char threads[sizeof(ps4_perf_threads)];
 +        ps4_thread_busy_report(threads, sizeof(threads), 5);
 +        memcpy(ps4_perf_threads, threads, sizeof(threads));
++        char pad_stats[160];
++        ps4_pad_stats(pad_stats, sizeof(pad_stats));
 +        trace("monitor: presented %.1f/s (display in %.1f/s), guest flips %.1f/s, "
-+              "guest clock +%.2f s, runstate %s, cpu pc 0x%08" PRIx64 "%s | %s",
++              "guest clock +%.2f s, runstate %s, cpu pc 0x%08" PRIx64 "%s | %s | %s",
 +              (frames - last_frames) / 5.0, (display - last_display) / 5.0,
 +              (flips - last_flips) / 5.0, (guest_ns - last_guest_ns) / 1e9,
 +              RunState_str(runstate_get()), pc,
-+              cpu != NULL && cpu->halted ? " (halted)" : "", threads);
++              cpu != NULL && cpu->halted ? " (halted)" : "", threads, pad_stats);
 +        /* (no cpu_dump_state here: from this thread, with the guest kernel running, it took
 +         * the process down in v00.07) */
 +        last_frames = frames;
@@ -2998,6 +3066,11 @@ index 0000000000..f1404b20b3
 +    redirect_output();
 +    atexit(trace_exit);
 +    setlocale(LC_NUMERIC, "C");
++    profiling = access(XEMU_DATA "/profile.txt", F_OK) == 0;
++    if (profiling) {
++        ps4_sampler_start();
++        ps4_sampler_register_thread("main (display)");
++    }
 +
 +    trace("xemu-ps4 %s (%s %s) starting", xemu_version, xemu_commit, xemu_date);
 +    trace("CPU: %s, OS: %s", xemu_get_cpu_info(), xemu_get_os_info());
@@ -3308,7 +3381,7 @@ index 3c14b72665..08488e9009 100644
      struct kinfo_proc *proc = kinfo_getproc(pid);
  
 diff --git a/util/qemu-thread-posix.c b/util/qemu-thread-posix.c
-index ba725444ba..5a13e0cd4f 100644
+index ba725444ba..7e1705fdb1 100644
 --- a/util/qemu-thread-posix.c
 +++ b/util/qemu-thread-posix.c
 @@ -370,6 +370,16 @@ static void *qemu_thread_start(void *args)
@@ -3317,11 +3390,11 @@ index ba725444ba..5a13e0cd4f 100644
      }
 +#ifdef __PS4__
 +    {
-+        /* the PS4 port's thread watch (port/ps4_sampler.cpp): named in crash and hang
-+         * reports and in the per-thread load the frontend shows; busy ones get a heap arena */
-+        extern void ps4_watch_thread(const char *name);
++        /* the PS4 frontend's thread start (ui/ps4/xemu-ps4.c): named in crash and hang
++         * reports, busy ones get a heap arena and, when profiling, the sampler */
++        extern void ps4_thread_started(const char *name);
 +        if (qemu_thread_args->name) {
-+            ps4_watch_thread(qemu_thread_args->name);
++            ps4_thread_started(qemu_thread_args->name);
 +        }
 +    }
 +#endif
