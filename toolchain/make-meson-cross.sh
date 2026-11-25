@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Writes $PSB/ps4-cross.ini: the meson cross file for PS4 dependencies and xemu. Compiles and links
-# through toolchain/bin/ps4-cc / ps4-c++ (OpenOrbis CRT + libc, clang 21, libc++ 21), with
-# pkg-config confined to our sysroot (and PacBrew's for the few libraries taken from there).
+# Writes $PSB/ps4-cross.ini: the meson cross file for xemu and its dependencies. Compiles and links
+# through toolchain/bin/ps4-cc / ps4-c++ (ps4-kit's wrappers: OpenOrbis CRT + C library, clang 21,
+# libc++ 21), pkg-config confined to this port's sysroot, CMake subprojects (glslang, volk,
+# SPIRV-Reflect) with toolchain/ps4-xemu.cmake.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-source "$HERE/env.sh"
-BIN="$HOME/xemups4/toolchain/bin"     # space-free path to this repo (scripts/seed-build-tree.sh)
+source "$HERE/../scripts/env.sh"
+BIN="$XEMUPS4/toolchain/bin"
 mkdir -p "$PSB"
 cat > "$PSB/ps4-cross.ini" <<INI
 [binaries]
@@ -22,7 +23,7 @@ cmake = 'cmake'
 [properties]
 needs_exe_wrapper = true
 pkg_config_libdir = ['$PS4_SYSROOT/lib/pkgconfig', '$PS4_SYSROOT/libdata/pkgconfig', '$PS4_SYSROOT/share/pkgconfig']
-cmake_toolchain_file = '$HERE/ps4-xemu.cmake'
+cmake_toolchain_file = '$XEMUPS4/toolchain/ps4-xemu.cmake'
 
 [built-in options]
 c_args = ['-march=btver2']

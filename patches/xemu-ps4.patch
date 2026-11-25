@@ -1,5 +1,175 @@
+diff --git a/accel/tcg/cputlb.c b/accel/tcg/cputlb.c
+index b9ae474..8da2039 100644
+--- a/accel/tcg/cputlb.c
++++ b/accel/tcg/cputlb.c
+@@ -900,6 +900,76 @@ static void tlb_reset_dirty_range_locked(CPUTLBEntryFull *full, CPUTLBEntry *ent
+     }
+ }
+ 
++#ifdef __PS4__
++/*
++ * xemu-ps4: the TLB dirty index. NV2A clears guest RAM's dirty bits for every vertex buffer and
++ * texture the emulated CPU rewrote - several times a draw - and each clear made tlb_reset_dirty
++ * walk every entry of every TLB (up to 2^20 each) under the TLB lock, which the emulated CPU needs
++ * for every TLB fill: v00.15's busiest QEMU function after the JIT. The walk only has to find the
++ * entries that let writes to the pages through without the dirty trap ("writable-clean"). Those
++ * are noted here, per guest RAM page, at the three places an entry becomes so (tlb_set_page_full,
++ * tlb_set_dirty, victim_tlb_hit's swap - all under the TLB lock, as tlb_reset_dirty is), and a
++ * reset visits just those plus the 8-entry victim TLBs. A page with more entries than fit falls
++ * back to the full walk. Stale notes are harmless: each entry is checked before it is changed.
++ */
++#define TDI_SLOTS 4
++#define TDI_OVERFLOW 0xff
++typedef struct TDIPage {
++    uint32_t slot[TDI_SLOTS];   /* mmu_idx << 24 | index */
++    uint8_t count;
++} TDIPage;
++
++bool tlb_dirty_index_enabled = true;    /* the frontend's setting, before the machine starts */
++uint64_t tlb_dirty_index_resets, tlb_dirty_index_walks;   /* for the frontend's monitor */
++static uintptr_t tdi_base, tdi_size;    /* the guest RAM's host range */
++static TDIPage *tdi_pages;
++
++void tlb_dirty_index_register(void *host, size_t size)
++{
++    if (!tlb_dirty_index_enabled || tdi_pages != NULL) {
++        return;
++    }
++    tdi_pages = g_new0(TDIPage, size >> TARGET_PAGE_BITS);
++    tdi_base = (uintptr_t)host;
++    tdi_size = size;
++}
++
++/* Called with tlb_c.lock held: note the entry at index if it lets writes through untrapped */
++static void tdi_note_entry(CPUState *cpu, int mmu_idx, uintptr_t index)
++{
++    if (tdi_pages == NULL) {
++        return;
++    }
++    CPUTLBEntry *ent = &cpu_tlb_fast(cpu, mmu_idx)->table[index];
++    CPUTLBEntryFull *full = &cpu->neg.tlb.d[mmu_idx].fulltlb[index];
++    const uintptr_t addr = ent->addr_write;
++    int flags = addr | full->slow_flags[MMU_DATA_STORE];
++    flags &= TLB_INVALID_MASK | TLB_MMIO | TLB_DISCARD_WRITE | TLB_NOTDIRTY;
++    if (flags != 0) {
++        return;
++    }
++    const uintptr_t off = (addr & TARGET_PAGE_MASK) + ent->addend - tdi_base;
++    if (off >= tdi_size) {
++        return;
++    }
++    TDIPage *p = &tdi_pages[off >> TARGET_PAGE_BITS];
++    const uint32_t v = (uint32_t)mmu_idx << 24 | (uint32_t)index;
++    if (p->count == TDI_OVERFLOW) {
++        return;
++    }
++    for (int i = 0; i < p->count; i++) {
++        if (p->slot[i] == v) {
++            return;
++        }
++    }
++    if (p->count < TDI_SLOTS) {
++        p->slot[p->count++] = v;
++    } else {
++        p->count = TDI_OVERFLOW;
++    }
++}
++#endif
++
+ /*
+  * Called with tlb_c.lock held.
+  * Called only from the vCPU context, i.e. the TLB's owner thread.
+@@ -917,6 +987,49 @@ static inline void copy_tlb_helper_locked(CPUTLBEntry *d, const CPUTLBEntry *s)
+ void tlb_reset_dirty(CPUState *cpu, uintptr_t start, uintptr_t length)
+ {
+     int mmu_idx;
++#ifdef __PS4__
++    if (tdi_pages != NULL && length != 0 && start - tdi_base < tdi_size &&
++        start + length - tdi_base <= tdi_size) {
++        bool walk = false;
++        const uintptr_t first = (start - tdi_base) >> TARGET_PAGE_BITS;
++        const uintptr_t last = (start + length - 1 - tdi_base) >> TARGET_PAGE_BITS;
++        qemu_spin_lock(&cpu->neg.tlb.c.lock);
++        tlb_dirty_index_resets++;
++        for (uintptr_t pg = first; pg <= last; pg++) {
++            TDIPage *p = &tdi_pages[pg];
++            if (p->count == TDI_OVERFLOW) {
++                walk = true;
++            } else {
++                for (int i = 0; i < p->count; i++) {
++                    const int idx = p->slot[i] >> 24;
++                    const uintptr_t index = p->slot[i] & 0xffffff;
++                    CPUTLBDescFast *fast = cpu_tlb_fast(cpu, idx);
++                    if (index < tlb_n_entries(fast)) {
++                        tlb_reset_dirty_range_locked(&cpu->neg.tlb.d[idx].fulltlb[index],
++                                                     &fast->table[index], start, length);
++                    }
++                }
++            }
++            p->count = 0;
++        }
++        for (mmu_idx = 0; mmu_idx < NB_MMU_MODES; mmu_idx++) {
++            CPUTLBDesc *desc = &cpu->neg.tlb.d[mmu_idx];
++            if (walk) {
++                CPUTLBDescFast *fast = cpu_tlb_fast(cpu, mmu_idx);
++                const unsigned int n = tlb_n_entries(fast);
++                for (unsigned int i = 0; i < n; i++) {
++                    tlb_reset_dirty_range_locked(&desc->fulltlb[i], &fast->table[i], start, length);
++                }
++            }
++            for (unsigned int i = 0; i < CPU_VTLB_SIZE; i++) {
++                tlb_reset_dirty_range_locked(&desc->vfulltlb[i], &desc->vtable[i], start, length);
++            }
++        }
++        tlb_dirty_index_walks += walk;
++        qemu_spin_unlock(&cpu->neg.tlb.c.lock);
++        return;
++    }
++#endif
+ 
+     qemu_spin_lock(&cpu->neg.tlb.c.lock);
+     for (mmu_idx = 0; mmu_idx < NB_MMU_MODES; mmu_idx++) {
+@@ -959,6 +1072,9 @@ static void tlb_set_dirty(CPUState *cpu, vaddr addr)
+     qemu_spin_lock(&cpu->neg.tlb.c.lock);
+     for (mmu_idx = 0; mmu_idx < NB_MMU_MODES; mmu_idx++) {
+         tlb_set_dirty1_locked(tlb_entry(cpu, mmu_idx, addr), addr);
++#ifdef __PS4__
++        tdi_note_entry(cpu, mmu_idx, tlb_index(cpu, mmu_idx, addr));
++#endif
+     }
+ 
+     for (mmu_idx = 0; mmu_idx < NB_MMU_MODES; mmu_idx++) {
+@@ -1184,6 +1300,9 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
+ 
+     copy_tlb_helper_locked(te, &tn);
+     tlb_n_used_entries_inc(cpu, mmu_idx);
++#ifdef __PS4__
++    tdi_note_entry(cpu, mmu_idx, index);
++#endif
+     qemu_spin_unlock(&tlb->c.lock);
+ }
+ 
+@@ -1325,6 +1444,18 @@ static bool victim_tlb_hit(CPUState *cpu, size_t mmu_idx, size_t index,
+             copy_tlb_helper_locked(&tmptlb, tlb);
+             copy_tlb_helper_locked(tlb, vtlb);
+             copy_tlb_helper_locked(vtlb, &tmptlb);
++#ifdef __PS4__
++            if (tdi_pages != NULL) {
++                /* the full entries too while locked: the note reads the main one's flags */
++                CPUTLBEntryFull *f1 = &cpu->neg.tlb.d[mmu_idx].fulltlb[index];
++                CPUTLBEntryFull *f2 = &cpu->neg.tlb.d[mmu_idx].vfulltlb[vidx];
++                CPUTLBEntryFull tmpf;
++                tmpf = *f1; *f1 = *f2; *f2 = tmpf;
++                tdi_note_entry(cpu, mmu_idx, index);
++                qemu_spin_unlock(&cpu->neg.tlb.c.lock);
++                return true;
++            }
++#endif
+             qemu_spin_unlock(&cpu->neg.tlb.c.lock);
+ 
+             CPUTLBEntryFull *f1 = &cpu->neg.tlb.d[mmu_idx].fulltlb[index];
 diff --git a/accel/tcg/tcg-accel-ops-mttcg.c b/accel/tcg/tcg-accel-ops-mttcg.c
-index cf1ee7ac25..c5cc4da46b 100644
+index cf1ee7a..c5cc4da 100644
 --- a/accel/tcg/tcg-accel-ops-mttcg.c
 +++ b/accel/tcg/tcg-accel-ops-mttcg.c
 @@ -85,6 +85,10 @@ static void *mttcg_cpu_thread_fn(void *arg)
@@ -14,7 +184,7 @@ index cf1ee7ac25..c5cc4da46b 100644
  
          if (cpu_can_run(cpu)) {
 diff --git a/block.c b/block.c
-index 14ed7f1487..6923af4535 100644
+index 14ed7f1..6923af4 100644
 --- a/block.c
 +++ b/block.c
 @@ -54,7 +54,7 @@
@@ -27,7 +197,7 @@ index 14ed7f1487..6923af4535 100644
  #include <sys/queue.h>
  #if defined(HAVE_SYS_DISK_H)
 diff --git a/block/file-posix.c b/block/file-posix.c
-index 6265d2e248..0fbd8b353f 100644
+index 6265d2e..0fbd8b3 100644
 --- a/block/file-posix.c
 +++ b/block/file-posix.c
 @@ -89,6 +89,14 @@
@@ -46,7 +216,7 @@ index 6265d2e248..0fbd8b353f 100644
  #include <sys/disk.h>
  #include <sys/cdio.h>
 diff --git a/chardev/char-parallel.c b/chardev/char-parallel.c
-index 62a44b2f96..03cd2b05b0 100644
+index 62a44b2..03cd2b0 100644
 --- a/chardev/char-parallel.c
 +++ b/chardev/char-parallel.c
 @@ -29,7 +29,7 @@
@@ -68,7 +238,7 @@ index 62a44b2f96..03cd2b05b0 100644
  typedef struct {
      Chardev parent;
 diff --git a/chardev/char-serial.c b/chardev/char-serial.c
-index 4c6ca713eb..83e4169c7e 100644
+index 4c6ca71..83e4169 100644
 --- a/chardev/char-serial.c
 +++ b/chardev/char-serial.c
 @@ -51,9 +51,7 @@ static void qmp_chardev_open_serial(Chardev *chr,
@@ -83,7 +253,7 @@ index 4c6ca713eb..83e4169c7e 100644
  static void tty_serial_init(int fd, int speed,
                              int parity, int data_bits, int stop_bits)
 diff --git a/hw/xbox/mcpx/apu/apu.c b/hw/xbox/mcpx/apu/apu.c
-index 1ee6dc4252..b6b5f933ba 100644
+index 1ee6dc4..b6b5f93 100644
 --- a/hw/xbox/mcpx/apu/apu.c
 +++ b/hw/xbox/mcpx/apu/apu.c
 @@ -259,6 +259,10 @@ static void *mcpx_apu_frame_thread(void *arg)
@@ -99,7 +269,7 @@ index 1ee6dc4252..b6b5f933ba 100644
              qemu_cond_signal(&d->idle_cond);
 diff --git a/hw/xbox/mcpx/apu/dsp/dsp_jit_stub.c b/hw/xbox/mcpx/apu/dsp/dsp_jit_stub.c
 new file mode 100644
-index 0000000000..830c2adf63
+index 0000000..830c2ad
 --- /dev/null
 +++ b/hw/xbox/mcpx/apu/dsp/dsp_jit_stub.c
 @@ -0,0 +1,19 @@
@@ -123,7 +293,7 @@ index 0000000000..830c2adf63
 +    dsp_c_init(dsp);
 +}
 diff --git a/hw/xbox/mcpx/apu/dsp/meson.build b/hw/xbox/mcpx/apu/dsp/meson.build
-index 3429547e24..6ba7217141 100644
+index 3429547..6ba7217 100644
 --- a/hw/xbox/mcpx/apu/dsp/meson.build
 +++ b/hw/xbox/mcpx/apu/dsp/meson.build
 @@ -1,10 +1,17 @@
@@ -146,9 +316,37 @@ index 3429547e24..6ba7217141 100644
    dependencies: [dsp56300_emu_ffi],
  )
  
+diff --git a/hw/xbox/mcpx/apu/vp/vp.c b/hw/xbox/mcpx/apu/vp/vp.c
+index c57ecb6..a5dbf6f 100644
+--- a/hw/xbox/mcpx/apu/vp/vp.c
++++ b/hw/xbox/mcpx/apu/vp/vp.c
+@@ -1597,6 +1597,9 @@ static void *voice_worker_thread(void *arg)
+     do {
+         int64_t start_time = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+         g_dbg.vp.workers[worker_id].num_voices = self->queue_len;
++#ifdef __PS4__
++        { extern void ps4_thread_cpu_tick(void); ps4_thread_cpu_tick(); }
++#endif
+ 
+         if (self->queue_len) {
+             qemu_mutex_unlock(&vwd->lock);
+@@ -1768,7 +1771,13 @@ static void voice_work_init(MCPXAPUState *d)
+ {
+     VoiceWorkDispatch *vwd = &d->vp.voice_work_dispatch;
+ 
++#ifdef __PS4__
++    /* xemu-ps4: SDL can't count the PS4's cores (1); the frontend's setting (ps4.ini) instead */
++    extern int ps4_voice_workers(void);
++    int num_workers = g_config.audio.vp.num_workers ?: ps4_voice_workers();
++#else
+     int num_workers = g_config.audio.vp.num_workers ?: SDL_GetNumLogicalCPUCores();
++#endif
+     vwd->num_workers = MAX(1, MIN(num_workers, MAX_VOICE_WORKERS));
+     vwd->workers = g_malloc0_n(vwd->num_workers, sizeof(VoiceWorker));
+     vwd->workers_should_exit = false;
 diff --git a/hw/xbox/nv2a/nv2a_vk_ps4.h b/hw/xbox/nv2a/nv2a_vk_ps4.h
 new file mode 100644
-index 0000000000..8531287d1e
+index 0000000..8531287
 --- /dev/null
 +++ b/hw/xbox/nv2a/nv2a_vk_ps4.h
 @@ -0,0 +1,50 @@
@@ -203,10 +401,10 @@ index 0000000000..8531287d1e
 +
 +#endif
 diff --git a/hw/xbox/nv2a/pfifo.c b/hw/xbox/nv2a/pfifo.c
-index ff4625c258..56d9f9a410 100644
+index 8b7ad47..6569ddf 100644
 --- a/hw/xbox/nv2a/pfifo.c
 +++ b/hw/xbox/nv2a/pfifo.c
-@@ -459,6 +459,10 @@ void *pfifo_thread(void *arg)
+@@ -463,6 +463,10 @@ void *pfifo_thread(void *arg)
  
      qemu_mutex_lock(&d->pfifo.lock);
      while (true) {
@@ -218,21 +416,40 @@ index ff4625c258..56d9f9a410 100644
  
          pgraph_process_pending(d);
 diff --git a/hw/xbox/nv2a/pgraph/meson.build b/hw/xbox/nv2a/pgraph/meson.build
-index fc52f609eb..e0fd91eb26 100644
+index fc52f60..96779da 100644
 --- a/hw/xbox/nv2a/pgraph/meson.build
 +++ b/hw/xbox/nv2a/pgraph/meson.build
-@@ -12,7 +12,9 @@ if have_renderdoc
+@@ -11,8 +11,10 @@ if have_renderdoc
+ 	specific_ss.add(files('debug_renderdoc.c'))
  endif
  subdir('thirdparty')
- subdir('null')
 +if opengl.found()
+ subdir('null')
  subdir('gl')
 +endif
  subdir('glsl')
  subdir('vk')
  specific_ss.add(nv2a_vsh_cpu)
+diff --git a/hw/xbox/nv2a/pgraph/thirdparty/meson.build b/hw/xbox/nv2a/pgraph/thirdparty/meson.build
+index fbc3751..c41e495 100644
+--- a/hw/xbox/nv2a/pgraph/thirdparty/meson.build
++++ b/hw/xbox/nv2a/pgraph/thirdparty/meson.build
+@@ -11,8 +11,13 @@ nv2a_vsh_cpu = declare_dependency(include_directories: nv2a_vsh_cpu_subproj.incl
+                                     nv2a_vsh_cpu_subproj.target('nv2a_vsh_disassembler'),
+                                     ])
+ 
++if opengl.found()
+ libgloffscreen = static_library('libgloffscreen',
+                           sources: files('gloffscreen/common.c', 'gloffscreen/sdl.c'),
+                           dependencies: sdl)
+ gloffscreen = declare_dependency(link_with: libgloffscreen,
+                            include_directories: ['gloffscreen'])
++else
++# xemu-ps4: no OpenGL on the PS4
++gloffscreen = declare_dependency()
++endif
 diff --git a/hw/xbox/nv2a/pgraph/vk/buffer.c b/hw/xbox/nv2a/pgraph/vk/buffer.c
-index d87c875aa4..084cbd929d 100644
+index d87c875..084cbd9 100644
 --- a/hw/xbox/nv2a/pgraph/vk/buffer.c
 +++ b/hw/xbox/nv2a/pgraph/vk/buffer.c
 @@ -60,6 +60,22 @@ void pgraph_vk_init_buffers(NV2AState *d)
@@ -286,7 +503,7 @@ index d87c875aa4..084cbd929d 100644
  
      r->storage_buffers[BUFFER_VERTEX_INLINE_STAGING] = (StorageBuffer){
 diff --git a/hw/xbox/nv2a/pgraph/vk/command.c b/hw/xbox/nv2a/pgraph/vk/command.c
-index 0e9fc9a2ee..cee36c5ad2 100644
+index 0e9fc9a..cee36c5 100644
 --- a/hw/xbox/nv2a/pgraph/vk/command.c
 +++ b/hw/xbox/nv2a/pgraph/vk/command.c
 @@ -99,9 +99,11 @@ void pgraph_vk_end_single_time_commands(PGRAPHState *pg, VkCommandBuffer cmd)
@@ -302,10 +519,10 @@ index 0e9fc9a2ee..cee36c5ad2 100644
      r->in_aux_command_buffer = false;
  }
 diff --git a/hw/xbox/nv2a/pgraph/vk/display.c b/hw/xbox/nv2a/pgraph/vk/display.c
-index 6b9e5851c4..e50289b062 100644
+index f4edc47..7f4bd6d 100644
 --- a/hw/xbox/nv2a/pgraph/vk/display.c
 +++ b/hw/xbox/nv2a/pgraph/vk/display.c
-@@ -578,10 +578,10 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
+@@ -580,10 +580,10 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
          destroy_current_display_image(pg);
      }
  
@@ -317,7 +534,7 @@ index 6b9e5851c4..e50289b062 100644
      GLint num_tiling_types;
      glGetInternalformativ(GL_TEXTURE_2D, gl_internal_format,
                            GL_NUM_TILING_TYPES_EXT, 1, &num_tiling_types);
-@@ -612,11 +612,13 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
+@@ -614,11 +614,13 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
          .format = VK_FORMAT_R8G8B8A8_UNORM,
          .tiling = use_optimal_tiling ? VK_IMAGE_TILING_OPTIMAL : VK_IMAGE_TILING_LINEAR,
          .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
@@ -332,7 +549,7 @@ index 6b9e5851c4..e50289b062 100644
      VkExternalMemoryImageCreateInfo external_memory_image_create_info = {
          .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
  #ifdef WIN32
-@@ -626,6 +628,7 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
+@@ -628,6 +630,7 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
  #endif
      };
      image_create_info.pNext = &external_memory_image_create_info;
@@ -340,7 +557,7 @@ index 6b9e5851c4..e50289b062 100644
  
      VK_CHECK(vkCreateImage(r->device, &image_create_info, NULL, &d->image));
  
-@@ -641,6 +644,7 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
+@@ -643,6 +646,7 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
                                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
      };
  
@@ -348,7 +565,7 @@ index 6b9e5851c4..e50289b062 100644
      VkExportMemoryAllocateInfo export_memory_alloc_info = {
          .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
          .handleTypes =
-@@ -652,6 +656,7 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
+@@ -654,6 +658,7 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
              ,
      };
      alloc_info.pNext = &export_memory_alloc_info;
@@ -357,7 +574,7 @@ index 6b9e5851c4..e50289b062 100644
      VK_CHECK(vkAllocateMemory(r->device, &alloc_info, NULL, &d->memory));
      VK_CHECK(vkBindImageMemory(r->device, d->image, d->memory, 0));
 diff --git a/hw/xbox/nv2a/pgraph/vk/draw.c b/hw/xbox/nv2a/pgraph/vk/draw.c
-index d78087e56b..c3d4b53866 100644
+index bf535b4..26c1893 100644
 --- a/hw/xbox/nv2a/pgraph/vk/draw.c
 +++ b/hw/xbox/nv2a/pgraph/vk/draw.c
 @@ -1259,8 +1259,10 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
@@ -372,7 +589,7 @@ index d78087e56b..c3d4b53866 100644
  
          bool check_budget = false;
 diff --git a/hw/xbox/nv2a/pgraph/vk/gpuprops.c b/hw/xbox/nv2a/pgraph/vk/gpuprops.c
-index ecc8bb3852..6eba23b1e3 100644
+index ecc8bb3..6eba23b 100644
 --- a/hw/xbox/nv2a/pgraph/vk/gpuprops.c
 +++ b/hw/xbox/nv2a/pgraph/vk/gpuprops.c
 @@ -451,8 +451,10 @@ static uint8_t *render_geom_shader_triangles(NV2AState *d, int width,
@@ -411,7 +628,7 @@ index ecc8bb3852..6eba23b1e3 100644
                                       &pgraph_vk_gpu_properties);
      g_free(pixels);
 diff --git a/hw/xbox/nv2a/pgraph/vk/instance.c b/hw/xbox/nv2a/pgraph/vk/instance.c
-index edead06c0f..0e5bdb4862 100644
+index 7044a7e..07ee63c 100644
 --- a/hw/xbox/nv2a/pgraph/vk/instance.c
 +++ b/hw/xbox/nv2a/pgraph/vk/instance.c
 @@ -32,7 +32,10 @@ static char const *const validation_layers[] = {
@@ -420,7 +637,7 @@ index edead06c0f..0e5bdb4862 100644
  static char const *const required_device_extensions[] = {
 -#ifdef WIN32
 +#if defined(__PS4__)
-+    /* the frontend presents on this device (ui/ps4/ps4-wsi.cc: VideoOut) */
++    /* the frontend presents on this device (ps4-kit's gpu/ps4_vk_wsi.cpp: VideoOut) */
 +    VK_KHR_SWAPCHAIN_EXTENSION_NAME,
 +#elif defined(WIN32)
      VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
@@ -432,7 +649,7 @@ index edead06c0f..0e5bdb4862 100644
                                     VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 +
 +#ifdef __PS4__
-+    /* the frontend's VideoOut surface (ui/ps4/ps4-wsi.cc) */
++    /* the frontend's VideoOut surface (ps4-kit's gpu/ps4_vk_wsi.cpp) */
 +    add_extension_if_available(available_extensions, enabled_extension_names,
 +                               VK_KHR_SURFACE_EXTENSION_NAME);
 +    add_extension_if_available(available_extensions, enabled_extension_names,
@@ -440,8 +657,8 @@ index edead06c0f..0e5bdb4862 100644
 +#endif
  }
  
- static bool create_instance(PGRAPHState *pg, Error **errp)
-@@ -149,11 +160,16 @@ static bool create_instance(PGRAPHState *pg, Error **errp)
+ #if defined(VK_API_VERSION_1_4)
+@@ -157,11 +168,16 @@ static bool create_instance(PGRAPHState *pg, Error **errp)
      PGRAPHVkState *r = pg->vk_renderer_state;
      VkResult result;
  
@@ -458,8 +675,28 @@ index edead06c0f..0e5bdb4862 100644
  
      uint32_t instance_version = VK_API_VERSION_1_0;
      if (vkEnumerateInstanceVersion) {
+@@ -436,6 +452,11 @@ static bool is_device_compatible(VkPhysicalDevice device)
+ 
+ static bool get_display_device_uuid(uint8_t *uuid)
+ {
++#if !HAVE_EXTERNAL_MEMORY
++    /* xemu-ps4: no OpenGL display context (the PS4 has one GPU) */
++    (void)uuid;
++    return false;
++#else
+     GLint num_uuids = 0;
+ 
+     if (epoxy_has_gl_extension("GL_EXT_memory_object")) {
+@@ -447,6 +468,7 @@ static bool get_display_device_uuid(uint8_t *uuid)
+     glGetUnsignedBytei_vEXT(GL_DEVICE_UUID_EXT, 0, uuid);
+ 
+     return true;
++#endif
+ }
+ 
+ static bool is_display_device(VkPhysicalDevice device,
 diff --git a/hw/xbox/nv2a/pgraph/vk/meson.build b/hw/xbox/nv2a/pgraph/vk/meson.build
-index 93ef5ca330..f4a38898af 100644
+index 93ef5ca..f4a3889 100644
 --- a/hw/xbox/nv2a/pgraph/vk/meson.build
 +++ b/hw/xbox/nv2a/pgraph/vk/meson.build
 @@ -21,5 +21,8 @@ specific_ss.add([volk, libglslang, vma, vulkan, spirv_reflect,
@@ -473,7 +710,7 @@ index 93ef5ca330..f4a38898af 100644
  endif
 diff --git a/hw/xbox/nv2a/pgraph/vk/ps4.c b/hw/xbox/nv2a/pgraph/vk/ps4.c
 new file mode 100644
-index 0000000000..f96821fbe1
+index 0000000..f96821f
 --- /dev/null
 +++ b/hw/xbox/nv2a/pgraph/vk/ps4.c
 @@ -0,0 +1,82 @@
@@ -560,7 +797,7 @@ index 0000000000..f96821fbe1
 +    return true;
 +}
 diff --git a/hw/xbox/nv2a/pgraph/vk/renderer.c b/hw/xbox/nv2a/pgraph/vk/renderer.c
-index 4272bbceb6..49dc57e977 100644
+index 4272bbc..49dc57e 100644
 --- a/hw/xbox/nv2a/pgraph/vk/renderer.c
 +++ b/hw/xbox/nv2a/pgraph/vk/renderer.c
 @@ -20,9 +20,9 @@
@@ -591,7 +828,7 @@ index 4272bbceb6..49dc57e977 100644
      qemu_mutex_unlock(&d->pfifo.lock);
      pgraph_vk_wait_for_surface_download(surface);
 diff --git a/hw/xbox/nv2a/pgraph/vk/renderer.h b/hw/xbox/nv2a/pgraph/vk/renderer.h
-index deb8762225..52873ea96a 100644
+index 1eac3e0..0463d5e 100644
 --- a/hw/xbox/nv2a/pgraph/vk/renderer.h
 +++ b/hw/xbox/nv2a/pgraph/vk/renderer.h
 @@ -41,7 +41,22 @@
@@ -607,7 +844,7 @@ index deb8762225..52873ea96a 100644
 +#define HAVE_SHARED_DISPLAY_IMAGE 1
 +void pgraph_vk_queue_lock(void);
 +void pgraph_vk_queue_unlock(void);
-+PFN_vkGetInstanceProcAddr ps4_vk_get_instance_proc_addr(void); /* ui/ps4/ps4-wsi.cc */
++PFN_vkGetInstanceProcAddr ps4_vk_get_instance_proc_addr(void); /* ui/ps4/ps4-vk.c: ps4-kit's presenter */
 +#else
  #define HAVE_EXTERNAL_MEMORY 1
 +#define HAVE_SHARED_DISPLAY_IMAGE 0
@@ -633,8 +870,25 @@ index deb8762225..52873ea96a 100644
  } PGRAPHVkDisplayState;
  
  typedef struct ComputePipelineKey {
+diff --git a/hw/xbox/xbox.c b/hw/xbox/xbox.c
+index 779a41b..6e94fa5 100644
+--- a/hw/xbox/xbox.c
++++ b/hw/xbox/xbox.c
+@@ -193,6 +193,12 @@ static void xbox_memory_init(PCMachineState *pcms,
+     ram = g_malloc(sizeof(*ram));
+     memory_region_init_ram(ram, NULL, "xbox.ram",
+                            machine->ram_size, &error_fatal);
++#ifdef __PS4__
++    {
++        extern void tlb_dirty_index_register(void *host, size_t size);
++        tlb_dirty_index_register(memory_region_get_ram_ptr(ram), machine->ram_size);
++    }
++#endif
+ 
+     *ram_memory = ram;
+     memory_region_add_subregion(system_memory, 0, ram);
 diff --git a/include/qemu/osdep.h b/include/qemu/osdep.h
-index 4ca8ccb27c..29767da396 100644
+index 4ca8ccb..29767da 100644
 --- a/include/qemu/osdep.h
 +++ b/include/qemu/osdep.h
 @@ -532,7 +532,7 @@ int qemu_shm_alloc(size_t size, Error **errp);
@@ -647,7 +901,7 @@ index 4ca8ccb27c..29767da396 100644
      || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__) \
      || defined(__GLIBC__) || defined(__APPLE__)
 diff --git a/meson.build b/meson.build
-index 82e5f5af65..d3f0ff3580 100644
+index cc049c3..e7aaecf 100644
 --- a/meson.build
 +++ b/meson.build
 @@ -80,6 +80,9 @@ cmake_macos_arch = host_machine.cpu() == 'aarch64' ? 'arm64' : host_machine.cpu(
@@ -727,7 +981,7 @@ index 82e5f5af65..d3f0ff3580 100644
      have_inotify_init = inotify.found()
    endif
 diff --git a/net/meson.build b/net/meson.build
-index 804eb71f82..350adb21b7 100644
+index 804eb71..350adb2 100644
 --- a/net/meson.build
 +++ b/net/meson.build
 @@ -54,7 +54,7 @@ if host_os == 'windows'
@@ -754,7 +1008,7 @@ index 804eb71f82..350adb21b7 100644
    system_ss.add(when: 'CONFIG_VIRTIO_NET', if_true: files('vhost-vdpa.c'), if_false: files('vhost-vdpa-stub.c'))
 diff --git a/net/pcap-stub.c b/net/pcap-stub.c
 new file mode 100644
-index 0000000000..f003d9ef5d
+index 0000000..f003d9e
 --- /dev/null
 +++ b/net/pcap-stub.c
 @@ -0,0 +1,18 @@
@@ -777,7 +1031,7 @@ index 0000000000..f003d9ef5d
 +    return -1;
 +}
 diff --git a/system/exit-with-parent.c b/system/exit-with-parent.c
-index df65d2231a..9895b198d4 100644
+index df65d22..9895b19 100644
 --- a/system/exit-with-parent.c
 +++ b/system/exit-with-parent.c
 @@ -56,7 +56,7 @@ set_exit_with_parent(void)
@@ -790,7 +1044,7 @@ index df65d2231a..9895b198d4 100644
  #include <sys/procctl.h>
  
 diff --git a/tcg/region.c b/tcg/region.c
-index 2181267e48..337e782196 100644
+index 2181267..337e782 100644
 --- a/tcg/region.c
 +++ b/tcg/region.c
 @@ -709,7 +709,15 @@ static int alloc_code_gen_buffer(size_t size, int splitwx, Error **errp)
@@ -821,7 +1075,7 @@ index 2181267e48..337e782196 100644
          tb_size = MIN_CODE_GEN_BUFFER_SIZE;
      }
 diff --git a/ui/meson.build b/ui/meson.build
-index ea46bf0f44..719cdc08a6 100644
+index ea46bf0..719cdc0 100644
 --- a/ui/meson.build
 +++ b/ui/meson.build
 @@ -27,12 +27,13 @@ xemu_ss.add(files(
@@ -865,7 +1119,7 @@ index ea46bf0f44..719cdc08a6 100644
    xemu_ss.add(files('xemu-os-utils-windows.c'))
 diff --git a/ui/ps4/imgui-impl-vulkan-ps4.cc b/ui/ps4/imgui-impl-vulkan-ps4.cc
 new file mode 100644
-index 0000000000..ed24aa5721
+index 0000000..ed24aa5
 --- /dev/null
 +++ b/ui/ps4/imgui-impl-vulkan-ps4.cc
 @@ -0,0 +1,7 @@
@@ -878,27 +1132,28 @@ index 0000000000..ed24aa5721
 +#include "backends/imgui_impl_vulkan.cpp"
 diff --git a/ui/ps4/meson.build b/ui/ps4/meson.build
 new file mode 100644
-index 0000000000..feb4ee519d
+index 0000000..cd4aad6
 --- /dev/null
 +++ b/ui/ps4/meson.build
-@@ -0,0 +1,11 @@
+@@ -0,0 +1,12 @@
 +# xemu-ps4: the PS4 frontend (in place of ui/xemu.c and the OpenGL GUI in ui/xui)
 +xemu_ss.add(volk, files(
 +  'imgui-impl-vulkan-ps4.cc',
 +  'ps4-hud.cc',
 +  'ps4-pad.c',
 +  'ps4-present.cc',
++  'ps4-settings.c',
 +  'ps4-thumbnail.cc',
-+  'ps4-wsi.cc',
++  'ps4-vk.c',
 +  'xemu-os-utils-ps4.c',
 +  'xemu-ps4.c',
 +))
 diff --git a/ui/ps4/ps4-frontend.h b/ui/ps4/ps4-frontend.h
 new file mode 100644
-index 0000000000..425dc7e47e
+index 0000000..061b0e4
 --- /dev/null
 +++ b/ui/ps4/ps4-frontend.h
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,72 @@
 +/*
 + * xemu-ps4: the PS4 frontend's pieces (xemu-ps4.c, ps4-present.cc, ps4-hud.cc)
 + *
@@ -946,6 +1201,20 @@ index 0000000000..425dc7e47e
 +/* xemu-ps4.c: why the Xbox can't start (a BIOS mismatch, ...), NULL if nothing is known wrong */
 +extern const char *ps4_setup_problem;
 +
++/* ps4-pad.c: the quick menu's buttons (ORBIS_PAD_BUTTON_*) pressed since the last call; while
++ * the menu is open the Xbox controller sees nothing pressed */
++uint32_t ps4_pad_menu_pressed(void);
++/* ps4-hud.cc: the quick menu is up (L3+R3 toggles it, ps4-pad.c) */
++extern bool ps4_menu_open;
++/* ps4-hud.cc: opens the menu on its game list (no disc at start) */
++void ps4_hud_open_games(void);
++
++/* xemu-ps4.c: the menu's actions, called with the main loop lock */
++bool ps4_load_disc(const char *path);
++void ps4_eject_disc(void);
++void ps4_request_reset(void);
++void ps4_request_quit(void);
++
 +/* ps4-hud.cc: notifications, status and menus (ImGui), called with the main loop lock */
 +void ps4_hud_process_sdl_event(const SDL_Event *event);
 +void ps4_hud_update(void);
@@ -959,14 +1228,14 @@ index 0000000000..425dc7e47e
 +#endif
 diff --git a/ui/ps4/ps4-hud.cc b/ui/ps4/ps4-hud.cc
 new file mode 100644
-index 0000000000..07c66b17c0
+index 0000000..e39fc6b
 --- /dev/null
 +++ b/ui/ps4/ps4-hud.cc
-@@ -0,0 +1,187 @@
+@@ -0,0 +1,418 @@
 +/*
-+ * xemu-ps4: the HUD drawn over the emulated picture (ImGui): notifications and error messages
-+ * (xemu-notifications.h, which the desktop's xui implements), and what is missing before a
-+ * game can start. The home screen and menus (from Resonance's launcher) come on top of this.
++ * xemu-ps4: what is drawn over the emulated picture (ImGui): notifications and error messages
++ * (xemu-notifications.h, which the desktop's xui implements), the frame rate, what is missing
++ * before a game can start, and the quick menu (L3+R3: games, reset, picture, CPU layout, quit).
 + *
 + * This program is free software; you can redistribute it and/or modify
 + * it under the terms of the GNU General Public License as published by
@@ -975,21 +1244,33 @@ index 0000000000..07c66b17c0
 + */
 +
 +#include "ps4-frontend.h"
++#include "ps4-settings.h"
 +#include "ui/xemu-notifications.h"
 +#include "ui/xemu-settings.h"
 +#include "hw/xbox/nv2a/debug.h"
 +
 +#include "imgui.h"
 +
++#include <algorithm>
 +#include <chrono>
 +#include <deque>
++#include <dirent.h>
 +#include <mutex>
 +#include <string>
++#include <strings.h>
++#include <sys/stat.h>
 +#include <unistd.h>
++#include <vector>
++
++#include <orbis/Pad.h>
++
++extern "C" unsigned ps4_kit_cpu_mhz(void);
 +
 +namespace
 +{
 +using Clock = std::chrono::steady_clock;
++
++// --- notifications ---------------------------------------------------------------------------
 +
 +struct Message
 +{
@@ -1043,7 +1324,9 @@ index 0000000000..07c66b17c0
 +    ImGui::End();
 +}
 +
-+// Top left: the game's frame rate (NV2A flips), the display's, and the busiest threads
++// --- frame rate ------------------------------------------------------------------------------
++
++// Top left: the game's frame rate (NV2A flips), the display's, and (Show load) GPU and threads
 +void DrawPerformance()
 +{
 +    static Clock::time_point last = Clock::now();
@@ -1062,27 +1345,34 @@ index 0000000000..07c66b17c0
 +        lastFrames = frames;
 +        last = now;
 +    }
++    if (!ps4_settings.show_fps && !ps4_pad_intercepted()) {
++        return;
++    }
 +    ImGui::SetNextWindowPos(ImVec2(16.0f, 16.0f), ImGuiCond_Always);
 +    ImGui::SetNextWindowBgAlpha(0.55f);
 +    ImGui::Begin("##performance", nullptr,
 +                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
 +                     ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing |
 +                     ImGuiWindowFlags_NoInputs);
-+    if (ps4_perf_gpu >= 0) {
-+        ImGui::Text("Game %.1f FPS   Display %.0f FPS   GPU %d%%", gameFps, displayFps,
-+                    ps4_perf_gpu);
-+    } else {
-+        ImGui::Text("Game %.1f FPS   Display %.0f FPS", gameFps, displayFps);
++    if (ps4_settings.show_fps) {
++        if (ps4_settings.show_stats && ps4_perf_gpu >= 0) {
++            ImGui::Text("Game %.1f FPS   Display %.0f FPS   GPU %d%%", gameFps, displayFps,
++                        ps4_perf_gpu);
++        } else {
++            ImGui::Text("Game %.1f FPS", gameFps);
++        }
 +    }
 +    if (ps4_pad_intercepted()) {
 +        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f),
 +                           "Controller input held by the PS4 system");
 +    }
-+    if (ps4_perf_threads[0] != '\0') {
++    if (ps4_settings.show_fps && ps4_settings.show_stats && ps4_perf_threads[0] != '\0') {
 +        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "%s", ps4_perf_threads);
 +    }
 +    ImGui::End();
 +}
++
++// --- setup help ------------------------------------------------------------------------------
 +
 +// Until the BIOS files are in place the Xbox can't start: say where they go
 +void DrawSetupHelp()
@@ -1091,9 +1381,9 @@ index 0000000000..07c66b17c0
 +                             access(g_config.sys.files.bootrom_path, R_OK) == 0;
 +    const bool haveFlash = g_config.sys.files.flashrom_path[0] != '\0' &&
 +                           access(g_config.sys.files.flashrom_path, R_OK) == 0;
++    const ImVec2 screen = ImGui::GetIO().DisplaySize;
 +    if (haveBootrom && haveFlash) {
 +        if (ps4_setup_problem != nullptr) {
-+            const ImVec2 screen = ImGui::GetIO().DisplaySize;
 +            ImGui::SetNextWindowPos(ImVec2(screen.x * 0.5f, screen.y * 0.5f), ImGuiCond_Always,
 +                                    ImVec2(0.5f, 0.5f));
 +            ImGui::SetNextWindowSize(ImVec2(screen.x * 0.6f, 0.0f));
@@ -1105,7 +1395,6 @@ index 0000000000..07c66b17c0
 +        }
 +        return;
 +    }
-+    const ImVec2 screen = ImGui::GetIO().DisplaySize;
 +    ImGui::SetNextWindowPos(ImVec2(screen.x * 0.5f, screen.y * 0.5f), ImGuiCond_Always,
 +                            ImVec2(0.5f, 0.5f));
 +    ImGui::Begin("xemu for PS4", nullptr,
@@ -1121,7 +1410,192 @@ index 0000000000..07c66b17c0
 +    ImGui::TextUnformatted("Games (.iso): /data/xemu/games");
 +    ImGui::End();
 +}
++
++// --- the quick menu --------------------------------------------------------------------------
++
++constexpr const char *kGamesDir = "/data/xemu/games";
++
++enum Page { kMain, kGames };
++enum Row {
++    kResume, kGamesRow, kEject, kReset, kScaling, kFilter, kShowFps, kShowStats, kCpuLayout,
++    kMonitor, kTlbIndex, kQuit, kRowCount
++};
++
++struct Menu
++{
++    Page page = kMain;
++    int row = 0;
++    int gameRow = 0;
++    std::vector<std::string> games;     // file names in kGamesDir
++    // done under the main loop lock (ps4_hud_update): the menu draws without it
++    std::string loadPath;
++    bool eject = false, reset = false, quit = false;
++    bool restartNote = false;
++} M;
++
++void ScanGames()
++{
++    M.games.clear();
++    if (DIR *dir = opendir(kGamesDir)) {
++        while (dirent *e = readdir(dir)) {
++            const char *dot = strrchr(e->d_name, '.');
++            if (e->d_name[0] != '.' && dot &&
++                (strcasecmp(dot, ".iso") == 0 || strcasecmp(dot, ".xiso") == 0)) {
++                M.games.emplace_back(e->d_name);
++            }
++        }
++        closedir(dir);
++    }
++    std::sort(M.games.begin(), M.games.end(), [](const std::string &a, const std::string &b) {
++        return strcasecmp(a.c_str(), b.c_str()) < 0;
++    });
++    M.gameRow = std::min(M.gameRow, std::max(0, (int)M.games.size() - 1));
++}
++
++const char *DiscName()
++{
++    const char *p = g_config.sys.files.dvd_path;
++    if (p == nullptr || p[0] == '\0') {
++        return "no disc";
++    }
++    const char *slash = strrchr(p, '/');
++    return slash ? slash + 1 : p;
++}
++
++std::string RowText(int row)
++{
++    static const char *const scaling[] = { "Fit", "Stretch", "Integer" };
++    static const char *const filter[] = { "Smooth", "Sharp" };
++    switch (row) {
++    case kResume: return "Resume";
++    case kGamesRow: return std::string("Load game...   (") + DiscName() + ")";
++    case kEject: return "Eject disc";
++    case kReset: return "Reset Xbox";
++    case kScaling: return std::string("Picture          < ") + scaling[ps4_settings.scaling] + " >";
++    case kFilter: return std::string("Filter           < ") + filter[ps4_settings.filter] + " >";
++    case kShowFps: return std::string("Show frame rate  < ") + (ps4_settings.show_fps ? "On" : "Off") + " >";
++    case kShowStats: return std::string("Show load        < ") + (ps4_settings.show_stats ? "On" : "Off") + " >";
++    case kCpuLayout:
++        return std::string("CPU layout       < ") +
++               (ps4_settings.cpu_layout == PS4_CPU_PINNED ? "Pinned" : "Floating") + " >  (restart)";
++    case kMonitor: return std::string("Monitor log      < ") + (ps4_settings.monitor_log ? "On" : "Off") + " >";
++    case kTlbIndex:
++        return std::string("TLB dirty index  < ") + (ps4_settings.tlb_index ? "On" : "Off") + " >  (restart)";
++    case kQuit: return "Quit xemu";
++    }
++    return "";
++}
++
++void Change(int row, int dir)
++{
++    switch (row) {
++    case kScaling: ps4_settings.scaling = (ps4_settings.scaling + 3 + dir) % 3; break;
++    case kFilter: ps4_settings.filter ^= 1; break;
++    case kShowFps: ps4_settings.show_fps = !ps4_settings.show_fps; break;
++    case kShowStats: ps4_settings.show_stats = !ps4_settings.show_stats; break;
++    case kCpuLayout: ps4_settings.cpu_layout ^= 1; M.restartNote = true; break;
++    case kMonitor: ps4_settings.monitor_log = !ps4_settings.monitor_log; break;
++    case kTlbIndex: ps4_settings.tlb_index = !ps4_settings.tlb_index; M.restartNote = true; break;
++    default: return;
++    }
++    ps4_settings_save();
++}
++
++void Activate(int row)
++{
++    switch (row) {
++    case kResume: ps4_menu_open = false; break;
++    case kGamesRow: ScanGames(); M.page = kGames; break;
++    case kEject: M.eject = true; ps4_menu_open = false; break;
++    case kReset: M.reset = true; ps4_menu_open = false; break;
++    case kQuit: M.quit = true; break;
++    default: Change(row, 1); break;
++    }
++}
++
++void HandleInput()
++{
++    const uint32_t b = ps4_pad_menu_pressed();
++    if (b == 0) {
++        return;
++    }
++    if (M.page == kGames) {
++        const int n = (int)M.games.size();
++        if (b & ORBIS_PAD_BUTTON_UP) M.gameRow = n ? (M.gameRow + n - 1) % n : 0;
++        if (b & ORBIS_PAD_BUTTON_DOWN) M.gameRow = n ? (M.gameRow + 1) % n : 0;
++        if ((b & ORBIS_PAD_BUTTON_CROSS) && n) {
++            M.loadPath = std::string(kGamesDir) + "/" + M.games[M.gameRow];
++            M.page = kMain;
++            ps4_menu_open = false;
++        }
++        if (b & ORBIS_PAD_BUTTON_CIRCLE) M.page = kMain;
++        return;
++    }
++    if (b & ORBIS_PAD_BUTTON_UP) M.row = (M.row + kRowCount - 1) % kRowCount;
++    if (b & ORBIS_PAD_BUTTON_DOWN) M.row = (M.row + 1) % kRowCount;
++    if (b & ORBIS_PAD_BUTTON_LEFT) Change(M.row, -1);
++    if (b & ORBIS_PAD_BUTTON_RIGHT) Change(M.row, 1);
++    if (b & ORBIS_PAD_BUTTON_CROSS) Activate(M.row);
++    if (b & ORBIS_PAD_BUTTON_CIRCLE) ps4_menu_open = false;
++}
++
++void DrawRow(ImDrawList *dl, ImVec2 pos, float width, const std::string &text, bool selected)
++{
++    const float h = ImGui::GetTextLineHeightWithSpacing() + 8.0f;
++    if (selected) {
++        dl->AddRectFilled(pos, ImVec2(pos.x + width, pos.y + h), IM_COL32(16, 124, 16, 230), 6.0f);
++    }
++    dl->AddText(ImVec2(pos.x + 16.0f, pos.y + 4.0f), selected ? IM_COL32_WHITE : IM_COL32(220, 220, 220, 255),
++                text.c_str());
++}
++
++void DrawMenu()
++{
++    HandleInput();
++    if (!ps4_menu_open) {
++        M.page = kMain;
++        return;
++    }
++    const ImVec2 screen = ImGui::GetIO().DisplaySize;
++    const float width = screen.x * 0.42f;
++    const float rowH = ImGui::GetTextLineHeightWithSpacing() + 8.0f;
++    ImDrawList *dl = ImGui::GetForegroundDrawList();
++    dl->AddRectFilled(ImVec2(0, 0), ImVec2(width + 64.0f, screen.y), IM_COL32(8, 12, 8, 225));
++    ImVec2 pos(32.0f, 48.0f);
++    dl->AddText(pos, IM_COL32(120, 220, 90, 255), M.page == kGames ? "xemu  -  Load game" : "xemu  -  Quick menu");
++    pos.y += rowH * 1.5f;
++    if (M.page == kGames) {
++        if (M.games.empty()) {
++            dl->AddText(ImVec2(pos.x + 16.0f, pos.y), IM_COL32(220, 220, 220, 255),
++                        "No .iso files in /data/xemu/games");
++        }
++        const int visible = (int)((screen.y - pos.y - 120.0f) / rowH);
++        const int first = std::max(0, std::min(M.gameRow - visible / 2, (int)M.games.size() - visible));
++        for (int i = first; i < (int)M.games.size() && i < first + visible; i++) {
++            DrawRow(dl, pos, width, M.games[i], i == M.gameRow);
++            pos.y += rowH;
++        }
++    } else {
++        for (int i = 0; i < kRowCount; i++) {
++            DrawRow(dl, pos, width, RowText(i), i == M.row);
++            pos.y += rowH;
++        }
++        if (M.restartNote) {
++            pos.y += rowH * 0.5f;
++            dl->AddText(ImVec2(pos.x + 16.0f, pos.y), IM_COL32(255, 200, 80, 255),
++                        "Takes effect at the next start");
++        }
++        pos.y += rowH;
++        char line[96];
++        snprintf(line, sizeof(line), "CPU %u MHz", ps4_kit_cpu_mhz());
++        dl->AddText(ImVec2(pos.x + 16.0f, pos.y), IM_COL32(160, 160, 160, 255), line);
++    }
++    dl->AddText(ImVec2(48.0f, screen.y - 72.0f), IM_COL32(160, 160, 160, 255),
++                M.page == kGames ? "Cross: load   Circle: back" : "Cross: select   Left/Right: change   Circle: close   L3+R3: menu");
++}
 +} // namespace
++
++bool ps4_menu_open;
 +
 +extern "C" void xemu_queue_notification(const char *msg)
 +{
@@ -1140,22 +1614,48 @@ index 0000000000..07c66b17c0
 +    (void)event;
 +}
 +
++/* the menu's actions that need the emulator: here, under the main loop lock */
 +extern "C" void ps4_hud_update(void)
 +{
++    if (!M.loadPath.empty()) {
++        const bool ok = ps4_load_disc(M.loadPath.c_str());
++        Queue(ok ? (std::string("Disc: ") + DiscName()).c_str() : "Couldn't load the disc", !ok);
++        M.loadPath.clear();
++    }
++    if (M.eject) {
++        ps4_eject_disc();
++        M.eject = false;
++    }
++    if (M.reset) {
++        ps4_request_reset();
++        M.reset = false;
++    }
++    if (M.quit) {
++        ps4_request_quit();
++        M.quit = false;
++    }
++}
++
++extern "C" void ps4_hud_open_games(void)
++{
++    ScanGames();
++    M.page = kGames;
++    ps4_menu_open = true;
 +}
 +
 +extern "C" void ps4_hud_draw(void)
 +{
 +    DrawPerformance();
 +    DrawSetupHelp();
++    DrawMenu();
 +    DrawNotification();
 +}
 diff --git a/ui/ps4/ps4-pad.c b/ui/ps4/ps4-pad.c
 new file mode 100644
-index 0000000000..4690883f0f
+index 0000000..032ad15
 --- /dev/null
 +++ b/ui/ps4/ps4-pad.c
-@@ -0,0 +1,214 @@
+@@ -0,0 +1,254 @@
 +/*
 + * xemu-ps4: the DualShock 4 as an SDL gamepad. SDL has no PS4 joystick driver; its virtual
 + * gamepad stands in, fed from ScePad each time SDL updates its joysticks, so xemu-input.c binds,
@@ -1166,6 +1666,7 @@ index 0000000000..4690883f0f
 + *   L2/R2                          left/right trigger (analog)
 + *   Options                        Start
 + *   touchpad click                 Back
++ *   L3+R3 together                 the quick menu (ps4-hud.cc), not passed to the Xbox
 + *
 + * This program is free software; you can redistribute it and/or modify
 + * it under the terms of the GNU General Public License as published by
@@ -1192,6 +1693,11 @@ index 0000000000..4690883f0f
 +    int last_error;
 +    uint32_t last_buttons;
 +    unsigned failures_in_a_row;
++    /* the quick menu: the previous read's buttons, presses for the menu, and buttons held when it
++     * closed (kept from the Xbox until released) */
++    uint32_t prev_buttons;
++    uint32_t menu_pressed;
++    uint32_t held_from_menu;
 +} PS4Pad;
 +
 +static PS4Pad pad = { .user = -1, .handle = -1 };
@@ -1215,6 +1721,16 @@ index 0000000000..4690883f0f
 +    { ORBIS_PAD_BUTTON_LEFT, SDL_GAMEPAD_BUTTON_DPAD_LEFT },
 +    { ORBIS_PAD_BUTTON_RIGHT, SDL_GAMEPAD_BUTTON_DPAD_RIGHT },
 +};
++
++/* The pad's reads are marked "intercepted" (bit 31) while the system has the input */
++#define PS4_PAD_INTERCEPTED 0x80000000u
++
++uint32_t ps4_pad_menu_pressed(void)
++{
++    const uint32_t b = pad.menu_pressed;
++    pad.menu_pressed = 0;
++    return b;
++}
 +
 +/* 0..255, centre 128 -> SDL's -32768..32767 */
 +static Sint16 stick_axis(uint8_t v)
@@ -1261,6 +1777,31 @@ index 0000000000..4690883f0f
 +        data.leftStick.x = data.leftStick.y = 128;
 +        data.rightStick.x = data.rightStick.y = 128;
 +        data.analogButtons.l2 = data.analogButtons.r2 = 0;
++    }
++    /* L3+R3: the quick menu; its presses don't reach the Xbox */
++    {
++        const uint32_t buttons = data.buttons & ~PS4_PAD_INTERCEPTED;
++        const uint32_t combo = ORBIS_PAD_BUTTON_L3 | ORBIS_PAD_BUTTON_R3;
++        const bool was_open = ps4_menu_open;
++        if ((buttons & combo) == combo && (pad.prev_buttons & combo) != combo) {
++            ps4_menu_open = !ps4_menu_open;
++            pad.menu_pressed = 0;
++        } else if (ps4_menu_open) {
++            pad.menu_pressed |= buttons & ~pad.prev_buttons;
++        }
++        pad.prev_buttons = buttons;
++        if (was_open || ps4_menu_open) {
++            pad.held_from_menu = buttons;
++        }
++        pad.held_from_menu &= buttons;
++        if (ps4_menu_open || (buttons & combo) == combo) {
++            data.buttons = 0;
++            data.leftStick.x = data.leftStick.y = 128;
++            data.rightStick.x = data.rightStick.y = 128;
++            data.analogButtons.l2 = data.analogButtons.r2 = 0;
++        } else {
++            data.buttons &= ~pad.held_from_menu;
++        }
 +    }
 +    for (size_t i = 0; i < ARRAY_SIZE(button_map); i++) {
 +        SDL_SetJoystickVirtualButton(pad.joystick, button_map[i].sdl,
@@ -1347,9 +1888,8 @@ index 0000000000..4690883f0f
 +} PS4SystemStatus;
 +int sceSystemServiceGetStatus(PS4SystemStatus *status);
 +
-+/* The pad's reads are marked "intercepted" (bit 31): the system has the input (its UI is over
-+ * the app, the app is in the background, ...) and reports no buttons to us */
-+#define PS4_PAD_INTERCEPTED 0x80000000u
++/* (PS4_PAD_INTERCEPTED, above: the system has the input - its UI is over the app, the app is in
++ * the background, ... - and reports no buttons to us) */
 +
 +bool ps4_pad_intercepted(void)
 +{
@@ -1372,10 +1912,10 @@ index 0000000000..4690883f0f
 +}
 diff --git a/ui/ps4/ps4-present.cc b/ui/ps4/ps4-present.cc
 new file mode 100644
-index 0000000000..2629a7ba42
+index 0000000..8f856ab
 --- /dev/null
 +++ b/ui/ps4/ps4-present.cc
-@@ -0,0 +1,508 @@
+@@ -0,0 +1,518 @@
 +/*
 + * xemu-ps4: presents the emulated display on VideoOut, on the Vulkan renderer's own device and
 + * queue (the PS4 has no OpenGL to hand the picture to, as the desktop frontends do).
@@ -1393,6 +1933,7 @@ index 0000000000..2629a7ba42
 +
 +#include "ps4-frontend.h"
 +#include "ps4-wsi.h"
++#include "ps4-settings.h"
 +
 +#include <volk.h>
 +#include "imgui.h"
@@ -1665,12 +2206,20 @@ index 0000000000..2629a7ba42
 +    return true;
 +}
 +
-+// The display image's rectangle on the screen: as large as fits, its own aspect ratio
++// The display image's rectangle on the screen (Settings > Picture): as large as fits at its own
++// aspect ratio, the whole screen, or the largest whole multiple of its size
 +VkRect2D FitRect(uint32_t w, uint32_t h)
 +{
 +    const float sx = (float)ps4wsi::kWidth / w, sy = (float)ps4wsi::kHeight / h;
-+    const float s = std::min(sx, sy);
-+    const uint32_t dw = (uint32_t)(w * s), dh = (uint32_t)(h * s);
++    float s = std::min(sx, sy);
++    if (ps4_settings.scaling == PS4_SCALE_INTEGER && s >= 1.0f) {
++        s = (float)(int)s;
++    }
++    uint32_t dw = (uint32_t)(w * s), dh = (uint32_t)(h * s);
++    if (ps4_settings.scaling == PS4_SCALE_STRETCH) {
++        dw = ps4wsi::kWidth;
++        dh = ps4wsi::kHeight;
++    }
 +    VkRect2D r;
 +    r.offset = { (int32_t)(ps4wsi::kWidth - dw) / 2, (int32_t)(ps4wsi::kHeight - dh) / 2 };
 +    r.extent = { dw, dh };
@@ -1743,7 +2292,8 @@ index 0000000000..2629a7ba42
 +        blit.dstOffsets[1] = { dst.offset.x + (int32_t)dst.extent.width,
 +                               dst.offset.y + (int32_t)dst.extent.height, 1 };
 +        vkCmdBlitImage(cmd, P.last, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target,
-+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
++                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
++                       ps4_settings.filter == PS4_FILTER_NEAREST ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
 +    }
 +
 +    ImageBarrier(cmd, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -1884,9 +2434,174 @@ index 0000000000..2629a7ba42
 +    vkDestroySurfaceKHR(P.dev.instance, P.surface, nullptr);
 +    P.ready = false;
 +}
+diff --git a/ui/ps4/ps4-settings.c b/ui/ps4/ps4-settings.c
+new file mode 100644
+index 0000000..b7bc34e
+--- /dev/null
++++ b/ui/ps4/ps4-settings.c
+@@ -0,0 +1,94 @@
++/*
++ * xemu-ps4: the PS4 frontend's own settings (ps4-settings.h), "key = value" lines in
++ * /data/xemu/ps4.ini. Unknown keys are ignored, missing ones keep their defaults.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "ps4-settings.h"
++
++#define PS4_SETTINGS_PATH "/data/xemu/ps4.ini"
++
++PS4Settings ps4_settings = {
++    .scaling = PS4_SCALE_FIT,
++    .filter = PS4_FILTER_LINEAR,
++    .show_fps = true,
++    .show_stats = true,
++    .cpu_layout = PS4_CPU_PINNED,
++    .voice_workers = 2,
++    .poll_spin_us = -1,
++    .audio_frames = 512,
++    .monitor_log = true,
++    .profiler = false,
++    .tlb_index = true,
++};
++
++typedef struct {
++    const char *key;
++    enum { T_INT, T_BOOL } type;
++    void *value;
++    int min, max;
++} Field;
++
++static const Field fields[] = {
++    { "scaling", T_INT, &ps4_settings.scaling, 0, 2 },
++    { "filter", T_INT, &ps4_settings.filter, 0, 1 },
++    { "show_fps", T_BOOL, &ps4_settings.show_fps, 0, 1 },
++    { "show_stats", T_BOOL, &ps4_settings.show_stats, 0, 1 },
++    { "cpu_layout", T_INT, &ps4_settings.cpu_layout, 0, 1 },
++    { "voice_workers", T_INT, &ps4_settings.voice_workers, 1, 4 },
++    { "poll_spin_us", T_INT, &ps4_settings.poll_spin_us, -1, 1250 },
++    { "audio_frames", T_INT, &ps4_settings.audio_frames, 256, 2048 },
++    { "monitor_log", T_BOOL, &ps4_settings.monitor_log, 0, 1 },
++    { "profiler", T_BOOL, &ps4_settings.profiler, 0, 1 },
++    { "tlb_index", T_BOOL, &ps4_settings.tlb_index, 0, 1 },
++};
++
++void ps4_settings_load(void)
++{
++    g_autofree char *text = NULL;
++    if (!g_file_get_contents(PS4_SETTINGS_PATH, &text, NULL, NULL)) {
++        return;
++    }
++    g_auto(GStrv) lines = g_strsplit(text, "\n", -1);
++    for (char **l = lines; *l; l++) {
++        char *eq = strchr(*l, '=');
++        if (**l == '#' || eq == NULL) {
++            continue;
++        }
++        *eq = '\0';
++        const char *key = g_strstrip(*l);
++        const char *val = g_strstrip(eq + 1);
++        for (size_t i = 0; i < ARRAY_SIZE(fields); i++) {
++            if (strcmp(key, fields[i].key) != 0) {
++                continue;
++            }
++            const int v = MAX(fields[i].min, MIN(fields[i].max, atoi(val)));
++            if (fields[i].type == T_BOOL) {
++                *(bool *)fields[i].value = v != 0;
++            } else {
++                *(int *)fields[i].value = v;
++            }
++        }
++    }
++}
++
++void ps4_settings_save(void)
++{
++    GString *s = g_string_new("# xemu-ps4 settings (the quick menu writes this file)\n");
++    for (size_t i = 0; i < ARRAY_SIZE(fields); i++) {
++        const int v = fields[i].type == T_BOOL ? *(bool *)fields[i].value : *(int *)fields[i].value;
++        g_string_append_printf(s, "%s = %d\n", fields[i].key, v);
++    }
++    g_file_set_contents(PS4_SETTINGS_PATH, s->str, s->len, NULL);
++    g_string_free(s, true);
++}
++
++int ps4_voice_workers(void)
++{
++    return ps4_settings.voice_workers;
++}
+diff --git a/ui/ps4/ps4-settings.h b/ui/ps4/ps4-settings.h
+new file mode 100644
+index 0000000..d93a3b5
+--- /dev/null
++++ b/ui/ps4/ps4-settings.h
+@@ -0,0 +1,59 @@
++/*
++ * xemu-ps4: the PS4 frontend's own settings (/data/xemu/ps4.ini), next to xemu's xemu.toml.
++ * Changed from the quick menu (ps4-hud.cc); "restart" ones apply at the next start.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#ifndef UI_PS4_PS4_SETTINGS_H
++#define UI_PS4_PS4_SETTINGS_H
++
++#include <stdbool.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++enum {
++    PS4_SCALE_FIT = 0,      /* the game's aspect ratio, as large as fits */
++    PS4_SCALE_STRETCH = 1,  /* the whole 16:9 screen */
++    PS4_SCALE_INTEGER = 2,  /* the largest whole multiple that fits (sharp pixels) */
++};
++
++enum {
++    PS4_FILTER_LINEAR = 0,
++    PS4_FILTER_NEAREST = 1,
++};
++
++enum {
++    PS4_CPU_PINNED = 0,     /* each busy emulation thread on a core of its own (ps4_thread_started) */
++    PS4_CPU_FLOATING = 1,   /* every thread on every core at the system's priority (as v00.15) */
++};
++
++typedef struct PS4Settings {
++    int scaling;            /* PS4_SCALE_* */
++    int filter;             /* PS4_FILTER_* */
++    bool show_fps;          /* frame rate in a corner */
++    bool show_stats;        /* plus GPU and thread load */
++    int cpu_layout;         /* PS4_CPU_* (restart) */
++    int voice_workers;      /* APU voice processing threads, 1..4 (restart) */
++    int poll_spin_us;       /* main loop: spin this long before a deadline; -1 = measured at start */
++    int audio_frames;       /* sound buffer, frames at 48 kHz: 256..2048 (restart) */
++    bool monitor_log;       /* the 5 s monitor line in boot-trace.log */
++    bool profiler;          /* the 1 kHz sampler (samples.log) (restart) */
++    bool tlb_index;         /* TLB dirty index (accel/tcg/cputlb.c) (restart) */
++} PS4Settings;
++
++extern PS4Settings ps4_settings;
++
++void ps4_settings_load(void);
++void ps4_settings_save(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
 diff --git a/ui/ps4/ps4-thumbnail.cc b/ui/ps4/ps4-thumbnail.cc
 new file mode 100644
-index 0000000000..61355d2849
+index 0000000..61355d2
 --- /dev/null
 +++ b/ui/ps4/ps4-thumbnail.cc
 @@ -0,0 +1,26 @@
@@ -1916,571 +2631,40 @@ index 0000000000..61355d2849
 +{
 +    return NULL;
 +}
-diff --git a/ui/ps4/ps4-wsi.cc b/ui/ps4/ps4-wsi.cc
+diff --git a/ui/ps4/ps4-vk.c b/ui/ps4/ps4-vk.c
 new file mode 100644
-index 0000000000..906f52885d
+index 0000000..0d79ea6
 --- /dev/null
-+++ b/ui/ps4/ps4-wsi.cc
-@@ -0,0 +1,551 @@
++++ b/ui/ps4/ps4-vk.c
+@@ -0,0 +1,20 @@
 +/*
-+	xemu-ps4: Vulkan window system integration on the PS4 (from Resonance's ps4_wsi.cpp, itself
-+	from Crema's PS4WSI.cpp).
-+
-+	RADV (DolphinPS4's GNM port) is linked into the executable and has no WSI. This file adds
-+	VK_EXT_headless_surface and VK_KHR_swapchain on top of it the way DolphinPS4 presents: the
-+	swapchain images are linear R8G8B8A8 images in host-visible memory (GPU address = CPU address
-+	on the PS4), registered as VideoOut buffers, and presenting queues a VideoOut flip behind the
-+	GPU work submitted so far (ac_ps4_submit_flip in the Mesa winsys). xemu's Vulkan renderer
-+	(through volk) and the PS4 presenter (ps4-present.cc) use the standard surface/swapchain API
-+	through ps4_vk_get_instance_proc_addr(). vkAcquireNextImageKHR and vkQueuePresentKHR submit
-+	to the graphics queue: callers hold nv2a_vk_ps4_queue_lock().
-+
-+	This program is free software: you can redistribute it and/or modify
-+	it under the terms of the GNU General Public License as published by
-+	the Free Software Foundation, either version 2 of the License, or
-+	(at your option) any later version.
++ * xemu-ps4: the Vulkan entry point for the NV2A renderer (volk) and the presenter. ps4-kit's
++ * presenter (gpu/ps4_vk_wsi.cpp, linked in libxemups4_port.a) adds VK_EXT_headless_surface and
++ * VK_KHR_swapchain on VideoOut to the statically linked RADV.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
 + */
++
++#include "qemu/osdep.h"
 +#include "ps4-wsi.h"
 +
-+#include <vulkan/vulkan.h>
-+#include <orbis/VideoOut.h>
-+#include <orbis/libkernel.h>
-+#include <orbis/SystemService.h>
++void *ps4kit_vk_get_instance_proc_addr(void);   /* ps4-kit gpu/ps4_vk_wsi.h */
 +
-+#include <algorithm>
-+#include <chrono>
-+#include <cstring>
-+#include <mutex>
-+#include <vector>
-+
-+extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInstance instance, const char *name);
-+extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_common_GetDeviceProcAddr(VkDevice device, const char *name);
-+// port/mesa/ac_ps4_drm.c: queues a VideoOut flip behind the submitted GPU work (GPU-side flip)
-+extern "C" int ac_ps4_submit_flip(int video, unsigned buffer, unsigned mode, int64_t arg);
-+
-+namespace
++PFN_vkGetInstanceProcAddr ps4_vk_get_instance_proc_addr(void)
 +{
-+constexpr u32 kMaxImages = 4;
-+constexpr VkDeviceSize kFramebufferAlign = 2 << 20;	// VideoOut buffer alignment
-+
-+struct PS4Surface
-+{
-+	u32 magic = 0x50533453;
-+};
-+
-+struct PS4Swapchain
-+{
-+	VkDevice device;
-+	u32 imageCount;
-+	VkImage images[kMaxImages] {};
-+	VkDeviceMemory memory[kMaxImages] {};
-+	int bufferSet = -1;
-+	int firstBuffer = 0;
-+	u32 nextImage = 0;
-+	u32 flipMode = ORBIS_VIDEO_OUT_FLIP_VSYNC;
-+};
-+
-+VkInstance sInstance = VK_NULL_HANDLE;
-+VkPhysicalDevice sPhysicalDevice = VK_NULL_HANDLE;
-+int sVideo = -1;
-+OrbisKernelEqueue sFlipQueue;
-+u64 sFlipsSubmitted = 0;
-+int sNextFirstBuffer = 0;
-+std::mutex sMutex;
-+
-+template<typename T>
-+T Device(VkDevice device, const char *name) {
-+	return (T)vk_common_GetDeviceProcAddr(device, name);
-+}
-+
-+template<typename T>
-+T Instance(const char *name) {
-+	return (T)vk_icdGetInstanceProcAddr(sInstance, name);
-+}
-+
-+bool OpenVideoOut()
-+{
-+	if (sVideo >= 0)
-+		return true;
-+	sVideo = sceVideoOutOpen(0xFF, 0, 0, nullptr);
-+	if (sVideo < 0)
-+	{
-+		ERROR_LOG(RENDERER, "PS4WSI: sceVideoOutOpen failed: %x", sVideo);
-+		return false;
-+	}
-+	sceKernelCreateEqueue(&sFlipQueue, "xemu flip");
-+	sceVideoOutAddFlipEvent(sFlipQueue, sVideo, nullptr);
-+	return true;
-+}
-+
-+// appends one extension to an enumeration result (count/properties two-call idiom)
-+VkResult AppendExtensions(std::vector<VkExtensionProperties>& list, std::initializer_list<std::pair<const char *, u32>> extra,
-+		u32 *count, VkExtensionProperties *props)
-+{
-+	for (const auto& [name, specVersion] : extra)
-+	{
-+		VkExtensionProperties p {};
-+		strncpy(p.extensionName, name, VK_MAX_EXTENSION_NAME_SIZE - 1);
-+		p.specVersion = specVersion;
-+		list.push_back(p);
-+	}
-+	if (props == nullptr)
-+	{
-+		*count = (u32)list.size();
-+		return VK_SUCCESS;
-+	}
-+	const u32 n = std::min<u32>(*count, (u32)list.size());
-+	memcpy(props, list.data(), n * sizeof(VkExtensionProperties));
-+	*count = n;
-+	return n < list.size() ? VK_INCOMPLETE : VK_SUCCESS;
-+}
-+
-+std::vector<const char *> WithoutExtensions(u32 count, const char *const *names, std::initializer_list<const char *> drop)
-+{
-+	std::vector<const char *> result;
-+	for (u32 i = 0; i < count; i++)
-+		if (std::none_of(drop.begin(), drop.end(), [&](const char *d) { return strcmp(names[i], d) == 0; }))
-+			result.push_back(names[i]);
-+	return result;
-+}
-+
-+// --- instance level ---
-+
-+VKAPI_ATTR VkResult VKAPI_CALL EnumerateInstanceExtensionProperties(const char *layer, u32 *count, VkExtensionProperties *props)
-+{
-+	auto real = (PFN_vkEnumerateInstanceExtensionProperties)vk_icdGetInstanceProcAddr(VK_NULL_HANDLE, "vkEnumerateInstanceExtensionProperties");
-+	u32 n = 0;
-+	real(layer, &n, nullptr);
-+	std::vector<VkExtensionProperties> list(n);
-+	real(layer, &n, list.data());
-+	list.resize(n);
-+	return AppendExtensions(list, { { VK_KHR_SURFACE_EXTENSION_NAME, 25 }, { VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME, 1 } }, count, props);
-+}
-+
-+VKAPI_ATTR VkResult VKAPI_CALL CreateInstance(const VkInstanceCreateInfo *info, const VkAllocationCallbacks *alloc, VkInstance *instance)
-+{
-+	auto real = (PFN_vkCreateInstance)vk_icdGetInstanceProcAddr(VK_NULL_HANDLE, "vkCreateInstance");
-+	VkInstanceCreateInfo copy = *info;
-+	auto names = WithoutExtensions(info->enabledExtensionCount, info->ppEnabledExtensionNames,
-+			{ VK_KHR_SURFACE_EXTENSION_NAME, VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME });
-+	copy.enabledExtensionCount = (u32)names.size();
-+	copy.ppEnabledExtensionNames = names.data();
-+	VkResult r = real(&copy, alloc, instance);
-+	if (r == VK_SUCCESS)
-+		sInstance = *instance;
-+	return r;
-+}
-+
-+VKAPI_ATTR VkResult VKAPI_CALL EnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice, const char *layer, u32 *count, VkExtensionProperties *props)
-+{
-+	auto real = Instance<PFN_vkEnumerateDeviceExtensionProperties>("vkEnumerateDeviceExtensionProperties");
-+	u32 n = 0;
-+	real(physicalDevice, layer, &n, nullptr);
-+	std::vector<VkExtensionProperties> list(n);
-+	real(physicalDevice, layer, &n, list.data());
-+	list.resize(n);
-+	return AppendExtensions(list, { { VK_KHR_SWAPCHAIN_EXTENSION_NAME, 70 } }, count, props);
-+}
-+
-+VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *info, const VkAllocationCallbacks *alloc, VkDevice *device)
-+{
-+	auto real = Instance<PFN_vkCreateDevice>("vkCreateDevice");
-+	VkDeviceCreateInfo copy = *info;
-+	auto names = WithoutExtensions(info->enabledExtensionCount, info->ppEnabledExtensionNames, { VK_KHR_SWAPCHAIN_EXTENSION_NAME });
-+	copy.enabledExtensionCount = (u32)names.size();
-+	copy.ppEnabledExtensionNames = names.data();
-+	sPhysicalDevice = physicalDevice;
-+	return real(physicalDevice, &copy, alloc, device);
-+}
-+
-+VKAPI_ATTR VkResult VKAPI_CALL CreateHeadlessSurfaceEXT(VkInstance, const VkHeadlessSurfaceCreateInfoEXT *, const VkAllocationCallbacks *, VkSurfaceKHR *surface)
-+{
-+	*surface = (VkSurfaceKHR)new PS4Surface();
-+	return VK_SUCCESS;
-+}
-+
-+VKAPI_ATTR void VKAPI_CALL DestroySurfaceKHR(VkInstance, VkSurfaceKHR surface, const VkAllocationCallbacks *)
-+{
-+	delete (PS4Surface *)surface;
-+}
-+
-+VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceSurfaceSupportKHR(VkPhysicalDevice, u32 queueFamily, VkSurfaceKHR, VkBool32 *supported)
-+{
-+	*supported = queueFamily == 0 ? VK_TRUE : VK_FALSE;	// the graphics queue family
-+	return VK_SUCCESS;
-+}
-+
-+VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice, VkSurfaceKHR, VkSurfaceCapabilitiesKHR *caps)
-+{
-+	*caps = {};
-+	caps->minImageCount = 2;
-+	caps->maxImageCount = 3;	// as DolphinPS4: render into one while one is shown and one is queued
-+	caps->currentExtent = { ps4wsi::kWidth, ps4wsi::kHeight };
-+	caps->minImageExtent = caps->currentExtent;
-+	caps->maxImageExtent = caps->currentExtent;
-+	caps->maxImageArrayLayers = 1;
-+	caps->supportedTransforms = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
-+	caps->currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
-+	caps->supportedCompositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-+	caps->supportedUsageFlags = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-+	return VK_SUCCESS;
-+}
-+
-+VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceSurfaceFormatsKHR(VkPhysicalDevice, VkSurfaceKHR, u32 *count, VkSurfaceFormatKHR *formats)
-+{
-+	// VideoOut A8B8G8R8 = R8G8B8A8 in memory (verified by DolphinPS4)
-+	if (formats == nullptr)
-+	{
-+		*count = 1;
-+		return VK_SUCCESS;
-+	}
-+	if (*count < 1)
-+		return VK_INCOMPLETE;
-+	formats[0] = { VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR };
-+	*count = 1;
-+	return VK_SUCCESS;
-+}
-+
-+VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceSurfacePresentModesKHR(VkPhysicalDevice, VkSurfaceKHR, u32 *count, VkPresentModeKHR *modes)
-+{
-+	const VkPresentModeKHR supported[] = { VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_MAILBOX_KHR };
-+	if (modes == nullptr)
-+	{
-+		*count = std::size(supported);
-+		return VK_SUCCESS;
-+	}
-+	const u32 n = std::min<u32>(*count, std::size(supported));
-+	memcpy(modes, supported, n * sizeof(VkPresentModeKHR));
-+	*count = n;
-+	return n < std::size(supported) ? VK_INCOMPLETE : VK_SUCCESS;
-+}
-+
-+// --- device level ---
-+
-+u32 HostVisibleMemoryType(u32 typeBits)
-+{
-+	VkPhysicalDeviceMemoryProperties props;
-+	Instance<PFN_vkGetPhysicalDeviceMemoryProperties>("vkGetPhysicalDeviceMemoryProperties")(sPhysicalDevice, &props);
-+	const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-+	for (u32 i = 0; i < props.memoryTypeCount; i++)
-+		if ((typeBits & (1u << i)) && (props.memoryTypes[i].propertyFlags & want) == want)
-+			return i;
-+	return UINT32_MAX;
-+}
-+
-+void FreeSwapchain(PS4Swapchain *sc)
-+{
-+	if (sc->bufferSet >= 0)
-+		sceVideoOutUnregisterBuffers(sVideo, sc->bufferSet);
-+	auto destroyImage = Device<PFN_vkDestroyImage>(sc->device, "vkDestroyImage");
-+	auto freeMemory = Device<PFN_vkFreeMemory>(sc->device, "vkFreeMemory");
-+	for (u32 i = 0; i < sc->imageCount; i++)
-+	{
-+		if (sc->images[i])
-+			destroyImage(sc->device, sc->images[i], nullptr);
-+		if (sc->memory[i])
-+			freeMemory(sc->device, sc->memory[i], nullptr);
-+	}
-+	delete sc;
-+}
-+
-+VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *info, const VkAllocationCallbacks *, VkSwapchainKHR *swapchain)
-+{
-+	std::lock_guard<std::mutex> _(sMutex);
-+	if (!OpenVideoOut())
-+		return VK_ERROR_INITIALIZATION_FAILED;
-+	auto sc = new PS4Swapchain();
-+	sc->device = device;
-+	sc->imageCount = std::clamp<u32>(info->minImageCount, 2, kMaxImages);
-+	sc->flipMode = info->presentMode == VK_PRESENT_MODE_FIFO_KHR ? ORBIS_VIDEO_OUT_FLIP_VSYNC : ORBIS_VIDEO_OUT_FLIP_HSYNC;
-+	auto createImage = Device<PFN_vkCreateImage>(device, "vkCreateImage");
-+	auto getRequirements = Device<PFN_vkGetImageMemoryRequirements>(device, "vkGetImageMemoryRequirements");
-+	auto allocateMemory = Device<PFN_vkAllocateMemory>(device, "vkAllocateMemory");
-+	auto mapMemory = Device<PFN_vkMapMemory>(device, "vkMapMemory");
-+	auto bindMemory = Device<PFN_vkBindImageMemory>(device, "vkBindImageMemory");
-+	auto getLayout = Device<PFN_vkGetImageSubresourceLayout>(device, "vkGetImageSubresourceLayout");
-+	void *addresses[kMaxImages] {};
-+	u32 pitch = ps4wsi::kWidth;
-+	for (u32 i = 0; i < sc->imageCount; i++)
-+	{
-+		VkImageCreateInfo ici { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-+		ici.imageType = VK_IMAGE_TYPE_2D;
-+		ici.format = VK_FORMAT_R8G8B8A8_UNORM;
-+		ici.extent = { ps4wsi::kWidth, ps4wsi::kHeight, 1 };
-+		ici.mipLevels = 1;
-+		ici.arrayLayers = 1;
-+		ici.samples = VK_SAMPLE_COUNT_1_BIT;
-+		ici.tiling = VK_IMAGE_TILING_LINEAR;
-+		ici.usage = info->imageUsage | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-+		ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-+		VkResult r = createImage(device, &ici, nullptr, &sc->images[i]);
-+		if (r != VK_SUCCESS)
-+		{
-+			ERROR_LOG(RENDERER, "PS4WSI: vkCreateImage failed: %d", r);
-+			FreeSwapchain(sc);
-+			return r;
-+		}
-+		VkMemoryRequirements req;
-+		getRequirements(device, sc->images[i], &req);
-+		// VideoOut wants 2 MiB aligned buffers: over-allocate, bind at an aligned offset
-+		VkMemoryAllocateInfo mai { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-+		mai.allocationSize = req.size + kFramebufferAlign;
-+		mai.memoryTypeIndex = HostVisibleMemoryType(req.memoryTypeBits);
-+		u8 *base = nullptr;
-+		r = allocateMemory(device, &mai, nullptr, &sc->memory[i]);
-+		if (r == VK_SUCCESS)
-+			r = mapMemory(device, sc->memory[i], 0, VK_WHOLE_SIZE, 0, (void **)&base);
-+		if (r != VK_SUCCESS)
-+		{
-+			ERROR_LOG(RENDERER, "PS4WSI: swapchain memory failed: %d", r);
-+			FreeSwapchain(sc);
-+			return r;
-+		}
-+		const uintptr_t baseAddress = (uintptr_t)base;
-+		VkDeviceSize offset = ((baseAddress + kFramebufferAlign - 1) & ~(kFramebufferAlign - 1)) - baseAddress;
-+		offset = (offset + req.alignment - 1) & ~(req.alignment - 1);
-+		bindMemory(device, sc->images[i], sc->memory[i], offset);
-+		VkImageSubresource sub { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0 };
-+		VkSubresourceLayout layout;
-+		getLayout(device, sc->images[i], &sub, &layout);
-+		addresses[i] = base + offset + layout.offset;
-+		pitch = (u32)(layout.rowPitch / 4);
-+	}
-+	OrbisVideoOutBufferAttribute attribute;
-+	sceVideoOutSetBufferAttribute(&attribute, ORBIS_VIDEO_OUT_PIXEL_FORMAT_A8B8G8R8_SRGB, ORBIS_VIDEO_OUT_TILING_MODE_LINEAR, 0,
-+			ps4wsi::kWidth, ps4wsi::kHeight, pitch);
-+	// alternate between two buffer index ranges so a new swapchain can register while the old one is still on screen
-+	sc->firstBuffer = sNextFirstBuffer;
-+	sNextFirstBuffer = sNextFirstBuffer == 0 ? 8 : 0;
-+	sc->bufferSet = sceVideoOutRegisterBuffers(sVideo, sc->firstBuffer, addresses, (int)sc->imageCount, &attribute);
-+	if (sc->bufferSet < 0)
-+	{
-+		ERROR_LOG(RENDERER, "PS4WSI: sceVideoOutRegisterBuffers failed: %x", sc->bufferSet);
-+		FreeSwapchain(sc);
-+		return VK_ERROR_INITIALIZATION_FAILED;
-+	}
-+	NOTICE_LOG(RENDERER, "PS4WSI: swapchain of %u images %ux%u pitch %u, buffers %d+", sc->imageCount, ps4wsi::kWidth, ps4wsi::kHeight,
-+			pitch, sc->firstBuffer);
-+	*swapchain = (VkSwapchainKHR)sc;
-+	return VK_SUCCESS;
-+}
-+
-+VKAPI_ATTR void VKAPI_CALL DestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain, const VkAllocationCallbacks *)
-+{
-+	if (!swapchain)
-+		return;
-+	std::lock_guard<std::mutex> _(sMutex);
-+	Device<PFN_vkDeviceWaitIdle>(device, "vkDeviceWaitIdle")(device);
-+	FreeSwapchain((PS4Swapchain *)swapchain);
-+}
-+
-+VKAPI_ATTR VkResult VKAPI_CALL GetSwapchainImagesKHR(VkDevice, VkSwapchainKHR swapchain, u32 *count, VkImage *images)
-+{
-+	auto sc = (PS4Swapchain *)swapchain;
-+	if (images == nullptr)
-+	{
-+		*count = sc->imageCount;
-+		return VK_SUCCESS;
-+	}
-+	const u32 n = std::min(*count, sc->imageCount);
-+	memcpy(images, sc->images, n * sizeof(VkImage));
-+	*count = n;
-+	return n < sc->imageCount ? VK_INCOMPLETE : VK_SUCCESS;
-+}
-+
-+// present statistics, logged every 10 s
-+struct
-+{
-+	std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
-+	u64 flips = 0;
-+	u64 waitNs = 0;
-+	u32 timeouts = 0;
-+	s64 lastFlipArg = 0;
-+} sStats;
-+
-+// The image about to be rendered into must be off screen: with N images in rotation it was
-+// shown by flip n-N+1 and replaced on screen by flip n-N+2 (n = flips submitted).
-+void WaitImageOffScreen(u32 imageCount)
-+{
-+	if (sFlipsSubmitted < imageCount - 1)
-+		return;
-+	const s64 needed = (s64)(sFlipsSubmitted - (imageCount - 2));
-+	const auto t0 = std::chrono::steady_clock::now();
-+	bool done = false;
-+	for (int tries = 0; tries < 40 && !done; tries++)
-+	{
-+		OrbisVideoOutFlipStatus status {};
-+		if (sceVideoOutGetFlipStatus(sVideo, &status) < 0)
-+			break;
-+		sStats.lastFlipArg = status.flipArg;
-+		if (status.flipArg >= needed)
-+		{
-+			done = true;
-+			break;
-+		}
-+		OrbisKernelEvent ev;
-+		int got = 0;
-+		OrbisKernelUseconds timeout = 5000;
-+		sceKernelWaitEqueue(sFlipQueue, &ev, 1, &got, &timeout);
-+	}
-+	if (!done)
-+		sStats.timeouts++;
-+	sStats.waitNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
-+}
-+
-+void CountPresent()
-+{
-+	sStats.flips++;
-+	const auto now = std::chrono::steady_clock::now();
-+	const double secs = std::chrono::duration<double>(now - sStats.start).count();
-+	if (secs < 10.0)
-+		return;
-+	INFO_LOG(RENDERER, "PS4WSI: %.1f flips/s, acquire waits %.0f ms/s, %u timeouts, flipArg %lld of %llu submitted",
-+			sStats.flips / secs, sStats.waitNs / 1e6 / secs, sStats.timeouts, (long long)sStats.lastFlipArg,
-+			(unsigned long long)sFlipsSubmitted);
-+	sStats.start = now;
-+	sStats.flips = 0;
-+	sStats.waitNs = 0;
-+	sStats.timeouts = 0;
-+}
-+
-+VkQueue GraphicsQueue(VkDevice device)
-+{
-+	VkQueue queue = VK_NULL_HANDLE;
-+	Device<PFN_vkGetDeviceQueue>(device, "vkGetDeviceQueue")(device, 0, 0, &queue);
-+	return queue;
-+}
-+
-+VKAPI_ATTR VkResult VKAPI_CALL AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain, u64, VkSemaphore semaphore, VkFence fence, u32 *index)
-+{
-+	auto sc = (PS4Swapchain *)swapchain;
-+	WaitImageOffScreen(sc->imageCount);
-+	*index = sc->nextImage;
-+	sc->nextImage = (sc->nextImage + 1) % sc->imageCount;
-+	if (semaphore || fence)
-+	{
-+		// signal the acquire semaphore/fence right away: the image is free
-+		VkSubmitInfo si { VK_STRUCTURE_TYPE_SUBMIT_INFO };
-+		si.signalSemaphoreCount = semaphore ? 1 : 0;
-+		si.pSignalSemaphores = &semaphore;
-+		const VkResult r = Device<PFN_vkQueueSubmit>(device, "vkQueueSubmit")(GraphicsQueue(device), 1, &si, fence);
-+		if (r != VK_SUCCESS)
-+			ERROR_LOG(RENDERER, "PS4WSI: acquire signal submit failed: %d", r);
-+		return r;
-+	}
-+	return VK_SUCCESS;
-+}
-+
-+VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *info)
-+{
-+	VkResult result = VK_SUCCESS;
-+	for (u32 i = 0; i < info->swapchainCount; i++)
-+	{
-+		auto sc = (PS4Swapchain *)info->pSwapchains[i];
-+		auto queueSubmit = Device<PFN_vkQueueSubmit>(sc->device, "vkQueueSubmit");
-+		// consume the wait semaphores (one queue, in order: the rendering was submitted before)
-+		std::vector<VkPipelineStageFlags> stages(info->waitSemaphoreCount, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
-+		VkSubmitInfo si { VK_STRUCTURE_TYPE_SUBMIT_INFO };
-+		si.waitSemaphoreCount = i == 0 ? info->waitSemaphoreCount : 0;
-+		si.pWaitSemaphores = info->pWaitSemaphores;
-+		si.pWaitDstStageMask = stages.data();
-+		const u32 buffer = (u32)sc->firstBuffer + info->pImageIndices[i];
-+		const s64 arg = (s64)(sFlipsSubmitted + 1);
-+		if (si.waitSemaphoreCount)
-+		{
-+			const VkResult sr = queueSubmit(queue, 1, &si, VK_NULL_HANDLE);
-+			if (sr != VK_SUCCESS)
-+				ERROR_LOG(RENDERER, "PS4WSI: present semaphore submit failed: %d", sr);
-+		}
-+		// the flip goes to the GPU behind the frame's commands: no CPU wait for the GPU or vblank
-+		int r = ac_ps4_submit_flip(sVideo, buffer, sc->flipMode, arg);
-+		const bool gpuFlip = r == 0;
-+		if (!gpuFlip)
-+		{
-+			// fallback: wait for the GPU on the CPU, then flip
-+			Device<PFN_vkQueueWaitIdle>(sc->device, "vkQueueWaitIdle")(queue);
-+			r = sceVideoOutSubmitFlip(sVideo, (int)buffer, sc->flipMode, arg);
-+		}
-+		if (r < 0)
-+		{
-+			ERROR_LOG(RENDERER, "PS4WSI: flip failed: %x", r);
-+			result = VK_ERROR_SURFACE_LOST_KHR;
-+		}
-+		else
-+		{
-+			sFlipsSubmitted++;
-+			CountPresent();
-+			// the PS4 keeps its boot splash (the app's picture) over everything until the app
-+			// says it has a picture of its own
-+			if (sFlipsSubmitted == 1)
-+				sceSystemServiceHideSplashScreen();
-+			if (sFlipsSubmitted <= 3)
-+				NOTICE_LOG(RENDERER, "PS4WSI: flip %llu of buffer %u (%s)", (unsigned long long)sFlipsSubmitted, buffer,
-+						gpuFlip ? "GPU-side" : "CPU wait");
-+		}
-+		if (info->pResults)
-+			info->pResults[i] = r < 0 ? VK_ERROR_SURFACE_LOST_KHR : VK_SUCCESS;
-+	}
-+	return result;
-+}
-+
-+PFN_vkVoidFunction Intercept(const char *name)
-+{
-+#define PS4WSI_ENTRY(fn) if (strcmp(name, "vk" #fn) == 0) return (PFN_vkVoidFunction)&fn
-+	PS4WSI_ENTRY(EnumerateInstanceExtensionProperties);
-+	PS4WSI_ENTRY(CreateInstance);
-+	PS4WSI_ENTRY(EnumerateDeviceExtensionProperties);
-+	PS4WSI_ENTRY(CreateDevice);
-+	PS4WSI_ENTRY(CreateHeadlessSurfaceEXT);
-+	PS4WSI_ENTRY(DestroySurfaceKHR);
-+	PS4WSI_ENTRY(GetPhysicalDeviceSurfaceSupportKHR);
-+	PS4WSI_ENTRY(GetPhysicalDeviceSurfaceCapabilitiesKHR);
-+	PS4WSI_ENTRY(GetPhysicalDeviceSurfaceFormatsKHR);
-+	PS4WSI_ENTRY(GetPhysicalDeviceSurfacePresentModesKHR);
-+	PS4WSI_ENTRY(CreateSwapchainKHR);
-+	PS4WSI_ENTRY(DestroySwapchainKHR);
-+	PS4WSI_ENTRY(GetSwapchainImagesKHR);
-+	PS4WSI_ENTRY(AcquireNextImageKHR);
-+	PS4WSI_ENTRY(QueuePresentKHR);
-+#undef PS4WSI_ENTRY
-+	return nullptr;
-+}
-+
-+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL GetDeviceProcAddr(VkDevice device, const char *name)
-+{
-+	// vulkan.hpp's DispatchLoaderDynamic::init(device) looks vkGetDeviceProcAddr up again through
-+	// itself: RADV's would then resolve the swapchain functions, and it has none (all null)
-+	if (strcmp(name, "vkGetDeviceProcAddr") == 0)
-+		return (PFN_vkVoidFunction)&GetDeviceProcAddr;
-+	if (auto fn = Intercept(name))
-+		return fn;
-+	return vk_common_GetDeviceProcAddr(device, name);
-+}
-+
-+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL GetInstanceProcAddr(VkInstance instance, const char *name)
-+{
-+	if (strcmp(name, "vkGetInstanceProcAddr") == 0)
-+		return (PFN_vkVoidFunction)&GetInstanceProcAddr;
-+	if (strcmp(name, "vkGetDeviceProcAddr") == 0)
-+		return (PFN_vkVoidFunction)&GetDeviceProcAddr;
-+	if (auto fn = Intercept(name))
-+		return fn;
-+	return vk_icdGetInstanceProcAddr(instance, name);
-+}
-+
-+} // namespace
-+
-+extern "C" PFN_vkGetInstanceProcAddr ps4_vk_get_instance_proc_addr(void) {
-+	return &GetInstanceProcAddr;
++    return (PFN_vkGetInstanceProcAddr)ps4kit_vk_get_instance_proc_addr();
 +}
 diff --git a/ui/ps4/ps4-wsi.h b/ui/ps4/ps4-wsi.h
 new file mode 100644
-index 0000000000..aa57a1572b
+index 0000000..04a33c2
 --- /dev/null
 +++ b/ui/ps4/ps4-wsi.h
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,34 @@
 +/*
-+ * xemu-ps4: Vulkan window system integration on the PS4 (ps4-wsi.cc)
++ * xemu-ps4: the screen and the Vulkan entry point (ps4-vk.c, on ps4-kit's presenter)
 + *
 + * This program is free software: you can redistribute it and/or modify
 + * it under the terms of the GNU General Public License as published by
@@ -2491,7 +2675,6 @@ index 0000000000..aa57a1572b
 +#define UI_PS4_PS4_WSI_H
 +
 +#include <stdint.h>
-+#include <stdio.h>
 +#include <vulkan/vulkan.h>
 +
 +#ifdef __cplusplus
@@ -2502,20 +2685,11 @@ index 0000000000..aa57a1572b
 +constexpr unsigned kHeight = 1080;
 +}
 +
-+typedef uint8_t u8;
-+typedef uint32_t u32;
-+typedef int64_t s64;
-+typedef uint64_t u64;
-+
-+#define ERROR_LOG(cat, fmt, ...) fprintf(stderr, "ps4-wsi: " fmt "\n", ##__VA_ARGS__)
-+#define NOTICE_LOG(cat, fmt, ...) fprintf(stderr, "ps4-wsi: " fmt "\n", ##__VA_ARGS__)
-+#define INFO_LOG(cat, fmt, ...) fprintf(stderr, "ps4-wsi: " fmt "\n", ##__VA_ARGS__)
-+
 +extern "C" {
 +#endif
 +
 +/* vkGetInstanceProcAddr of the statically linked RADV, with the PS4 surface and swapchain
-+   (VK_EXT_headless_surface + VK_KHR_swapchain on VideoOut) added. */
++   (VK_EXT_headless_surface + VK_KHR_swapchain on VideoOut) added by ps4-kit. */
 +PFN_vkGetInstanceProcAddr ps4_vk_get_instance_proc_addr(void);
 +
 +#ifdef __cplusplus
@@ -2525,7 +2699,7 @@ index 0000000000..aa57a1572b
 +#endif
 diff --git a/ui/ps4/xemu-os-utils-ps4.c b/ui/ps4/xemu-os-utils-ps4.c
 new file mode 100644
-index 0000000000..24e9598a97
+index 0000000..24e9598
 --- /dev/null
 +++ b/ui/ps4/xemu-os-utils-ps4.c
 @@ -0,0 +1,16 @@
@@ -2547,10 +2721,10 @@ index 0000000000..24e9598a97
 +}
 diff --git a/ui/ps4/xemu-ps4.c b/ui/ps4/xemu-ps4.c
 new file mode 100644
-index 0000000000..93ced8c605
+index 0000000..db2e31c
 --- /dev/null
 +++ b/ui/ps4/xemu-ps4.c
-@@ -0,0 +1,775 @@
+@@ -0,0 +1,1002 @@
 +/*
 + * xemu-ps4: the PS4 frontend (replaces ui/xemu.c and its SDL window + OpenGL).
 + *
@@ -2595,6 +2769,9 @@ index 0000000000..93ced8c605
 +#include "system/cpus.h"
 +#include "qemu/timer.h"
 +#include "ps4-frontend.h"
++#include "ps4-settings.h"
++#include "ps4_kit.h"
++#include "ps4_kit_diag.h"
 +
 +#include <SDL3/SDL.h>
 +#include <dirent.h>
@@ -2602,11 +2779,32 @@ index 0000000000..93ced8c605
 +#include <orbis/Sysmodule.h>
 +#include <orbis/libkernel.h>
 +#include <orbis/SystemService.h>
++#include <pthread.h>
++#include <sys/select.h>
 +
-+void ps4_boot_trace(const char *line);  /* port/ps4_crashlog.cpp */
++/* (ps4_boot_trace: ps4-kit's crash log, ps4_kit_diag.h) */
 +void tcg_register_init_ctx(void);       /* tcg.c */
 +
 +#define XEMU_DATA "/data/xemu"
++
++/* util/qemu-timer.c: the main loop's waits (ps4_poll_ns) */
++extern int64_t ps4_poll_spin_ns;
++/* accel/tcg/cputlb.c: the TLB dirty index (set before the machine starts) and its counts */
++extern bool tlb_dirty_index_enabled;
++extern uint64_t tlb_dirty_index_resets, tlb_dirty_index_walks;
++extern uint64_t ps4_poll_waits, ps4_poll_sleeps, ps4_poll_spin_total_ns;
++/* below: the desktop's ui/xemu.c has these */
++void xemu_eject_disc(Error **errp);
++void xemu_load_disc(const char *path, Error **errp);
++
++/* ps4-kit: this app's folder for crash.log, boot-trace.log and the profilers' files */
++PS4_DIAG_DATA_DIR(XEMU_DATA);
++
++/* ps4-kit's heap (before main: fields only): its log lines and mappings named "xemu" */
++void ps4_kit_configure_heap(ps4_kit_heap_options *o)
++{
++    o->log_tag = "xemu";
++}
 +
 +/* port/ps4_crashlog.cpp, after the host stacks: the emulator's view of the crash. No
 + * allocation or locks here. (The guest CPU's registers are for later: they live in target
@@ -2958,8 +3156,66 @@ index 0000000000..93ced8c605
 +void ps4_sampler_register_thread(const char *name);
 +void ps4_sampler_start(void);
 +
-+/* /data/xemu/profile.txt exists: the sampling profiler writes /data/xemu/samples.log */
++/* Settings > Profiler or /data/xemu/profile.txt: the 1 kHz sampler writes samples.log */
 +static bool profiling;
++
++/* libkernel's thread calls (the PS4's priorities: 256 highest .. 767 lowest, 700 default), under
++ * names of our own: OpenOrbis' libkernel.h declares scePthreadSetaffinity without its arguments */
++int ps4x_set_affinity(pthread_t thread, uint64_t mask) __asm__("scePthreadSetaffinity");
++int ps4x_set_priority(pthread_t thread, int prio) __asm__("scePthreadSetprio");
++
++/*
++ * Where xemu's threads run (Settings > CPU layout, ps4.ini cpu_layout). The PS4 gives threads of
++ * one priority no turns: a busy thread keeps its core until it blocks, and with every thread free
++ * to run anywhere at the default priority (v00.15) the emulated CPU, the NV2A and the APU kept
++ * landing on each other's cores while others sat idle - the "synchronization-bound" 1 fps (the
++ * Max Payne 3 port saw the same: 3x in its fights once the threads had places). Pinned: the four
++ * threads that set the pace get a core each, nothing else may run there; everything else shares
++ * cores 4-6. Priorities only matter among the sharers: vblank and the main loop's wake-ups first,
++ * the APU's voice workers next, the frontend, then the background.
++ */
++typedef struct ThreadPlace {
++    const char *name;
++    int core;       /* -1: the shared cores */
++    int priority;
++} ThreadPlace;
++
++static const ThreadPlace thread_places[] = {
++    { "CPU 0/TCG", 0, 640 },            /* the emulated Pentium III */
++    { "ALL CPUs/TCG", 0, 640 },         /* (single-threaded TCG) */
++    { "nv2a.pfifo_thread", 1, 640 },    /* the GPU: push buffer, Vulkan recording, submits */
++    { "qemu_main", 2, 620 },            /* QEMU's main loop: timers, interrupts, disk I/O */
++    { "mcpx.apu_thread", 3, 630 },      /* the APU's frame loop and its DSPs (interpreter) */
++    { "mcpx.voice_worker", -1, 640 },
++    { "vblank-timer", -1, 600 },
++    { "worker", -1, 700 },              /* QEMU's thread pool (disk reads) */
++    { "call_rcu", -1, 720 },
++    { "ps4-monitor", -1, 720 },
++};
++
++static uint64_t app_cores = 0x3f;       /* the cores the app may use (0x7f with the 7th) */
++static uint64_t shared_cores = 0x30;    /* what isn't pinned: cores 4.. */
++
++static void place_thread(const char *name)
++{
++    const ThreadPlace *place = NULL;
++    for (size_t i = 0; i < ARRAY_SIZE(thread_places); i++) {
++        if (strcmp(name, thread_places[i].name) == 0) {
++            place = &thread_places[i];
++        }
++    }
++    if (ps4_settings.cpu_layout == PS4_CPU_FLOATING) {
++        ps4x_set_affinity(pthread_self(), app_cores);
++        return;
++    }
++    const uint64_t mask = place && place->core >= 0 ? (1ull << place->core) : shared_cores;
++    int r1 = ps4x_set_affinity(pthread_self(), mask);
++    int r2 = place ? ps4x_set_priority(pthread_self(), place->priority) : 0;
++    if (place) {
++        ps4_boot_tracef("thread %s: cores %#llx%s, priority %d%s", name, (unsigned long long)mask,
++                        r1 ? " (refused)" : "", place->priority, r2 ? " (refused)" : "");
++    }
++}
 +
 +/*
 + * Every QEMU thread, first thing (util/qemu-thread-posix.c). The emulation's busy threads go
@@ -2968,6 +3224,25 @@ index 0000000000..93ced8c605
 + */
 +void ps4_thread_started(const char *name)
 +{
++    /*
++     * QEMU starts its threads with every signal blocked (the main loop handles them): let the kit's
++     * crash handler, thread dumps and profilers reach them. SIGUSR2 stays blocked: QEMU's coroutines
++     * start through it (coroutine-sigaltstack.c).
++     */
++    {
++        sigset_t s;
++        sigemptyset(&s);
++        sigaddset(&s, SIGSEGV);
++        sigaddset(&s, SIGBUS);
++        sigaddset(&s, SIGILL);
++        sigaddset(&s, SIGFPE);
++        sigaddset(&s, SIGABRT);
++        sigaddset(&s, SIGTRAP);
++        sigaddset(&s, SIGUSR1);
++        sigaddset(&s, SIGVTALRM);
++        pthread_sigmask(SIG_UNBLOCK, &s, NULL);
++    }
++    place_thread(name);
 +    static const char *const sampled[] = { "nv2a.pfifo_thread", "mcpx.apu_thread",
 +                                           "qemu_main" };
 +    /* the emulated CPU: "CPU 0/TCG" (multi-threaded TCG) or "ALL CPUs/TCG" */
@@ -3030,12 +3305,36 @@ index 0000000000..93ced8c605
 +        last_span = span;
 +        char pad_stats[160];
 +        ps4_pad_stats(pad_stats, sizeof(pad_stats));
-+        trace("monitor: presented %.1f/s (display in %.1f/s), guest flips %.1f/s, "
-+              "guest clock +%.2f s, runstate %s, cpu pc 0x%08" PRIx64 "%s | GPU %d%% | %s | %s",
-+              (frames - last_frames) / 5.0, (display - last_display) / 5.0,
-+              (flips - last_flips) / 5.0, (guest_ns - last_guest_ns) / 1e9,
-+              RunState_str(runstate_get()), pc,
-+              cpu != NULL && cpu->halted ? " (halted)" : "", ps4_perf_gpu, threads, pad_stats);
++        /* the main loop's waits since the last line (util/qemu-timer.c) */
++        static uint64_t last_waits, last_sleeps, last_spin_ns;
++        const uint64_t waits = ps4_poll_waits, sleeps = ps4_poll_sleeps,
++                       spin_ns = ps4_poll_spin_total_ns;
++        char loop_stats[200];
++        snprintf(loop_stats, sizeof(loop_stats), "main loop %.0f waits/s, %.0f slept, spun %.1f%%",
++                 (waits - last_waits) / 5.0, (sleeps - last_sleeps) / 5.0,
++                 (spin_ns - last_spin_ns) / 5e9 * 100.0);
++        last_waits = waits;
++        last_sleeps = sleeps;
++        last_spin_ns = spin_ns;
++        static uint64_t last_resets, last_walks;
++        const uint64_t resets = tlb_dirty_index_resets, walks = tlb_dirty_index_walks;
++        if (tlb_dirty_index_enabled) {
++            const size_t len = strlen(loop_stats);
++            snprintf(loop_stats + len, sizeof(loop_stats) - len, "; TLB dirty resets %.0f/s, %.0f walked",
++                     (resets - last_resets) / 5.0, (walks - last_walks) / 5.0);
++        }
++        last_resets = resets;
++        last_walks = walks;
++        ps4_heap_trim();
++        if (ps4_settings.monitor_log) {
++            trace("monitor: presented %.1f/s (display in %.1f/s), guest flips %.1f/s, "
++                  "guest clock +%.2f s, runstate %s, cpu pc 0x%08" PRIx64 "%s | GPU %d%% | %s | %s | %s",
++                  (frames - last_frames) / 5.0, (display - last_display) / 5.0,
++                  (flips - last_flips) / 5.0, (guest_ns - last_guest_ns) / 1e9,
++                  RunState_str(runstate_get()), pc,
++                  cpu != NULL && cpu->halted ? " (halted)" : "", ps4_perf_gpu, threads, loop_stats,
++                  pad_stats);
++        }
 +        /* (no cpu_dump_state here: from this thread, with the guest kernel running, it took
 +         * the process down in v00.07) */
 +        last_frames = frames;
@@ -3044,6 +3343,40 @@ index 0000000000..93ced8c605
 +        last_guest_ns = guest_ns;
 +    }
 +    return NULL;
++}
++
++/*
++ * QEMU's main loop sleeps until shortly before each timer deadline and spins the rest
++ * (util/qemu-timer.c, ps4_poll_ns): how much it spins comes from how far the PS4's sleeps
++ * overshoot, measured here (Settings: poll_spin_us in ps4.ini, -1 = this measurement).
++ */
++extern int64_t ps4_poll_spin_ns;
++extern uint64_t ps4_poll_waits, ps4_poll_sleeps, ps4_poll_spin_total_ns;
++
++static void calibrate_main_loop_waits(void)
++{
++    if (ps4_settings.poll_spin_us >= 0) {
++        ps4_poll_spin_ns = (int64_t)ps4_settings.poll_spin_us * 1000;
++        trace("main loop waits: spin the last %d us (ps4.ini)", ps4_settings.poll_spin_us);
++        return;
++    }
++    int64_t total = 0, worst = 0;
++    const int runs = 16;
++    for (int i = 0; i < runs; i++) {
++        struct timespec ts = { 0, 300000 };
++        const int64_t t0 = get_clock();
++        pselect(0, NULL, NULL, NULL, &ts, NULL);
++        const int64_t over = MAX(0, get_clock() - t0 - 300000);
++        total += over;
++        worst = MAX(worst, over);
++    }
++    /* spin past the usual overshoot; a sleep that is coarser than that (a 1 ms tick) is taken as
++     * it comes rather than spun through: a timer a little late beats a core lost to spinning */
++    const int64_t spin = MIN(MAX(total / runs + 50000, 50000), 400000);
++    ps4_poll_spin_ns = spin;
++    trace("main loop waits: a 300 us sleep overshoots %lld us on average, %lld at worst: "
++          "spin the last %lld us", (long long)(total / runs / 1000), (long long)(worst / 1000),
++          (long long)(spin / 1000));
 +}
 +
 +static int g_argc;
@@ -3149,6 +3482,10 @@ index 0000000000..93ced8c605
 +            return;
 +        }
 +        trace("presenting on VideoOut");
++        const char *dvd = g_config.sys.files.dvd_path;
++        if (dvd == NULL || dvd[0] == '\0' || access(dvd, R_OK) != 0) {
++            ps4_hud_open_games();
++        }
 +    }
 +
 +    /*
@@ -3207,7 +3544,30 @@ index 0000000000..93ced8c605
 +    redirect_output();
 +    atexit(trace_exit);
 +    setlocale(LC_NUMERIC, "C");
-+    profiling = access(XEMU_DATA "/profile.txt", F_OK) == 0;
++    ps4_settings_load();
++    ps4_settings_save();    /* every key in the file, for editing by hand */
++
++    /*
++     * Threads: stacks from the kit's heap (direct memory) rather than the shared flexible pool;
++     * new threads on the shared cores, pinned ones move themselves (ps4_thread_started). This
++     * thread presents and polls the pads: a shared core, above the background threads.
++     */
++    ps4_kit_set_thread_stacks_from_heap(1);
++    app_cores = ps4_new_thread_cores ? ps4_new_thread_cores : 0x3f;
++    shared_cores = app_cores & ~0xfull;
++    if (shared_cores == 0 || ps4_settings.cpu_layout == PS4_CPU_FLOATING) {
++        shared_cores = app_cores;
++    }
++    ps4_kit_set_new_thread_cores(shared_cores);
++    ps4x_set_affinity(pthread_self(), shared_cores);
++    if (ps4_settings.cpu_layout == PS4_CPU_PINNED) {
++        ps4x_set_priority(pthread_self(), 660);
++    }
++    /* RADV's shader cache: compiled pipelines kept between runs (ps4-kit Mesa patches 0023-0025) */
++    mkdir(XEMU_DATA "/cache", 0777);
++    setenv("MESA_SHADER_CACHE_DIR", XEMU_DATA "/cache/mesa", 1);
++    profiling = ps4_settings.profiler || access(XEMU_DATA "/profile.txt", F_OK) == 0;
++    tlb_dirty_index_enabled = ps4_settings.tlb_index;
 +    if (profiling) {
 +        ps4_sampler_start();
 +        ps4_sampler_register_thread("main (display)");
@@ -3215,6 +3575,10 @@ index 0000000000..93ced8c605
 +
 +    trace("xemu-ps4 %s (%s %s) starting", xemu_version, xemu_commit, xemu_date);
 +    trace("CPU: %s, OS: %s", xemu_get_cpu_info(), xemu_get_os_info());
++    trace("CPU: %s at %u MHz, OS: %s; cores %#llx, layout %s", xemu_get_cpu_info(), ps4_kit_cpu_mhz(),
++          xemu_get_os_info(), (unsigned long long)app_cores,
++          ps4_settings.cpu_layout == PS4_CPU_PINNED ? "pinned" : "floating");
++    calibrate_main_loop_waits();
 +
 +    xemu_settings_set_path(XEMU_DATA "/xemu.toml");
 +    if (!xemu_settings_load()) {
@@ -3224,9 +3588,11 @@ index 0000000000..93ced8c605
 +    xemu_settings_save();
 +    atexit(xemu_settings_save);
 +
-+    /* One subsystem at a time: SDL_Init stops at the first that fails. No PS4 audio driver in
-+     * SDL yet: the dummy one keeps xemu's audio streams working, silently. */
-+    SDL_SetHint(SDL_HINT_AUDIO_DRIVER, "dummy");
++    /* One subsystem at a time: SDL_Init stops at the first that fails. Sound: SDL's PS4 driver
++     * (port/sdl3: sceAudioOut, 48 kHz stereo), its buffer from Settings (ps4.ini audio_frames). */
++    char frames[16];
++    snprintf(frames, sizeof(frames), "%d", ps4_settings.audio_frames);
++    SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, frames);
 +    static const struct {
 +        SDL_InitFlags flag;
 +        const char *name;
@@ -3240,6 +3606,7 @@ index 0000000000..93ced8c605
 +            trace("SDL %s: %s", subsystems[i].name, SDL_GetError());
 +        }
 +    }
++    trace("SDL audio driver: %s", SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "none");
 +    ps4_pad_init();
 +
 +    /* QEMU parses no command line here: the machine comes from xemu.toml (system/vl.c). Extra
@@ -3292,6 +3659,40 @@ index 0000000000..93ced8c605
 +    return exit_status;
 +}
 +
++bool ps4_load_disc(const char *path)
++{
++    Error *err = NULL;
++    xemu_load_disc(path, &err);
++    if (err) {
++        trace("load disc %s: %s", path, error_get_pretty(err));
++        error_free(err);
++        return false;
++    }
++    trace("disc: %s", path);
++    xemu_settings_save();
++    return true;
++}
++
++void ps4_eject_disc(void)
++{
++    Error *err = NULL;
++    xemu_eject_disc(&err);
++    if (err) {
++        error_free(err);
++    }
++    xemu_settings_save();
++}
++
++void ps4_request_reset(void)
++{
++    qemu_system_reset_request(SHUTDOWN_CAUSE_HOST_UI);
++}
++
++void ps4_request_quit(void)
++{
++    qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
++}
++
 +void xemu_eject_disc(Error **errp)
 +{
 +    Error *error = NULL;
@@ -3327,7 +3728,7 @@ index 0000000000..93ced8c605
 +    xbox_smc_update_tray_state();
 +}
 diff --git a/ui/qemu-pixman.c b/ui/qemu-pixman.c
-index aea09755b9..c8fc7c7037 100644
+index aea0975..c8fc7c7 100644
 --- a/ui/qemu-pixman.c
 +++ b/ui/qemu-pixman.c
 @@ -4,6 +4,7 @@
@@ -3359,7 +3760,7 @@ index aea09755b9..c8fc7c7037 100644
      qemu_memfd_free(ptr, size, handle);
  #endif
 diff --git a/ui/xemu-data.c b/ui/xemu-data.c
-index b0972ce280..1e9d516ca9 100644
+index b0972ce..1e9d516 100644
 --- a/ui/xemu-data.c
 +++ b/ui/xemu-data.c
 @@ -42,7 +42,12 @@ const char *xemu_get_resource_path(const char *filename)
@@ -3376,7 +3777,7 @@ index b0972ce280..1e9d516ca9 100644
  
  	if (!resource_path) {
 diff --git a/ui/xemu-settings.cc b/ui/xemu-settings.cc
-index 5f9148af8a..d7661813f3 100644
+index 5f9148a..d766181 100644
 --- a/ui/xemu-settings.cc
 +++ b/ui/xemu-settings.cc
 @@ -77,6 +77,14 @@ const char *xemu_settings_get_base_path(void)
@@ -3395,7 +3796,7 @@ index 5f9148af8a..d7661813f3 100644
          const char *base = SDL_GetBasePath();
          assert(base != NULL);
 diff --git a/ui/xemu-snapshots.c b/ui/xemu-snapshots.c
-index 9d40864e66..01b26c68bd 100644
+index 9d40864..01b26c6 100644
 --- a/ui/xemu-snapshots.c
 +++ b/ui/xemu-snapshots.c
 @@ -22,7 +22,9 @@
@@ -3446,7 +3847,7 @@ index 9d40864e66..01b26c68bd 100644
          g_free(*data);
      }
 diff --git a/ui/xemu-snapshots.h b/ui/xemu-snapshots.h
-index 9d793f0ced..7e5137aab0 100644
+index 9d793f0..7e5137a 100644
 --- a/ui/xemu-snapshots.h
 +++ b/ui/xemu-snapshots.h
 @@ -27,7 +27,12 @@ extern "C" {
@@ -3463,7 +3864,7 @@ index 9d793f0ced..7e5137aab0 100644
  #define XEMU_SNAPSHOT_DATA_MAGIC 0x78656d75 // 'xemu'
  #define XEMU_SNAPSHOT_DATA_VERSION 1
 diff --git a/util/cutils.c b/util/cutils.c
-index 9803f11a59..2cebf29d17 100644
+index 9803f11..2cebf29 100644
 --- a/util/cutils.c
 +++ b/util/cutils.c
 @@ -28,8 +28,10 @@
@@ -3477,8 +3878,23 @@ index 9803f11a59..2cebf29d17 100644
  
  #ifdef __NetBSD__
  #include <sys/sysctl.h>
+diff --git a/util/main-loop.c b/util/main-loop.c
+index 42ecfb8..0159f44 100644
+--- a/util/main-loop.c
++++ b/util/main-loop.c
+@@ -383,6 +383,10 @@ static int os_host_main_loop_wait(int64_t timeout)
+     bql_lock();
+ 
+     glib_pollfds_poll();
++#ifdef __PS4__
++    /* the main loop's CPU time for the PS4 frontend's load display (ps4-kit's ps4_sampler.cpp) */
++    { extern void ps4_thread_cpu_tick(void); ps4_thread_cpu_tick(); }
++#endif
+ 
+     g_main_context_release(context);
+ 
 diff --git a/util/oslib-posix.c b/util/oslib-posix.c
-index 3c14b72665..08488e9009 100644
+index 3c14b72..839fdfe 100644
 --- a/util/oslib-posix.c
 +++ b/util/oslib-posix.c
 @@ -48,7 +48,10 @@
@@ -3512,7 +3928,38 @@ index 3c14b72665..08488e9009 100644
  #elif defined(__FreeBSD__)
      return thr_kill2(getpid(), tid, sig);
  #elif defined(__NetBSD__)
-@@ -685,7 +693,7 @@ char *qemu_get_pid_name(pid_t pid)
+@@ -211,7 +219,20 @@ void *qemu_anon_ram_alloc(size_t size, uint64_t *alignment, bool shared,
+     const uint32_t qemu_map_flags = (shared ? QEMU_MAP_SHARED : 0) |
+                                     (noreserve ? QEMU_MAP_NORESERVE : 0);
+     size_t align = QEMU_VMALLOC_ALIGN;
+-#ifndef EMSCRIPTEN
++#if defined(__PS4__)
++    /*
++     * xemu-ps4: guest RAM from ps4-kit's heap, whose big blocks come from direct memory. QEMU's
++     * mmap reservation + MAP_FIXED mapping took it from the app's shared flexible memory pool
++     * (~450 MiB for program images, thread stacks and the system's own objects; when it runs dry
++     * the PS4 freezes the app). Zeroed, as anonymous memory is.
++     */
++    (void)qemu_map_flags;
++    void *ptr = qemu_try_memalign(align, size);
++    if (ptr == NULL) {
++        return NULL;
++    }
++    memset(ptr, 0, size);
++#elif !defined(EMSCRIPTEN)
+     void *ptr = qemu_ram_mmap(-1, size, align, qemu_map_flags, 0);
+ 
+     if (ptr == MAP_FAILED) {
+@@ -238,7 +259,7 @@ void *qemu_anon_ram_alloc(size_t size, uint64_t *alignment, bool shared,
+ void qemu_anon_ram_free(void *ptr, size_t size)
+ {
+     trace_qemu_anon_ram_free(ptr, size);
+-#ifndef EMSCRIPTEN
++#if !defined(EMSCRIPTEN) && !defined(__PS4__)
+     qemu_ram_munmap(-1, ptr, size);
+ #else
+     /*
+@@ -685,7 +706,7 @@ char *qemu_get_pid_name(pid_t pid)
  {
      char *name = NULL;
  
@@ -3521,8 +3968,44 @@ index 3c14b72665..08488e9009 100644
      /* BSDs don't have /proc, but they provide a nice substitute */
      struct kinfo_proc *proc = kinfo_getproc(pid);
  
+@@ -724,6 +745,22 @@ void *qemu_alloc_stack(size_t *sz)
+     *sz = ROUND_UP(*sz, pagesz);
+     /* allocate one extra page for the guard page */
+     *sz += pagesz;
++#ifdef __PS4__
++    /*
++     * xemu-ps4: coroutine stacks (1 MiB each, QEMU keeps pools of them) from ps4-kit's heap (direct
++     * memory) instead of mmap, which took them from the shared flexible memory pool: v00.15's log
++     * showed a new one every ~11 ms while a game loaded, 129 -> 112 MiB of the pool left in 0.3 s.
++     * The guard page stays when the kernel lets the heap's page be protected.
++     */
++    ptr = qemu_try_memalign(pagesz, *sz);
++    if (ptr == NULL) {
++        perror("failed to allocate memory for stack");
++        abort();
++    }
++    (void)flags;
++    mprotect(ptr, pagesz, PROT_NONE);
++    return ptr;
++#endif
+ 
+     flags = MAP_PRIVATE | MAP_ANONYMOUS;
+ #if defined(MAP_STACK) && defined(__OpenBSD__)
+@@ -763,6 +800,12 @@ static __thread unsigned int max_stack_usage;
+ 
+ void qemu_free_stack(void *stack, size_t sz)
+ {
++#ifdef __PS4__
++    /* the guard page back to read/write before the heap reuses it (qemu_alloc_stack) */
++    mprotect(stack, qemu_real_host_page_size(), PROT_READ | PROT_WRITE);
++    qemu_vfree(stack);
++    return;
++#endif
+ #ifdef CONFIG_DEBUG_STACK_USAGE
+     unsigned int usage;
+     void *ptr;
 diff --git a/util/qemu-thread-posix.c b/util/qemu-thread-posix.c
-index ba725444ba..7e1705fdb1 100644
+index ba72544..7e1705f 100644
 --- a/util/qemu-thread-posix.c
 +++ b/util/qemu-thread-posix.c
 @@ -370,6 +370,16 @@ static void *qemu_thread_start(void *args)
@@ -3542,3 +4025,120 @@ index ba725444ba..7e1705fdb1 100644
      QEMU_TSAN_ANNOTATE_THREAD_NAME(qemu_thread_args->name);
      g_free(qemu_thread_args->name);
      g_free(qemu_thread_args);
+diff --git a/util/qemu-timer.c b/util/qemu-timer.c
+index 650030c..9f8bdb1 100644
+--- a/util/qemu-timer.c
++++ b/util/qemu-timer.c
+@@ -323,6 +323,101 @@ int qemu_timeout_ns_to_ms(int64_t ns)
+ /* qemu implementation of g_poll which uses a nanosecond timeout but is
+  * otherwise identical to g_poll
+  */
++#ifdef __PS4__
++/*
++ * xemu-ps4: the PS4's libkernel has no ppoll, and the XBOX busy-wait below (for Windows' coarse
++ * sleeps) spins on every deadline under 1.25 ms: with the Xbox kernel's 1 kHz timer tick that is
++ * nearly always, so QEMU's main loop kept a whole core busy (v00.15) - and the PS4 gives threads of
++ * one priority no turns, so whatever shared that core waited. pselect takes nanoseconds: sleep until
++ * shortly before the deadline, then spin only the margin the PS4's sleeps overshoot by, which the
++ * frontend measures at start (ui/ps4/xemu-ps4.c sets ps4_poll_spin_ns).
++ */
++#include <sys/select.h>
++
++int64_t ps4_poll_spin_ns = 300000;
++/* for the frontend's monitor: waits, of them slept in pselect, ns spun */
++uint64_t ps4_poll_waits, ps4_poll_sleeps, ps4_poll_spin_total_ns;
++
++static int ps4_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
++{
++    if (timeout == 0) {
++        return g_poll(fds, nfds, 0);
++    }
++    if (timeout < 0) {
++        return g_poll(fds, nfds, -1);
++    }
++    const int64_t start = get_clock();
++    const int64_t deadline = start + timeout;
++    const int64_t sleep_ns = timeout - qatomic_read(&ps4_poll_spin_ns);
++    ps4_poll_waits++;
++    if (sleep_ns > 0) {
++        fd_set rd, wr, ex;
++        int maxfd = -1;
++        FD_ZERO(&rd);
++        FD_ZERO(&wr);
++        FD_ZERO(&ex);
++        for (guint i = 0; i < nfds; i++) {
++            const int fd = fds[i].fd;
++            fds[i].revents = 0;
++            if (fd < 0 || fd >= FD_SETSIZE) {
++                continue;
++            }
++            if (fds[i].events & (G_IO_IN | G_IO_HUP | G_IO_ERR)) {
++                FD_SET(fd, &rd);
++            }
++            if (fds[i].events & G_IO_OUT) {
++                FD_SET(fd, &wr);
++            }
++            if (fds[i].events & G_IO_PRI) {
++                FD_SET(fd, &ex);
++            }
++            maxfd = MAX(maxfd, fd);
++        }
++        struct timespec ts = {
++            .tv_sec = sleep_ns / 1000000000LL,
++            .tv_nsec = sleep_ns % 1000000000LL,
++        };
++        ps4_poll_sleeps++;
++        int r = pselect(maxfd + 1, &rd, &wr, &ex, &ts, NULL);
++        if (r > 0) {
++            int ready = 0;
++            for (guint i = 0; i < nfds; i++) {
++                const int fd = fds[i].fd;
++                if (fd < 0 || fd >= FD_SETSIZE) {
++                    continue;
++                }
++                if (FD_ISSET(fd, &rd)) {
++                    fds[i].revents |= fds[i].events & G_IO_IN ? G_IO_IN
++                                                              : fds[i].events & (G_IO_HUP | G_IO_ERR);
++                }
++                if (FD_ISSET(fd, &wr)) {
++                    fds[i].revents |= G_IO_OUT;
++                }
++                if (FD_ISSET(fd, &ex)) {
++                    fds[i].revents |= G_IO_PRI;
++                }
++                ready += fds[i].revents != 0;
++            }
++            return ready;
++        }
++        if (r < 0) {
++            /* EINTR or an fd pselect can't take: poll, which reports such an fd */
++            return g_poll(fds, nfds, 0);
++        }
++    }
++    int64_t now = get_clock();
++    if (now < deadline) {
++        const int64_t spin_start = now;
++        while (now < deadline) {
++            __builtin_ia32_pause();
++            now = get_clock();
++        }
++        ps4_poll_spin_total_ns += now - spin_start;
++    }
++    return g_poll(fds, nfds, 0);
++}
++#endif
++
+ int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
+ {
+ #ifdef CONFIG_PPOLL
+@@ -343,6 +438,10 @@ int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
+     }
+ #else
+ 
++#ifdef __PS4__
++    return ps4_poll_ns(fds, nfds, timeout);
++#endif
++
+ #ifdef XBOX
+     /* Timers are facilitated by this function. Busy-wait if the deadline is
+      * near, to avoid missing deadlines due to costly sleeps.

@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
-# xemu additions to the sysroot (idempotent): declarations for libps4compat.a in the libc overlay
-# and the library itself (toolchain/runtime/ps4_compat.c), also installed as libresolv.a; libc.a
-# without its ENOSYS stubs (toolchain/trim-libc.py).
+# xemu's additions to this port's sysroot (idempotent), on top of the kit's libc overlay (which has
+# sys/event.h and the dirent.h d_ino fix since the kit merged them from this port):
+#   - declarations for libps4compat.a (port/ps4_compat.c: closefrom, uname, res_query, ...) and the
+#     library itself, also installed as libresolv.a (GIO links it by name)
+#   - FreeBSD's SCM_CREDS/struct cmsgcred (GIO's gcredentials.c) and SOCK_CLOEXEC/SOCK_NONBLOCK
+#   - libc.a without its ENOSYS stubs (toolchain/trim-libc.py): configure and meson link probes
+#     otherwise "find" ppoll, timerfd, epoll, inotify, memfd_create, ...; the stubs go to
+#     libc_enosys.a, linked last into the eboot only
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-source "$HERE/env.sh"
+source "$HERE/../scripts/env.sh"
 O="$PS4_SYSROOT/libc-overlay"
 
-if ! grep -q _XEMUPS4_UNISTD_H "$O/unistd.h"; then
+if ! grep -q _XEMUPS4_UNISTD_H "$O/unistd.h" 2>/dev/null; then
+    [ -f "$O/unistd.h" ] || printf '#include_next <unistd.h>\n' > "$O/unistd.h"
     cat >> "$O/unistd.h" <<'H'
-/* xemu-ps4: FreeBSD functions provided by libps4compat.a (toolchain/runtime/ps4_compat.c) */
+/* xemu-ps4: FreeBSD functions provided by libps4compat.a (port/ps4_compat.c) */
 #ifndef _XEMUPS4_UNISTD_H
 #define _XEMUPS4_UNISTD_H
 #ifdef __cplusplus
@@ -52,29 +58,13 @@ struct cmsgcred {
 H
 fi
 
-# FreeBSD's d_ino alias for the PS4's struct dirent (d_fileno)
-cat > "$O/dirent.h" <<'H'
-/* xemu-ps4: the PS4's struct dirent is FreeBSD 9's (member d_fileno), but OpenOrbis' dirent.h
-   then defines d_fileno as d_ino, so neither name reaches the member. FreeBSD's alias instead. */
-#include_next <dirent.h>
-#undef d_fileno
-#ifndef d_ino
-#define d_ino d_fileno
-#endif
-H
-
-# whole headers OpenOrbis lacks (toolchain/overlay)
-cp -r "$HERE/overlay/." "$O/"
-
-OBJ="$PSB/build/runtime"
+OBJ="$PSB/build/compat"
 mkdir -p "$OBJ"
-"$HERE/bin/ps4-cc" -std=gnu11 -O2 -Wall -c "$HERE/runtime/ps4_compat.c" -o "$OBJ/ps4_compat.o"
+"$XEMUPS4/toolchain/bin/ps4-cc" -std=gnu11 -O2 -Wall -c "$XEMUPS4/port/ps4_compat.c" -o "$OBJ/ps4_compat.o"
 for lib in libps4compat.a libresolv.a; do
     rm -f "$PS4_SYSROOT/lib/$lib"
     "$PS4_AR" rcs "$PS4_SYSROOT/lib/$lib" "$OBJ/ps4_compat.o"
 done
 # libc.a without the ENOSYS stubs, ahead of OpenOrbis' on the wrappers' library path
 python3 "$HERE/trim-libc.py" "$OPENORBIS/lib/libc.a" "$PS4_SYSROOT/lib/libc.a" "$PS4_SYSROOT/lib/libc_enosys.a"
-# the link script for PS4 programs (toolchain/bin/ps4-cc)
-python3 "$HERE/make-link-script.py" "$OPENORBIS/link.x" "$PS4_SYSROOT/lib/ps4-link.x" >/dev/null
 echo "xemu overlay installed"

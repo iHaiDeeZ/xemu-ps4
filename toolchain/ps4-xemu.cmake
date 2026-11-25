@@ -1,13 +1,35 @@
-# Toolchain for xemu on PS4: DolphinPS4/Crema's love-ps4-style modern toolchain
-# (clang 21 + libc++ 21, ld.lld called directly, OpenOrbis CRT/libc), plus this port's sysroot
-# (seeded from Crema's: zlib, zstd, libzip, glslang, ...) on the find path ahead of PacBrew's.
-include(${CMAKE_CURRENT_LIST_DIR}/ps4-love-modern.cmake)
+# CMake toolchain for what xemu's meson build makes with CMake (glslang, volk, SPIRV-Reflect) and
+# for SDL3: the toolchain/bin wrappers as compilers (ps4-kit's: OpenOrbis CRT + C library, clang 21,
+# libc++ 21), FreeBSD as the system (what the code sees: __FreeBSD__ from the target triple, and
+# what the PS4's kernel is), this port's sysroot as the only place to find packages.
+set(CMAKE_SYSTEM_NAME FreeBSD)
+set(CMAKE_SYSTEM_VERSION 9)
+set(CMAKE_SYSTEM_PROCESSOR x86_64)
+set(CMAKE_CROSSCOMPILING ON)
 
-list(PREPEND CMAKE_FIND_ROOT_PATH ${PS4_SYSROOT})
-set(CMAKE_TRY_COMPILE_PLATFORM_VARIABLES ${CMAKE_TRY_COMPILE_PLATFORM_VARIABLES} CMAKE_FIND_ROOT_PATH)
-# Our sysroot's headers instead of PacBrew's port libraries (usr/include has old fmt, SDL2, ...):
-# a -I there would be searched before any -isystem directory.
-foreach(_lang C CXX ASM)
-    string(REPLACE "-I${OPENORBIS}/usr/include" "-I${PS4_SYSROOT}/include"
-           CMAKE_${_lang}_FLAGS_INIT "${CMAKE_${_lang}_FLAGS_INIT}")
-endforeach()
+if (DEFINED ENV{XEMUPS4})
+    set(XEMUPS4 $ENV{XEMUPS4})
+else ()
+    set(XEMUPS4 $ENV{HOME}/xemups4)
+endif ()
+if (DEFINED ENV{PS4_SYSROOT})
+    set(PS4_SYSROOT $ENV{PS4_SYSROOT})
+else ()
+    set(PS4_SYSROOT $ENV{HOME}/xemups4-build/sysroot)
+endif ()
+set(CMAKE_C_COMPILER ${XEMUPS4}/toolchain/bin/ps4-cc)
+set(CMAKE_CXX_COMPILER ${XEMUPS4}/toolchain/bin/ps4-c++)
+set(CMAKE_ASM_COMPILER ${XEMUPS4}/toolchain/bin/ps4-cc)
+set(CMAKE_AR llvm-ar-21 CACHE FILEPATH "")
+set(CMAKE_RANLIB llvm-ranlib-21 CACHE FILEPATH "")
+
+set(CMAKE_FIND_ROOT_PATH ${PS4_SYSROOT})
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "")
+# pthreads are in libkernel, which every link through the wrappers has
+set(CMAKE_HAVE_LIBC_PTHREAD 1 CACHE INTERNAL "")
+set(CMAKE_THREAD_LIBS_INIT "" CACHE INTERNAL "")
+set(Threads_FOUND TRUE CACHE INTERNAL "")

@@ -1,23 +1,21 @@
 #!/usr/bin/env bash
-# One-time: create ~/xemups4-build from copies of Resonance's build tree (libc++ 21 sysroot with the
-# libc overlay and prebuilt libraries, and the RADV/GNM Mesa build), so this port never writes into
-# another port's tree.
+# One-time: the WSL build tree ~/xemups4-build and the space-free link ~/xemups4 to this repo.
+# Needs ps4-kit (github.com/iHaiDeeZ/ps4-kit) set up first: ~/ps4-kit, its sysroot in
+# ~/ps4kit-build/sysroot (scripts/seed-build-tree.sh there) and its RADV build
+# (gpu/build-mesa.sh -> ~/ps4kit-build/build/mesa). This port's sysroot starts as a copy of the
+# kit's, so what xemu adds (glib, pixman, its SDL3, a trimmed libc.a) never lands in another port's.
 set -euo pipefail
-SRC_TREE="${SRC_TREE:-$HOME/resonance-build}"
-PSB="${PSB:-$HOME/xemups4-build}"
-mkdir -p "$PSB/src" "$PSB/build" "$PSB/out" "$PSB/logs" "$PSB/oelf"
-[ -d "$PSB/sysroot" ] || cp -a "$SRC_TREE/sysroot" "$PSB/sysroot"
-# the copied pkg-config and CMake files still name the build tree they were made in
-grep -rlE "/home/[^/]+/[a-z0-9]+-build/sysroot" "$PSB/sysroot/lib/pkgconfig" "$PSB/sysroot/lib/cmake" 2>/dev/null |
-    xargs -r sed -i -E "s#/home/[^/]+/[a-z0-9]+-build/sysroot#$PSB/sysroot#g"
-[ -d "$PSB/host-compat" ] || cp -a "$SRC_TREE/host-compat" "$PSB/host-compat"
-# Mesa: the whole build directory (its static libraries are thin archives). CEMUPS4's build of
-# Crema's tree (34ff87b and later): xemu runs nearly every draw through a geometry shader, and
-# that tree allocates the legacy GS rings larger than programmed - with Resonance's older RADV
-# the GS wrote past its rings and the PS4 ended the app on the GPU page fault.
-MESA_TREE="${MESA_TREE:-$HOME/cemups4-build}"
-[ -d "$PSB/build/mesa" ] || cp -a "$MESA_TREE/build/mesa" "$PSB/build/mesa"
-# Space-free path to this repo: toolchain flags (linker script paths) break on "PS4 Projects".
-REPO="$(cd "$(dirname "$0")/.." && pwd)"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+REPO="$(cd "$HERE/.." && pwd)"
 [ -e "$HOME/xemups4" ] || ln -s "$REPO" "$HOME/xemups4"
-du -sh "$PSB"/* 2>/dev/null
+source "$HERE/env.sh"
+[ -d "$HOME/ps4kit-build/sysroot/lib" ] || { echo "no kit sysroot in ~/ps4kit-build/sysroot (ps4-kit's seed-build-tree.sh)" >&2; exit 1; }
+[ -f "$PS4_MESA_BUILD/src/amd/vulkan/libvulkan_radeon.a" ] || { echo "no RADV build in $PS4_MESA_BUILD (ps4-kit's gpu/build-mesa.sh)" >&2; exit 1; }
+mkdir -p "$PSB/src" "$PSB/build" "$PSB/out" "$PSB/logs" "$PSB/oelf"
+if [ ! -d "$PS4_SYSROOT/lib" ]; then
+    cp -a "$HOME/ps4kit-build/sysroot" "$PS4_SYSROOT"
+    # the copied pkg-config and CMake files still name the kit's tree
+    grep -rlE "/home/[^/]+/ps4kit-build/sysroot" "$PS4_SYSROOT/lib/pkgconfig" "$PS4_SYSROOT/lib/cmake" 2>/dev/null |
+        xargs -r sed -i -E "s#/home/[^/]+/ps4kit-build/sysroot#$PS4_SYSROOT#g"
+fi
+du -sh "$PSB"/* 2>/dev/null || true
