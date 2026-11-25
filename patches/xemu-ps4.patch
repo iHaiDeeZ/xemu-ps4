@@ -1,9 +1,9 @@
 diff --git a/accel/tcg/aot.c b/accel/tcg/aot.c
 new file mode 100644
-index 0000000..a49d8da
+index 0000000..ba5194c
 --- /dev/null
 +++ b/accel/tcg/aot.c
-@@ -0,0 +1,807 @@
+@@ -0,0 +1,873 @@
 +/*
 + * xemu-ps4: the ahead-of-time translator's runtime (see include/exec/aot.h).
 + *
@@ -95,6 +95,7 @@ index 0000000..a49d8da
 +static uint32_t index_mask;
 +static unsigned long *valid_pages;   /* virtual 4 KiB pages holding blocks entered this generation */
 +static uint32_t loaded_title;
++static uint32_t current_title;     /* the game started last (aot_set_title) */
 +static char loaded_path[128];
 +
 +/* counters (read by the monitor thread without locks) */
@@ -163,44 +164,85 @@ index 0000000..a49d8da
 +    return !probe_faulted;
 +}
 +
-+static void *aot_exec_alloc(size_t size)
++int32_t sceKernelReserveVirtualRange(void **addr, size_t len, int flags, size_t align);
++
++/* Direct memory as Crema's mapDirectExecutable: a reserved range, the memory mapped over it. */
++static void *aot_map_direct(size_t size)
 +{
-+    static int direct_runs = -1;
 +    void *base = NULL;
 +    off_t phys = 0;
 +    int32_t r;
 +
-+    /* 2 MiB aligned: the kernel can map the code with large pages (fewer iTLB misses) */
-+    size = ROUND_UP(size, 2 * MiB);
-+    r = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), size, 2 * MiB, 0, &phys);
++    r = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), size, 16 * KiB, 0, &phys);
 +    if (r != 0) {
 +        fprintf(stderr, "aot: no %zu MiB of direct memory (0x%x)\n", size >> 20, (unsigned)r);
 +        return NULL;
 +    }
-+    r = sceKernelMapDirectMemory(&base, size, 0x7 /* CPU read, write, execute */, 0, phys, 2 * MiB);
++    r = sceKernelReserveVirtualRange(&base, size, 0, 16 * KiB);
++    if (r == 0) {
++        r = sceKernelMapDirectMemory(&base, size, 0x7 /* CPU read, write, execute */,
++                                     0x10 /* fixed */, phys, 16 * KiB);
++    }
 +    if (r != 0) {
++        /* v00.21 on 13.52: 0x80020016 (EINVAL) - the kernel won't make direct memory executable */
 +        fprintf(stderr, "aot: direct memory can't be mapped executable (0x%x)\n", (unsigned)r);
++        if (base) {
++            sceKernelMunmap(base, size);
++        }
 +        sceKernelReleaseDirectMemory(phys, size);
 +        return NULL;
 +    }
-+    if (direct_runs < 0) {
-+        direct_runs = aot_runs_code(base);
-+        fprintf(stderr, "aot: executable direct memory %s\n", direct_runs ? "runs code" : "does NOT run code");
-+    }
-+    if (!direct_runs) {
++    if (!aot_runs_code(base)) {
++        fprintf(stderr, "aot: executable direct memory does not run code\n");
 +        sceKernelMunmap(base, size);
 +        sceKernelReleaseDirectMemory(phys, size);
 +        return NULL;
 +    }
 +    map_phys = phys;
++    return base;
++}
++
++/*
++ * Executable memory for the file: direct memory if the kernel allows it, else flexible memory
++ * through mmap (ps4-kit's wrap: the system pool, as the JIT's buffer; the app's regular pool when
++ * the system pool is short), each probed with a "ret" before use.
++ */
++static void *aot_exec_alloc(size_t size)
++{
++    void *base;
++
++    size = ROUND_UP(size, 16 * KiB);
++    map_phys = -1;
++    base = aot_map_direct(size);
++    if (!base) {
++        base = mmap(NULL, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS,
++                    -1, 0);
++        if (base == MAP_FAILED) {
++            fprintf(stderr, "aot: no %zu MiB of executable flexible memory either (errno %d)\n",
++                    size >> 20, errno);
++            return NULL;
++        }
++        if (!aot_runs_code(base)) {
++            fprintf(stderr, "aot: executable flexible memory does not run code\n");
++            munmap(base, size);
++            return NULL;
++        }
++        fprintf(stderr, "aot: %zu MiB of executable flexible memory at %p\n", size >> 20, base);
++    } else {
++        fprintf(stderr, "aot: %zu MiB of executable direct memory at %p\n", size >> 20, base);
++    }
 +    map_size = size;
 +    return base;
 +}
 +
 +static void aot_exec_free(void *base, size_t size)
 +{
-+    sceKernelMunmap(base, size);
-+    sceKernelReleaseDirectMemory(map_phys, size);
++    if (map_phys >= 0) {
++        sceKernelMunmap(base, size);
++        sceKernelReleaseDirectMemory(map_phys, size);
++    } else {
++        munmap(base, size);
++    }
 +}
 +#else
 +static void *aot_exec_alloc(size_t size)
@@ -604,6 +646,7 @@ index 0000000..a49d8da
 +    if (!target) {
 +        return;
 +    }
++    current_title = title_id;
 +    rec_stop();
 +    if (loaded_title != title_id) {
 +        aot_unload();
@@ -801,6 +844,29 @@ index 0000000..a49d8da
 +        }
 +        qemu_mutex_unlock(&rec_lock);
 +    }
++}
++
++/* The live console's "aot load" / "aot off", with the machine stopped and the TBs flushed after. */
++const char *aot_switch(bool load)
++{
++    char path[96];
++
++    aot_unload();
++    if (!load) {
++        return "translated code dropped: the JIT runs everything";
++    }
++    if (!current_title) {
++        return "no game started from the library";
++    }
++    snprintf(path, sizeof(path), AOT_DIR "/%08x.aot", current_title);
++    if (access(path, R_OK) != 0) {
++        return "no translated code for this game on the console";
++    }
++    if (!aot_load(path)) {
++        return "the file did not load (xemu.log says why)";
++    }
++    loaded_title = current_title;
++    return "loaded";
 +}
 +
 +void aot_register_target(const AotTarget *t)
@@ -2130,10 +2196,10 @@ index 779a41b..6e94fa5 100644
      memory_region_add_subregion(system_memory, 0, ram);
 diff --git a/include/exec/aot.h b/include/exec/aot.h
 new file mode 100644
-index 0000000..f687aeb
+index 0000000..be72ec5
 --- /dev/null
 +++ b/include/exec/aot.h
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,87 @@
 +/*
 + * xemu-ps4: the ahead-of-time translator ("translated game code").
 + *
@@ -2193,6 +2259,9 @@ index 0000000..f687aeb
 +/* cpu_restore_state / cpu_unwind_state_data for a host pc inside translated code */
 +bool aot_restore_state(CPUState *cpu, uintptr_t host_pc);
 +bool aot_unwind_state_data(CPUState *cpu, uintptr_t host_pc, uint64_t *data);
++
++/* the live console: drop the loaded file, or load the current game's again (machine stopped) */
++const char *aot_switch(bool load);
 +
 +/* one line for the monitor / the live console's "aot" command */
 +void aot_stats(GString *out, bool verbose);
@@ -5413,10 +5482,10 @@ index 0000000..a80721c
 +}
 diff --git a/ui/ps4/ps4-live.c b/ui/ps4/ps4-live.c
 new file mode 100644
-index 0000000..c8b7a12
+index 0000000..45c9279
 --- /dev/null
 +++ b/ui/ps4/ps4-live.c
-@@ -0,0 +1,210 @@
+@@ -0,0 +1,227 @@
 +/*
 + * xemu-ps4: the live console - a TCP port on the PS4 (ps4.ini live_port, default 4445; 0 = off)
 + * to look into and steer the running emulator from a PC (scripts/live.py). One client at a time,
@@ -5446,6 +5515,8 @@ index 0000000..c8b7a12
 +#include "qapi/qapi-commands-misc.h"
 +#include "exec/cpu-common.h"
 +#include "system/memory.h"
++#include "exec/tb-flush.h"
++#include "system/runstate.h"
 +#include "exec/aot.h"
 +#include "ps4-frontend.h"
 +#include "ps4-settings.h"
@@ -5527,11 +5598,26 @@ index 0000000..c8b7a12
 +        args = line + strlen(line);
 +    }
 +    if (strcmp(line, "help") == 0) {
-+        g_string_append(out, "stats | aot | hmp <monitor command> | mem <addr> [len] | profile [s] | "
-+                             "dump | get [key] | set <key> <value> | quit\n");
++        g_string_append(out, "stats | aot [load|off] | hmp <monitor command> | mem <addr> [len] | "
++                             "profile [s] | dump | get [key] | set <key> <value> | quit\n");
 +    } else if (strcmp(line, "stats") == 0) {
 +        g_string_append(out, ps4_live_last_monitor);
 +    } else if (strcmp(line, "aot") == 0) {
++        if (strcmp(args, "load") == 0 || strcmp(args, "off") == 0) {
++            /* with the CPU stopped: TBs made for the old file go, the new file's come next */
++            bql_lock();
++            const bool was_running = runstate_is_running();
++            if (was_running) {
++                vm_stop(RUN_STATE_PAUSED);
++            }
++            const char *r = aot_switch(strcmp(args, "load") == 0);
++            tb_flush__exclusive_or_serial();
++            if (was_running) {
++                vm_start();
++            }
++            bql_unlock();
++            g_string_append_printf(out, "%s\n", r);
++        }
 +        aot_stats(out, true);
 +        g_string_append_c(out, '\n');
 +    } else if (strcmp(line, "hmp") == 0) {
@@ -6936,10 +7022,10 @@ index 0000000..24e9598
 +}
 diff --git a/ui/ps4/xemu-ps4.c b/ui/ps4/xemu-ps4.c
 new file mode 100644
-index 0000000..841a0d3
+index 0000000..d4e08ee
 --- /dev/null
 +++ b/ui/ps4/xemu-ps4.c
-@@ -0,0 +1,1168 @@
+@@ -0,0 +1,1176 @@
 +/*
 + * xemu-ps4: the PS4 frontend (replaces ui/xemu.c and its SDL window + OpenGL).
 + *
@@ -7020,10 +7106,18 @@ index 0000000..841a0d3
 +/* ps4-kit: this app's folder for crash.log, boot-trace.log and the profilers' files */
 +PS4_DIAG_DATA_DIR(XEMU_DATA);
 +
-+/* ps4-kit's heap (before main: fields only): its log lines and mappings named "xemu" */
++/*
++ * ps4-kit's heap (before main: fields only): its log lines and mappings named "xemu". Its part in
++ * the system flexible pool is 64 MiB instead of 256: the heap overflowed into direct memory 0.3 s
++ * after start anyway, and the pool is where executable memory comes from - the JIT's 64 MiB and a
++ * game's translated code (accel/tcg/aot.c, 150+ MiB; the kernel refuses executable direct memory).
++ * The pool's kernel objects and Sony's modules keep more room than before (64 + 64 + 158 MiB vs
++ * 256 + 64).
++ */
 +void ps4_kit_configure_heap(ps4_kit_heap_options *o)
 +{
 +    o->log_tag = "xemu";
++    o->system_pool_max = 64u << 20;
 +}
 +
 +/* port/ps4_crashlog.cpp, after the host stacks: the emulator's view of the crash. No
