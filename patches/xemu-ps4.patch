@@ -628,7 +628,7 @@ index ecc8bb3..6eba23b 100644
                                       &pgraph_vk_gpu_properties);
      g_free(pixels);
 diff --git a/hw/xbox/nv2a/pgraph/vk/instance.c b/hw/xbox/nv2a/pgraph/vk/instance.c
-index 7044a7e..07ee63c 100644
+index 7044a7e..268345d 100644
 --- a/hw/xbox/nv2a/pgraph/vk/instance.c
 +++ b/hw/xbox/nv2a/pgraph/vk/instance.c
 @@ -32,7 +32,10 @@ static char const *const validation_layers[] = {
@@ -695,6 +695,19 @@ index 7044a7e..07ee63c 100644
  }
  
  static bool is_display_device(VkPhysicalDevice device,
+@@ -500,6 +522,12 @@ static bool select_physical_device(PGRAPHState *pg, const uint8_t *display_uuid,
+         bool is_wanted =
+             force ? !strcmp(r->device_props.deviceName, forced_device) :
+                     is_display_device(devices[i], display_uuid);
++#if !HAVE_EXTERNAL_MEMORY
++        /* xemu-ps4: no OpenGL context to match (one GPU, which presents itself): any compatible
++         * device. v00.16 left on "No supported Vulkan device found for the GPU driving the
++         * display" at start. */
++        is_wanted |= !force && display_uuid == NULL;
++#endif
+         fprintf(stderr, "- %s%s\n", r->device_props.deviceName,
+                 is_wanted ? " *" : "");
+         if (is_wanted && r->physical_device == VK_NULL_HANDLE &&
 diff --git a/hw/xbox/nv2a/pgraph/vk/meson.build b/hw/xbox/nv2a/pgraph/vk/meson.build
 index 93ef5ca..f4a3889 100644
 --- a/hw/xbox/nv2a/pgraph/vk/meson.build
@@ -2734,10 +2747,10 @@ index 0000000..24e9598
 +}
 diff --git a/ui/ps4/xemu-ps4.c b/ui/ps4/xemu-ps4.c
 new file mode 100644
-index 0000000..9456588
+index 0000000..d6ce7b6
 --- /dev/null
 +++ b/ui/ps4/xemu-ps4.c
-@@ -0,0 +1,1038 @@
+@@ -0,0 +1,1072 @@
 +/*
 + * xemu-ps4: the PS4 frontend (replaces ui/xemu.c and its SDL window + OpenGL).
 + *
@@ -2801,11 +2814,13 @@ index 0000000..9456588
 +#define XEMU_DATA "/data/xemu"
 +
 +/* util/qemu-timer.c: the main loop's waits (ps4_poll_ns) */
-+extern int64_t ps4_poll_spin_ns;
++extern int64_t ps4_poll_spin_ns, ps4_poll_short_ns;
++extern void (*ps4_poll_short_sleep)(int64_t ns);
++extern uint64_t ps4_poll_waits, ps4_poll_sleeps, ps4_poll_spin_total_ns;
++int sceKernelUsleep(unsigned int usec);
 +/* accel/tcg/cputlb.c: the TLB dirty index (set before the machine starts) and its counts */
 +extern bool tlb_dirty_index_enabled;
 +extern uint64_t tlb_dirty_index_resets, tlb_dirty_index_walks;
-+extern uint64_t ps4_poll_waits, ps4_poll_sleeps, ps4_poll_spin_total_ns;
 +/* below: the desktop's ui/xemu.c has these */
 +void xemu_eject_disc(Error **errp);
 +void xemu_load_disc(const char *path, Error **errp);
@@ -3380,8 +3395,16 @@ index 0000000..9456588
 + * (util/qemu-timer.c, ps4_poll_ns): how much it spins comes from how far the PS4's sleeps
 + * overshoot, measured here (Settings: poll_spin_us in ps4.ini, -1 = this measurement).
 + */
-+extern int64_t ps4_poll_spin_ns;
-+extern uint64_t ps4_poll_waits, ps4_poll_sleeps, ps4_poll_spin_total_ns;
++static void ps4_sleep_nanosleep(int64_t ns)
++{
++    struct timespec ts = { ns / 1000000000LL, ns % 1000000000LL };
++    nanosleep(&ts, NULL);
++}
++
++static void ps4_sleep_usleep(int64_t ns)
++{
++    sceKernelUsleep((unsigned int)(ns / 1000));
++}
 +
 +static void calibrate_main_loop_waits(void)
 +{
@@ -3390,22 +3413,46 @@ index 0000000..9456588
 +        trace("main loop waits: spin the last %d us (ps4.ini)", ps4_settings.poll_spin_us);
 +        return;
 +    }
-+    int64_t total = 0, worst = 0;
-+    const int runs = 16;
-+    for (int i = 0; i < runs; i++) {
-+        struct timespec ts = { 0, 300000 };
-+        const int64_t t0 = get_clock();
-+        pselect(0, NULL, NULL, NULL, &ts, NULL);
-+        const int64_t over = MAX(0, get_clock() - t0 - 300000);
-+        total += over;
-+        worst = MAX(worst, over);
++    /* each of the PS4's sleeps, 16 times 300 us: how much later than asked it wakes up */
++    static const char *const names[] = { "pselect", "nanosleep", "sceKernelUsleep" };
++    int64_t avg[3], worst[3];
++    for (int k = 0; k < 3; k++) {
++        int64_t total = 0;
++        worst[k] = 0;
++        for (int i = 0; i < 16; i++) {
++            struct timespec ts = { 0, 300000 };
++            const int64_t t0 = get_clock();
++            if (k == 0) {
++                pselect(0, NULL, NULL, NULL, &ts, NULL);
++            } else if (k == 1) {
++                nanosleep(&ts, NULL);
++            } else {
++                sceKernelUsleep(300);
++            }
++            const int64_t over = MAX(0, get_clock() - t0 - 300000);
++            total += over;
++            worst[k] = MAX(worst[k], over);
++        }
++        avg[k] = total / 16;
++        trace("main loop waits: a 300 us %s overshoots %lld us on average, %lld at worst", names[k],
++              (long long)(avg[k] / 1000), (long long)(worst[k] / 1000));
++    }
++    /* the short waits (under 2 ms) with the most precise of the sleeps, if it beats pselect */
++    int best = 0;
++    for (int k = 1; k < 3; k++) {
++        if (avg[k] < avg[best]) {
++            best = k;
++        }
++    }
++    if (best != 0 && avg[best] + 100000 < avg[0]) {
++        ps4_poll_short_sleep = best == 1 ? ps4_sleep_nanosleep : ps4_sleep_usleep;
++        ps4_poll_short_ns = 2000000;
 +    }
 +    /* spin past the usual overshoot; a sleep that is coarser than that (a 1 ms tick) is taken as
 +     * it comes rather than spun through: a timer a little late beats a core lost to spinning */
-+    const int64_t spin = MIN(MAX(total / runs + 50000, 50000), 400000);
++    const int64_t spin = MIN(MAX(avg[best] + 50000, 50000), 400000);
 +    ps4_poll_spin_ns = spin;
-+    trace("main loop waits: a 300 us sleep overshoots %lld us on average, %lld at worst: "
-+          "spin the last %lld us", (long long)(total / runs / 1000), (long long)(worst / 1000),
++    trace("main loop waits: short ones with %s, spin the last %lld us", names[best],
 +          (long long)(spin / 1000));
 +}
 +
@@ -4075,10 +4122,10 @@ index ba72544..7e1705f 100644
      g_free(qemu_thread_args->name);
      g_free(qemu_thread_args);
 diff --git a/util/qemu-timer.c b/util/qemu-timer.c
-index 650030c..9f8bdb1 100644
+index 650030c..ac5b95d 100644
 --- a/util/qemu-timer.c
 +++ b/util/qemu-timer.c
-@@ -323,6 +323,101 @@ int qemu_timeout_ns_to_ms(int64_t ns)
+@@ -323,6 +323,115 @@ int qemu_timeout_ns_to_ms(int64_t ns)
  /* qemu implementation of g_poll which uses a nanosecond timeout but is
   * otherwise identical to g_poll
   */
@@ -4094,6 +4141,13 @@ index 650030c..9f8bdb1 100644
 +#include <sys/select.h>
 +
 +int64_t ps4_poll_spin_ns = 300000;
++/*
++ * Waits shorter than this are slept with ps4_poll_short_sleep instead of pselect, whose timeouts
++ * the PS4 rounds to its scheduler tick (~1 ms: a 300 us pselect took ~950 us in v00.16): the fds
++ * are polled before and after it. 0: pselect always. Both set by the frontend's measurement.
++ */
++int64_t ps4_poll_short_ns;
++void (*ps4_poll_short_sleep)(int64_t ns);
 +/* for the frontend's monitor: waits, of them slept in pselect, ns spun */
 +uint64_t ps4_poll_waits, ps4_poll_sleeps, ps4_poll_spin_total_ns;
 +
@@ -4109,7 +4163,14 @@ index 650030c..9f8bdb1 100644
 +    const int64_t deadline = start + timeout;
 +    const int64_t sleep_ns = timeout - qatomic_read(&ps4_poll_spin_ns);
 +    ps4_poll_waits++;
-+    if (sleep_ns > 0) {
++    if (sleep_ns > 0 && sleep_ns < ps4_poll_short_ns && ps4_poll_short_sleep != NULL) {
++        int r = g_poll(fds, nfds, 0);
++        if (r != 0) {
++            return r;
++        }
++        ps4_poll_sleeps++;
++        ps4_poll_short_sleep(sleep_ns);
++    } else if (sleep_ns > 0) {
 +        fd_set rd, wr, ex;
 +        int maxfd = -1;
 +        FD_ZERO(&rd);
@@ -4180,7 +4241,7 @@ index 650030c..9f8bdb1 100644
  int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
  {
  #ifdef CONFIG_PPOLL
-@@ -343,6 +438,10 @@ int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
+@@ -343,6 +452,10 @@ int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
      }
  #else
  

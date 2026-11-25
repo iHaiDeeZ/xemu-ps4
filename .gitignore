@@ -7,3 +7,5 @@ out/
 build/
 art/preview/
 *.tar
+logs/
+clips/
