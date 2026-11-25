@@ -226,7 +226,9 @@ static inline uint64_t AOT_ROTR64(uint64_t a, uint64_t b) { b &= 63; return (a >
 
 /* --- xemu's x87 on host SSE (tcg/i386/tcg-target.c.inc, the FP ops) -------------------------- */
 
-#define AOT_SETCSR(v) _mm_setcsr((uint32_t)(v))
+/* host MXCSR is 0x1F80 (set by AOT_SSE_CSR; aot_enter and x87's flcr clear it) */
+extern uint32_t aot_csr_ok AOT_HIDDEN;
+#define AOT_SETCSR(v) (_mm_setcsr((uint32_t)(v)), aot_csr_ok = 0)
 
 static inline float AOT_LD80_F32(const char *p) { long double x; __builtin_memcpy(&x, p, 10); return (float)x; }
 static inline double AOT_LD80_F64(const char *p) { long double x; __builtin_memcpy(&x, p, 10); return (double)x; }
@@ -256,6 +258,104 @@ static inline uint32_t AOT_CVTSS2SI(float a) { return (uint32_t)_mm_cvtss_si32(_
 static inline uint64_t AOT_CVTSS2SI64(float a) { return (uint64_t)_mm_cvtss_si64(_mm_set_ss(a)); }
 static inline uint32_t AOT_CVTSD2SI(double a) { return (uint32_t)_mm_cvtsd_si32(_mm_set_sd(a)); }
 static inline uint64_t AOT_CVTSD2SI64(double a) { return (uint64_t)_mm_cvtsd_si64(_mm_set_sd(a)); }
+
+/* --- SSE scalar helpers as host instructions (scripts/aot-build.py swaps the calls) ------------
+ *
+ * QEMU computes these with softfloat (target/i386/ops_sse.h) behind a helper call and a sync of
+ * every guest register around it. The host's own SSE gives the same results bit for bit when
+ * it rounds the same way: these run the instruction (inline asm keeps the operand order, which
+ * decides the NaN returned when both inputs are NaNs) when the guest's MXCSR is the default
+ * (round to nearest, no flush-to-zero, no denormals-are-zero) with the host's MXCSR set to
+ * 0x1F80, and call QEMU's helper otherwise. The guest's MXCSR exception flags are not updated
+ * (QEMU raises no SIMD exceptions; games don't read the sticky flags). */
+
+#define AOT_SSE_CSR() do {                                                      \
+        if (AOT_UNLIKELY(!aot_csr_ok)) {                                        \
+            _mm_setcsr(0x1F80u);                                                \
+            aot_csr_ok = 1;                                                     \
+        }                                                                       \
+    } while (0)
+#define AOT_GUEST_CSR_DEFAULT(e) ((AOT_LDM(uint32_t, (e), AOT_OFF_MXCSR) & 0xE040u) == 0)
+
+typedef void (*aot_sse3_fn)(uintptr_t, uintptr_t, uintptr_t, uintptr_t);
+typedef void (*aot_sse2_fn)(uintptr_t, uintptr_t, uintptr_t);
+
+/* lanes 1..3 of v into d (the scalar op leaves d's upper lanes as v's) */
+static inline void aot_ss_upper(uintptr_t d, uintptr_t v)
+{
+    if (d != v) {
+        uint32_t u[3];
+        __builtin_memcpy(u, (char *)v + 4, 12);
+        __builtin_memcpy((char *)d + 4, u, 12);
+    }
+}
+
+#define AOT_SS_OP(NAME, INSN)                                                   \
+    static inline void AOT_I_##NAME(uintptr_t envp, uintptr_t d, uintptr_t v, uintptr_t s) \
+    {                                                                           \
+        char *e = (char *)envp;                                                 \
+        if (AOT_LIKELY(AOT_GUEST_CSR_DEFAULT(e))) {                             \
+            float a = AOT_LDM(float, v, 0), b = AOT_LDM(float, s, 0);          \
+            AOT_SSE_CSR();                                                      \
+            __asm__(INSN " %1, %0" : "+x"(a) : "x"(b));                         \
+            aot_ss_upper(d, v);                                                 \
+            AOT_STM(float, d, 0, a);                                            \
+        } else {                                                                \
+            ((aot_sse3_fn)AOT_H(NAME))(envp, d, v, s);                          \
+        }                                                                       \
+    }
+AOT_SS_OP(addss, "addss")
+AOT_SS_OP(subss, "subss")
+AOT_SS_OP(mulss, "mulss")
+AOT_SS_OP(divss, "divss")
+
+/* comiss/ucomiss: CC_SRC = ZF/PF/CF as the comparison says, CC_OP = CC_OP_EFLAGS (0) */
+static inline uint32_t aot_comis_flags(float a, float b)
+{
+    if (a != a || b != b) {
+        return 0x0040 | 0x0004 | 0x0001;
+    }
+    return a < b ? 0x0001 : a == b ? 0x0040 : 0;
+}
+#define AOT_COMIS_OP(NAME)                                                      \
+    static inline void AOT_I_##NAME(uintptr_t envp, uintptr_t d, uintptr_t s)  \
+    {                                                                           \
+        char *e = (char *)envp;                                                 \
+        if (AOT_LIKELY(AOT_GUEST_CSR_DEFAULT(e))) {                             \
+            AOT_STM(uint32_t, e, AOT_OFF_CC_SRC,                                \
+                    aot_comis_flags(AOT_LDM(float, d, 0), AOT_LDM(float, s, 0))); \
+            AOT_STM(uint32_t, e, AOT_OFF_CC_OP, 0);                             \
+        } else {                                                                \
+            ((aot_sse2_fn)AOT_H(NAME))(envp, d, s);                             \
+        }                                                                       \
+    }
+AOT_COMIS_OP(comiss)
+AOT_COMIS_OP(ucomiss)
+
+static inline void AOT_I_cvtsi2ss(uintptr_t envp, uintptr_t d, uint32_t val)
+{
+    char *e = (char *)envp;
+    if (AOT_LIKELY(AOT_GUEST_CSR_DEFAULT(e))) {
+        float f;
+        AOT_SSE_CSR();
+        __asm__("cvtsi2ss %1, %0" : "=x"(f) : "r"((int32_t)val));
+        AOT_STM(float, d, 0, f);
+    } else {
+        ((void (*)(uintptr_t, uintptr_t, uint32_t))AOT_H(cvtsi2ss))(envp, d, val);
+    }
+}
+
+/* truncation: the rounding mode doesn't matter; NaN and overflow give 0x80000000 as QEMU's */
+static inline int32_t AOT_I_cvttss2si(uintptr_t envp, uintptr_t s)
+{
+    char *e = (char *)envp;
+    if (AOT_LIKELY(AOT_GUEST_CSR_DEFAULT(e))) {
+        int32_t r;
+        __asm__("cvttss2si %1, %0" : "=r"(r) : "x"(AOT_LDM(float, s, 0)));
+        return r;
+    }
+    return ((int32_t (*)(uintptr_t, uintptr_t))AOT_H(cvttss2si))(envp, s);
+}
 
 static inline uint32_t AOT_F2U(float f) { uint32_t u; __builtin_memcpy(&u, &f, 4); return u; }
 static inline float AOT_U2F(uint32_t u) { float f; __builtin_memcpy(&f, &u, 4); return f; }

@@ -28,6 +28,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 RT_DIR = os.path.normpath(os.path.join(HERE, '..', 'aot'))
 LDST = ['ldub_mmu', 'lduw_mmu', 'ldul_mmu', 'ldq_mmu', 'ld16_mmu',
         'stb_mmu', 'stw_mmu', 'stl_mmu', 'stq_mmu', 'st16_mmu']
+# helpers aot_rt.h runs as host SSE instructions (AOT_I_<name>; QEMU's helper when the guest's
+# MXCSR isn't the default). Not in blocks that also set x87's MXCSR (AOT_SETCSR): both would
+# share the host's one register within the block.
+INLINE_SSE = ['addss', 'subss', 'mulss', 'divss', 'comiss', 'ucomiss', 'cvtsi2ss', 'cvttss2si']
+INLINE_RE = re.compile(r'\(\([\w ]+? \(\*\)\([^()]*\)\)AOT_H\((' + '|'.join(INLINE_SSE) + r')\)\)')
 PER_FILE = 300
 HEAD_RE = re.compile(r'//@aot pc=([0-9a-f]+) cs=([0-9a-f]+) fl=([0-9a-f]+) cf=([0-9a-f]+) '
                      r'sz=(\d+) ic=(\d+) h=([0-9a-f]+)')
@@ -62,7 +67,9 @@ def read_blocks(dirs):
                     cur = None
                     if m and int(m.group(2), 16) == 0:
                         b = Block()
-                        b.pc, b.fl, b.cf = int(m.group(1), 16), int(m.group(3), 16), int(m.group(4), 16)
+                        # cflags as accel/tcg/aot.c compares them: no cluster, no CF_INVALID
+                        b.pc, b.fl = int(m.group(1), 16), int(m.group(3), 16)
+                        b.cf = int(m.group(4), 16) & 0x00ffffff & ~0x4000
                         b.size, b.icount, b.hash = int(m.group(5)), int(m.group(6)), int(m.group(7), 16)
                         cur, body = b, []
                 elif line.startswith('//@end'):
@@ -118,9 +125,9 @@ def main():
     write_if_changed(os.path.join(work, 'aot_abi.h'), abi)
 
     # direct jumps: a tail call where exactly one block is there for those flags
-    imports = list(LDST)
+    imports = list(LDST) + list(INLINE_SSE)
     imp_set = set(imports)
-    chained = unresolved = 0
+    chained = unresolved = inlined = 0
     for b in blocks:
         def goto(m, b=b):
             nonlocal chained, unresolved
@@ -136,7 +143,11 @@ def main():
             if h not in imp_set:
                 imp_set.add(h)
                 imports.append(h)
-    print(f'{chained} direct jumps chained, {unresolved} looked up at run time, {len(imports)} helpers')
+        if 'AOT_SETCSR(' not in b.body:
+            b.body, k = INLINE_RE.subn(r'AOT_I_\1', b.body)
+            inlined += k
+    print(f'{chained} direct jumps chained, {unresolved} looked up at run time, {len(imports)} helpers, '
+          f'{inlined} SSE helper calls as host instructions')
 
     mask = 1
     while mask + 1 < 2 * n:
@@ -202,6 +213,7 @@ typedef struct {
 } aot_header_t;
 
 char *aot_env AOT_HIDDEN;
+uint32_t aot_csr_ok AOT_HIDDEN;
 uint32_t aot_valid[AOT_NB_BLOCKS + 1] AOT_HIDDEN;
 uint32_t aot_gen AOT_HIDDEN = 1;
 uint32_t aot_cur[2] AOT_HIDDEN;
@@ -224,6 +236,7 @@ void *aot_imp[AOT_NB_IMPORTS] AOT_HIDDEN;
 AOT_HIDDEN void aot_enter(char *env, uint32_t id)
 {{
     aot_env = env;
+    aot_csr_ok = 0;     /* the JIT's code may have left x87's rounding in MXCSR */
     aot_fns[id](AOT_LD_I32(AOT_OFF_EAX), AOT_LD_I32(AOT_OFF_ECX), AOT_LD_I32(AOT_OFF_EDX),
                 AOT_LD_I32(AOT_OFF_EBX), AOT_LD_I32(AOT_OFF_ESP), AOT_LD_I32(AOT_OFF_EBP),
                 AOT_LD_I32(AOT_OFF_ESI), AOT_LD_I32(AOT_OFF_EDI), AOT_LD_I32(AOT_OFF_CC_DST),

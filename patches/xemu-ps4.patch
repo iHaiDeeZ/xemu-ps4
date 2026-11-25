@@ -1,9 +1,9 @@
 diff --git a/accel/tcg/aot.c b/accel/tcg/aot.c
 new file mode 100644
-index 0000000..edfa99c
+index 0000000..a49d8da
 --- /dev/null
 +++ b/accel/tcg/aot.c
-@@ -0,0 +1,666 @@
+@@ -0,0 +1,807 @@
 +/*
 + * xemu-ps4: the ahead-of-time translator's runtime (see include/exec/aot.h).
 + *
@@ -105,12 +105,123 @@ index 0000000..edfa99c
 +    return ((pc * 0x9E3779B1u) ^ (flags * 0x85EBCA77u)) >> 7;
 +}
 +
++/* --- executable memory for the file -------------------------------------------------------- */
++
++#ifdef __PS4__
++/*
++ * Direct memory mapped RWX, as Crema's recompiled code (port/ps4_runtime.cpp mapDirectExecutable):
++ * a game's translated code is 100+ MiB and the system flexible pool, where the kit puts executable
++ * mmaps, holds the heap (256 MiB) and the JIT's buffer (64 MiB) with ~70 MiB left. Probed once with
++ * a "ret" under a SIGSEGV/SIGBUS handler: a console whose jailbreak maps it but won't run it
++ * leaves the translated code off instead of crashing.
++ */
++int32_t sceKernelAllocateDirectMemory(off_t start, off_t end, size_t len, size_t align, int type,
++                                      off_t *phys);
++int32_t sceKernelMapDirectMemory(void **addr, size_t len, int prot, int flags, off_t phys,
++                                 size_t align);
++int32_t sceKernelReleaseDirectMemory(off_t phys, size_t len);
++size_t sceKernelGetDirectMemorySize(void);
++int32_t sceKernelMunmap(void *addr, size_t len);
++
++static off_t map_phys;
++static volatile uintptr_t probe_code;
++static volatile int probe_faulted;
++static struct sigaction probe_old_segv, probe_old_bus;
++
++static void aot_probe_handler(int sig, siginfo_t *si, void *context)
++{
++    /* PS4 ucontext: mcontext at 0x40, rip and rsp as registers 20 and 23 (Crema's crash log) */
++    uint64_t *regs = (uint64_t *)((char *)context + 0x40);
++    if (probe_code && regs[20] == probe_code) {
++        regs[20] = *(uint64_t *)regs[23];   /* as if the ret ran */
++        regs[23] += 8;
++        probe_faulted = 1;
++        return;
++    }
++    sigaction(SIGSEGV, &probe_old_segv, NULL);
++    sigaction(SIGBUS, &probe_old_bus, NULL);
++}
++
++static bool aot_runs_code(void *code)
++{
++    struct sigaction sa;
++    void (*volatile fn)(void) = (void (*)(void))code;
++
++    *(volatile uint8_t *)code = 0xC3;   /* ret */
++    memset(&sa, 0, sizeof(sa));
++    sa.sa_sigaction = aot_probe_handler;
++    sa.sa_flags = SA_SIGINFO;
++    sigemptyset(&sa.sa_mask);
++    probe_faulted = 0;
++    probe_code = (uintptr_t)code;
++    sigaction(SIGSEGV, &sa, &probe_old_segv);
++    sigaction(SIGBUS, &sa, &probe_old_bus);
++    fn();
++    sigaction(SIGSEGV, &probe_old_segv, NULL);
++    sigaction(SIGBUS, &probe_old_bus, NULL);
++    probe_code = 0;
++    return !probe_faulted;
++}
++
++static void *aot_exec_alloc(size_t size)
++{
++    static int direct_runs = -1;
++    void *base = NULL;
++    off_t phys = 0;
++    int32_t r;
++
++    /* 2 MiB aligned: the kernel can map the code with large pages (fewer iTLB misses) */
++    size = ROUND_UP(size, 2 * MiB);
++    r = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), size, 2 * MiB, 0, &phys);
++    if (r != 0) {
++        fprintf(stderr, "aot: no %zu MiB of direct memory (0x%x)\n", size >> 20, (unsigned)r);
++        return NULL;
++    }
++    r = sceKernelMapDirectMemory(&base, size, 0x7 /* CPU read, write, execute */, 0, phys, 2 * MiB);
++    if (r != 0) {
++        fprintf(stderr, "aot: direct memory can't be mapped executable (0x%x)\n", (unsigned)r);
++        sceKernelReleaseDirectMemory(phys, size);
++        return NULL;
++    }
++    if (direct_runs < 0) {
++        direct_runs = aot_runs_code(base);
++        fprintf(stderr, "aot: executable direct memory %s\n", direct_runs ? "runs code" : "does NOT run code");
++    }
++    if (!direct_runs) {
++        sceKernelMunmap(base, size);
++        sceKernelReleaseDirectMemory(phys, size);
++        return NULL;
++    }
++    map_phys = phys;
++    map_size = size;
++    return base;
++}
++
++static void aot_exec_free(void *base, size_t size)
++{
++    sceKernelMunmap(base, size);
++    sceKernelReleaseDirectMemory(map_phys, size);
++}
++#else
++static void *aot_exec_alloc(size_t size)
++{
++    void *p = mmap(NULL, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++    map_size = size;
++    return p == MAP_FAILED ? NULL : p;
++}
++
++static void aot_exec_free(void *base, size_t size)
++{
++    munmap(base, size);
++}
++#endif
++
 +static void aot_unload(void)
 +{
 +    if (map_base) {
 +        aot_loaded = false;
 +        smp_mb();
-+        munmap(map_base, map_size);
++        aot_exec_free(map_base, map_size);
 +    }
 +    map_base = NULL;
 +    hdr = NULL;
@@ -133,28 +244,52 @@ index 0000000..edfa99c
 +    return NULL;
 +}
 +
-+/* Map an ELF64 shared object made by scripts/aot-build.py; NULL (and a log line) if not. */
-+static bool aot_map(const char *path, const uint8_t *f, size_t len)
++static bool aot_pread(int fd, void *buf, size_t len, uint64_t off)
 +{
-+    const Elf64_Ehdr *eh = (const void *)f;
-+    const Elf64_Phdr *ph;
-+    const Elf64_Shdr *sh;
++    while (len) {
++        ssize_t n = pread(fd, buf, len, off);
++        if (n <= 0) {
++            return false;
++        }
++        buf = (char *)buf + n;
++        len -= n;
++        off += n;
++    }
++    return true;
++}
++
++/*
++ * Map an ELF64 shared object made by scripts/aot-build.py: its segments are read from the file
++ * straight into executable memory (the file is 100+ MiB: not through the heap first).
++ */
++static bool aot_map(const char *path, int fd, uint64_t len)
++{
++    Elf64_Ehdr ehs, *eh = &ehs;
++    g_autofree Elf64_Phdr *ph = NULL;
++    g_autofree Elf64_Shdr *sh = NULL;
++    g_autofree Elf64_Sym *symtab = NULL;
++    g_autofree char *strtab = NULL;
 +    uint64_t lo = UINT64_MAX, hi = 0;
 +    const Elf64_Dyn *dyn = NULL;
 +    uint64_t rela = 0, relasz = 0, relaent = sizeof(Elf64_Rela);
-+    const Elf64_Sym *symtab = NULL;
-+    const char *strtab = NULL;
 +    size_t nsyms = 0;
 +    AotHeader *h = NULL;
 +
-+    if (len < sizeof(*eh) || memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0 ||
++    if (len < sizeof(*eh) || !aot_pread(fd, eh, sizeof(*eh), 0) ||
++        memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0 ||
 +        eh->e_ident[EI_CLASS] != ELFCLASS64 || eh->e_machine != EM_X86_64 ||
 +        eh->e_type != ET_DYN || eh->e_phoff + (uint64_t)eh->e_phnum * sizeof(*ph) > len ||
 +        eh->e_shoff + (uint64_t)eh->e_shnum * sizeof(*sh) > len) {
 +        fprintf(stderr, "aot: %s is not an x86-64 shared object\n", path);
 +        return false;
 +    }
-+    ph = (const void *)(f + eh->e_phoff);
++    ph = g_new(Elf64_Phdr, eh->e_phnum);
++    sh = g_new(Elf64_Shdr, eh->e_shnum);
++    if (!aot_pread(fd, ph, eh->e_phnum * sizeof(*ph), eh->e_phoff) ||
++        !aot_pread(fd, sh, eh->e_shnum * sizeof(*sh), eh->e_shoff)) {
++        fprintf(stderr, "aot: %s: can't read its headers\n", path);
++        return false;
++    }
 +    for (int i = 0; i < eh->e_phnum; i++) {
 +        if (ph[i].p_type == PT_LOAD) {
 +            lo = MIN(lo, ph[i].p_vaddr & ~0xfffull);
@@ -165,25 +300,22 @@ index 0000000..edfa99c
 +        fprintf(stderr, "aot: %s: odd load layout\n", path);
 +        return false;
 +    }
-+    map_size = ROUND_UP(hi, 16 * KiB);
-+    /* the PS4 gives execute permission only at mmap time (as for the JIT's buffer) */
-+    map_base = mmap(NULL, map_size, PROT_READ | PROT_WRITE | PROT_EXEC,
-+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-+    if (map_base == MAP_FAILED) {
-+        fprintf(stderr, "aot: %s: no %zu MiB of executable memory\n", path, map_size >> 20);
-+        map_base = NULL;
++    map_base = aot_exec_alloc(ROUND_UP(hi, 16 * KiB));
++    if (!map_base) {
++        fprintf(stderr, "aot: %s: no %" PRIu64 " MiB of executable memory\n", path, hi >> 20);
 +        return false;
 +    }
++    memset(map_base, 0, hi);
 +    for (int i = 0; i < eh->e_phnum; i++) {
 +        if (ph[i].p_type != PT_LOAD) {
 +            continue;
 +        }
-+        if (ph[i].p_offset + ph[i].p_filesz > len) {
++        if (ph[i].p_offset + ph[i].p_filesz > len ||
++            !aot_pread(fd, map_base + ph[i].p_vaddr, ph[i].p_filesz, ph[i].p_offset)) {
 +            fprintf(stderr, "aot: %s: truncated\n", path);
 +            return false;
 +        }
-+        memcpy(map_base + ph[i].p_vaddr, f + ph[i].p_offset, ph[i].p_filesz);
-+        /* the rest (bss) is already zero */
++        /* the rest (bss) was zeroed above */
 +    }
 +    for (int i = 0; i < eh->e_phnum; i++) {
 +        if (ph[i].p_type == PT_DYNAMIC) {
@@ -211,13 +343,19 @@ index 0000000..edfa99c
 +        *(uint64_t *)(map_base + r->r_offset) = (uint64_t)(uintptr_t)map_base + r->r_addend;
 +    }
 +    /* the header: the one exported symbol, found through the section headers */
-+    sh = (const void *)(f + eh->e_shoff);
-+    for (int i = 0; i < eh->e_shnum; i++) {
++    for (int i = 0; i < eh->e_shnum && !symtab; i++) {
++        const Elf64_Shdr *st = &sh[sh[i].sh_link < eh->e_shnum ? sh[i].sh_link : 0];
 +        if (sh[i].sh_type == SHT_DYNSYM && sh[i].sh_link < eh->e_shnum &&
-+            sh[i].sh_offset + sh[i].sh_size <= len) {
-+            symtab = (const void *)(f + sh[i].sh_offset);
++            sh[i].sh_offset + sh[i].sh_size <= len && st->sh_offset + st->sh_size <= len &&
++            sh[i].sh_size < 16 * MiB && st->sh_size < 16 * MiB) {
++            symtab = g_malloc(sh[i].sh_size);
++            strtab = g_malloc0(st->sh_size + 1);
++            if (!aot_pread(fd, symtab, sh[i].sh_size, sh[i].sh_offset) ||
++                !aot_pread(fd, strtab, st->sh_size, st->sh_offset)) {
++                fprintf(stderr, "aot: %s: can't read its symbols\n", path);
++                return false;
++            }
 +            nsyms = sh[i].sh_size / sizeof(Elf64_Sym);
-+            strtab = (const char *)(f + sh[sh[i].sh_link].sh_offset);
 +        }
 +    }
 +    for (size_t i = 0; i < nsyms; i++) {
@@ -252,14 +390,17 @@ index 0000000..edfa99c
 +
 +static bool aot_load(const char *path)
 +{
-+    g_autofree char *data = NULL;
-+    gsize len = 0;
 +    int64_t t0 = get_clock();
++    struct stat st;
++    int fd = open(path, O_RDONLY);
++    bool ok;
 +
-+    if (!g_file_get_contents(path, &data, &len, NULL)) {
++    if (fd < 0) {
 +        return false;
 +    }
-+    if (!aot_map(path, (const uint8_t *)data, len)) {
++    ok = fstat(fd, &st) == 0 && aot_map(path, fd, st.st_size);
++    close(fd);
++    if (!ok) {
 +        aot_unload();
 +        return false;
 +    }
@@ -670,6 +811,20 @@ index 0000000..edfa99c
 +    rec_seen = g_hash_table_new(g_direct_hash, g_direct_equal);
 +    rec_why = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
 +}
+diff --git a/accel/tcg/cpu-exec.c b/accel/tcg/cpu-exec.c
+index d93cd17..9a17569 100644
+--- a/accel/tcg/cpu-exec.c
++++ b/accel/tcg/cpu-exec.c
+@@ -161,7 +161,8 @@ static bool tb_lookup_cmp(const void *p, const void *d)
+     const TranslationBlock *tb = p;
+     const struct tb_desc *desc = d;
+ 
+-    if ((tb_cflags(tb) & CF_PCREL || tb->pc == desc->s.pc) &&
++    /* xemu-ps4: an ahead-of-time trampoline is only for the pc it was made at */
++    if ((((tb_cflags(tb) & CF_PCREL) && !tb->aot_id) || tb->pc == desc->s.pc) &&
+         tb_page_addr0(tb) == desc->page_addr0 &&
+         tb->cs_base == desc->s.cs_base &&
+         tb->flags == desc->s.flags &&
 diff --git a/accel/tcg/cputlb.c b/accel/tcg/cputlb.c
 index b9ae474..b81c2a9 100644
 --- a/accel/tcg/cputlb.c
@@ -885,7 +1040,7 @@ index 234a6e2..cf06995 100644
    'icount-common.c',
    'monitor.c',
 diff --git a/accel/tcg/tb-maint.c b/accel/tcg/tb-maint.c
-index d21a8bd..afbb05a 100644
+index d21a8bd..a32bdae 100644
 --- a/accel/tcg/tb-maint.c
 +++ b/accel/tcg/tb-maint.c
 @@ -34,6 +34,7 @@
@@ -896,7 +1051,17 @@ index d21a8bd..afbb05a 100644
  #ifdef CONFIG_USER_ONLY
  #include "user/page-protection.h"
  #define runstate_is_running()  true
-@@ -795,6 +796,7 @@ void tb_flush__exclusive_or_serial(void)
+@@ -56,7 +57,8 @@ static bool tb_cmp(const void *ap, const void *bp)
+     const TranslationBlock *a = ap;
+     const TranslationBlock *b = bp;
+ 
+-    return ((tb_cflags(a) & CF_PCREL || a->pc == b->pc) &&
++    /* xemu-ps4: an ahead-of-time trampoline is only for the pc it was made at */
++    return ((((tb_cflags(a) & CF_PCREL) && !a->aot_id && !b->aot_id) || a->pc == b->pc) &&
+             a->cs_base == b->cs_base &&
+             a->flags == b->flags &&
+             (tb_cflags(a) & ~CF_INVALID) == (tb_cflags(b) & ~CF_INVALID) &&
+@@ -795,6 +797,7 @@ void tb_flush__exclusive_or_serial(void)
      tcg_region_reset_all();
      /* XXX: flush processor icache at this point if cache flush is expensive */
      qatomic_inc(&tb_ctx.tb_flush_count);
@@ -904,7 +1069,7 @@ index d21a8bd..afbb05a 100644
      qemu_plugin_flush_cb();
  }
  
-@@ -904,9 +906,19 @@ static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
+@@ -904,9 +907,19 @@ static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
      CPUState *cpu;
  
      if (tb_cflags(tb) & CF_PCREL) {
@@ -926,7 +1091,7 @@ index d21a8bd..afbb05a 100644
          }
      } else {
          uint32_t h = tb_jmp_cache_hash_func(tb->pc);
-@@ -940,6 +952,11 @@ static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
+@@ -940,6 +953,11 @@ static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
      qatomic_set(&tb->cflags, tb->cflags | CF_INVALID);
      qemu_spin_unlock(&tb->jmp_lock);
  
@@ -2552,10 +2717,10 @@ index 2181267..337e782 100644
      }
 diff --git a/tcg/tcg-aot.c.inc b/tcg/tcg-aot.c.inc
 new file mode 100644
-index 0000000..a728890
+index 0000000..70394ae
 --- /dev/null
 +++ b/tcg/tcg-aot.c.inc
-@@ -0,0 +1,1310 @@
+@@ -0,0 +1,1307 @@
 +/*
 + * xemu-ps4: a translation block written out as C, for the ahead-of-time
 + * translator (accel/tcg/aot.c records these on the console, scripts/aot-build.py
@@ -3470,7 +3635,7 @@ index 0000000..a728890
 +            aot_after_op(&e, op);
 +            continue;
 +        }
-+        if (def->flags & TCG_OPF_INT) {
++        if ((def->flags & TCG_OPF_INT) && c != INDEX_op_qemu_ld2 && c != INDEX_op_qemu_st2) {
 +            if (t != TCG_TYPE_I32 && t != TCG_TYPE_I64) {
 +                aot_failf(&e, "%s of type %d", def->name, t);
 +                break;
@@ -3758,10 +3923,7 @@ index 0000000..a728890
 +             */
 +            if (base->kind == TEMP_FIXED && c == INDEX_op_st8 &&
 +                off == (int64_t)(offsetof(CPUState, neg.can_do_io) - sizeof(CPUState))) {
-+                TCGTemp *v = arg_temp(op->args[0]);
-+                if (v->kind == TEMP_CONST && v->val == 0) {
-+                    break;
-+                }
++                break;      /* stays 1 (the trampoline's single insn set it) */
 +            }
 +            /* a store into a global's env slot would be undone by a later sync */
 +            if (base->kind == TEMP_FIXED) {

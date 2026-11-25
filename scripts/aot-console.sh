@@ -21,17 +21,20 @@ title="${2:?title ID (8 hex digits)}"
 ip="${3:-${PS4_HOST:-192.168.0.90}}"
 ftp="ftp://$ip:2121/data/xemu/aot"
 data="$REPO/aot-data/$title"
+CR="$(printf '\r')"
 
 fetch() {
     mkdir -p "$data"
     local names
-    names="$(curl -s --max-time 30 --list-only "$ftp/$title/")" || { echo "no $ftp/$title/" >&2; exit 1; }
+    # the console's FTP server ends each name with CR LF
+    names="$(curl -s --max-time 30 --list-only "$ftp/$title/" | tr -d "$CR")" ||
+        { echo "no $ftp/$title/" >&2; exit 1; }
     for f in $names; do
         case "$f" in
             blocks-*.c|aot_abi.h)
                 # sizes differ = the console wrote more since: fetch again
                 local remote local_size
-                remote="$(curl -s --max-time 20 -I "$ftp/$title/$f" | tr -d '\r' | awk '/Content-Length/ {print $2}')"
+                remote="$(curl -s --max-time 20 -I "$ftp/$title/$f" | tr -d "$CR" | awk '/Content-Length/ {print $2}')"
                 local_size="$( [ -f "$data/$f" ] && stat -c %s "$data/$f" || echo -1)"
                 if [ "$remote" != "$local_size" ]; then
                     echo "fetching $f ($remote bytes)"
@@ -44,10 +47,10 @@ fetch() {
 }
 
 build() {
-    local out
-    out="out/aot/$title.aot"
     mkdir -p "$REPO/out/aot"
-    MSYS_NO_PATHCONV=1 wsl -e bash -lc "cd ~/xemups4 && python3 scripts/aot-build.py aot-data/$title -o $out --title $title --work $HOME_WORK"
+    # the work dir (generated C and objects) stays in WSL's own file system: faster than /mnt
+    MSYS_NO_PATHCONV=1 wsl -e bash -lc "cd ~/xemups4 && python3 scripts/aot-build.py aot-data/$title \
+        -o out/aot/$title.aot --title $title --work ~/xemups4-build/aot-work/$title"
 }
 
 upload() {
@@ -56,7 +59,6 @@ upload() {
     curl -s --max-time 600 -T "$f" "$ftp/$title.aot" && echo "uploaded $(basename "$f") to $ip"
 }
 
-HOME_WORK="~/xemups4-build/aot-work/$title"
 case "$cmd" in
     fetch) fetch ;;
     build) build ;;
