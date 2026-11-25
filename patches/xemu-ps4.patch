@@ -1150,10 +1150,10 @@ index 0000000..cd4aad6
 +))
 diff --git a/ui/ps4/ps4-frontend.h b/ui/ps4/ps4-frontend.h
 new file mode 100644
-index 0000000..061b0e4
+index 0000000..6daddee
 --- /dev/null
 +++ b/ui/ps4/ps4-frontend.h
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,74 @@
 +/*
 + * xemu-ps4: the PS4 frontend's pieces (xemu-ps4.c, ps4-present.cc, ps4-hud.cc)
 + *
@@ -1214,6 +1214,8 @@ index 0000000..061b0e4
 +void ps4_eject_disc(void);
 +void ps4_request_reset(void);
 +void ps4_request_quit(void);
++/* xemu-ps4.c: an 8 s CPU profile of the emulation threads now (profiles/profile_N.txt) */
++bool ps4_profile_now(const char *reason);
 +
 +/* ps4-hud.cc: notifications, status and menus (ImGui), called with the main loop lock */
 +void ps4_hud_process_sdl_event(const SDL_Event *event);
@@ -1228,10 +1230,10 @@ index 0000000..061b0e4
 +#endif
 diff --git a/ui/ps4/ps4-hud.cc b/ui/ps4/ps4-hud.cc
 new file mode 100644
-index 0000000..e39fc6b
+index 0000000..decb257
 --- /dev/null
 +++ b/ui/ps4/ps4-hud.cc
-@@ -0,0 +1,418 @@
+@@ -0,0 +1,426 @@
 +/*
 + * xemu-ps4: what is drawn over the emulated picture (ImGui): notifications and error messages
 + * (xemu-notifications.h, which the desktop's xui implements), the frame rate, what is missing
@@ -1418,7 +1420,7 @@ index 0000000..e39fc6b
 +enum Page { kMain, kGames };
 +enum Row {
 +    kResume, kGamesRow, kEject, kReset, kScaling, kFilter, kShowFps, kShowStats, kCpuLayout,
-+    kMonitor, kTlbIndex, kQuit, kRowCount
++    kMonitor, kTlbIndex, kAutoProfile, kProfileNow, kQuit, kRowCount
 +};
 +
 +struct Menu
@@ -1481,6 +1483,9 @@ index 0000000..e39fc6b
 +    case kMonitor: return std::string("Monitor log      < ") + (ps4_settings.monitor_log ? "On" : "Off") + " >";
 +    case kTlbIndex:
 +        return std::string("TLB dirty index  < ") + (ps4_settings.tlb_index ? "On" : "Off") + " >  (restart)";
++    case kAutoProfile:
++        return std::string("Auto profile     < ") + (ps4_settings.auto_profile ? "On" : "Off") + " >";
++    case kProfileNow: return "Profile 8 s now (profiles/)";
 +    case kQuit: return "Quit xemu";
 +    }
 +    return "";
@@ -1495,6 +1500,7 @@ index 0000000..e39fc6b
 +    case kShowStats: ps4_settings.show_stats = !ps4_settings.show_stats; break;
 +    case kCpuLayout: ps4_settings.cpu_layout ^= 1; M.restartNote = true; break;
 +    case kMonitor: ps4_settings.monitor_log = !ps4_settings.monitor_log; break;
++    case kAutoProfile: ps4_settings.auto_profile = !ps4_settings.auto_profile; break;
 +    case kTlbIndex: ps4_settings.tlb_index = !ps4_settings.tlb_index; M.restartNote = true; break;
 +    default: return;
 +    }
@@ -1509,6 +1515,10 @@ index 0000000..e39fc6b
 +    case kEject: M.eject = true; ps4_menu_open = false; break;
 +    case kReset: M.reset = true; ps4_menu_open = false; break;
 +    case kQuit: M.quit = true; break;
++    case kProfileNow:
++        Queue(ps4_profile_now("menu") ? "Profiling 8 s: /data/xemu/profiles" : "A profile is running", false);
++        ps4_menu_open = false;
++        break;
 +    default: Change(row, 1); break;
 +    }
 +}
@@ -2436,10 +2446,10 @@ index 0000000..8f856ab
 +}
 diff --git a/ui/ps4/ps4-settings.c b/ui/ps4/ps4-settings.c
 new file mode 100644
-index 0000000..b7bc34e
+index 0000000..f5e1420
 --- /dev/null
 +++ b/ui/ps4/ps4-settings.c
-@@ -0,0 +1,94 @@
+@@ -0,0 +1,96 @@
 +/*
 + * xemu-ps4: the PS4 frontend's own settings (ps4-settings.h), "key = value" lines in
 + * /data/xemu/ps4.ini. Unknown keys are ignored, missing ones keep their defaults.
@@ -2467,6 +2477,7 @@ index 0000000..b7bc34e
 +    .monitor_log = true,
 +    .profiler = false,
 +    .tlb_index = true,
++    .auto_profile = true,
 +};
 +
 +typedef struct {
@@ -2488,6 +2499,7 @@ index 0000000..b7bc34e
 +    { "monitor_log", T_BOOL, &ps4_settings.monitor_log, 0, 1 },
 +    { "profiler", T_BOOL, &ps4_settings.profiler, 0, 1 },
 +    { "tlb_index", T_BOOL, &ps4_settings.tlb_index, 0, 1 },
++    { "auto_profile", T_BOOL, &ps4_settings.auto_profile, 0, 1 },
 +};
 +
 +void ps4_settings_load(void)
@@ -2536,10 +2548,10 @@ index 0000000..b7bc34e
 +}
 diff --git a/ui/ps4/ps4-settings.h b/ui/ps4/ps4-settings.h
 new file mode 100644
-index 0000000..d93a3b5
+index 0000000..b8ad6f0
 --- /dev/null
 +++ b/ui/ps4/ps4-settings.h
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,60 @@
 +/*
 + * xemu-ps4: the PS4 frontend's own settings (/data/xemu/ps4.ini), next to xemu's xemu.toml.
 + * Changed from the quick menu (ps4-hud.cc); "restart" ones apply at the next start.
@@ -2587,6 +2599,7 @@ index 0000000..d93a3b5
 +    bool monitor_log;       /* the 5 s monitor line in boot-trace.log */
 +    bool profiler;          /* the 1 kHz sampler (samples.log) (restart) */
 +    bool tlb_index;         /* TLB dirty index (accel/tcg/cputlb.c) (restart) */
++    bool auto_profile;      /* an 8 s CPU profile when the game runs slowly (profiles/) */
 +} PS4Settings;
 +
 +extern PS4Settings ps4_settings;
@@ -2721,10 +2734,10 @@ index 0000000..24e9598
 +}
 diff --git a/ui/ps4/xemu-ps4.c b/ui/ps4/xemu-ps4.c
 new file mode 100644
-index 0000000..db2e31c
+index 0000000..9456588
 --- /dev/null
 +++ b/ui/ps4/xemu-ps4.c
-@@ -0,0 +1,1002 @@
+@@ -0,0 +1,1038 @@
 +/*
 + * xemu-ps4: the PS4 frontend (replaces ui/xemu.c and its SDL window + OpenGL).
 + *
@@ -3337,7 +3350,24 @@ index 0000000..db2e31c
 +        }
 +        /* (no cpu_dump_state here: from this thread, with the guest kernel running, it took
 +         * the process down in v00.07) */
-+        last_frames = frames;
++
++        /* the automatic profile: once the game has run 60 s, the first time it flips fewer than
++         * 20 frames a second for two monitor periods in a row (then once more, 5 minutes later) */
++        static int slow_periods, auto_profiles;
++        static int64_t last_profile_ns;
++        const int64_t now_ns = get_clock();
++        const double flips_per_s = (flips - last_flips) / 5.0;
++        slow_periods = runstate_is_running() && flips_per_s > 0.0 && flips_per_s < 20.0 ? slow_periods + 1 : 0;
++        if (ps4_settings.auto_profile && slow_periods >= 2 && auto_profiles < 2 &&
++            guest_ns > 60 * NANOSECONDS_PER_SECOND &&
++            (last_profile_ns == 0 || now_ns - last_profile_ns > 300 * NANOSECONDS_PER_SECOND)) {
++            char reason[64];
++            snprintf(reason, sizeof(reason), "auto: %.1f flips/s", flips_per_s);
++            if (ps4_profile_now(reason)) {
++                auto_profiles++;
++                last_profile_ns = now_ns;
++            }
++        }        last_frames = frames;
 +        last_display = display;
 +        last_flips = flips;
 +        last_guest_ns = guest_ns;
@@ -3379,6 +3409,25 @@ index 0000000..db2e31c
 +          (long long)(spin / 1000));
 +}
 +
++/*
++ * CPU profiles (ps4-kit's burst profiler, profiles/profile_N.txt in /data/xemu): the emulation's
++ * threads sampled every 4 ms for 8 s, with their call stacks - from the menu, or once by itself when
++ * the game runs slowly (Settings: auto_profile). The presenter (main) thread is left out: it waits on
++ * the display, and a signal there has frozen other ports.
++ */
++bool ps4_profile_now(const char *reason)
++{
++    static const char *const threads[] = { "CPU 0/TCG", "ALL CPUs/TCG", "nv2a.pfifo", "qemu_main",
++                                           "mcpx.apu", "mcpx.voice", "worker" };
++    ps4_profile_set_threads(threads, ARRAY_SIZE(threads));
++    ps4_profile_set_enabled(1);
++    const bool started = ps4_profile_start(8.0, reason);
++    trace("profile (%s): %s", reason, started ? "8 s from now, profiles/profile_N.txt" : "one is running");
++    return started;
++}
++
++static int g_argc;
++static char **g_argv;
 +static int g_argc;
 +static char **g_argv;
 +
