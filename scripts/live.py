@@ -6,6 +6,7 @@
 
 Commands (the console's own "help"):
     stats                    frame rates, thread loads, main loop, TLB index (the monitor's last line)
+    aot                      the translated code: loaded file, entries, recording
     hmp <monitor command>    QEMU's monitor: info registers, x/64xb $eip, xp /32xw 0x..., info tlb,
                              stop, cont, system_reset, ...
     mem <hex addr> [len]     guest physical memory
@@ -32,6 +33,8 @@ def ask(sock, f, line):
 
 
 def main():
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')   # QEMU's info jit draws bars
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--host', default=os.environ.get('PS4_HOST', '192.168.0.90'))
     ap.add_argument('--port', type=int, default=4445)

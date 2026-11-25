@@ -9,3 +9,6 @@ art/preview/
 *.tar
 logs/
 clips/
+# the translated code: a game's own code as C / compiled (scripts/aot-console.sh) - never commit
+aot-data/
+out/aot/

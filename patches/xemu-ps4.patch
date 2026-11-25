@@ -1,8 +1,712 @@
+diff --git a/accel/tcg/aot.c b/accel/tcg/aot.c
+new file mode 100644
+index 0000000..edfa99c
+--- /dev/null
++++ b/accel/tcg/aot.c
+@@ -0,0 +1,666 @@
++/*
++ * xemu-ps4: the ahead-of-time translator's runtime (see include/exec/aot.h).
++ *
++ * Recording: tcg_gen_code hands every translated block to aot_record_tb, which writes
++ * it as C (tcg/tcg-aot.c.inc) into /data/xemu/aot/<title ID>/blocks-<n>.c through a
++ * writer thread, with the ABI header (aot_abi.h) the PC's build includes.
++ *
++ * Running: /data/xemu/aot/<title ID>.aot is an x86-64 ELF shared object made by
++ * scripts/aot-build.py (clang, position-independent, no imports). It is mapped into
++ * executable memory here, its relative relocations applied and its helper imports
++ * resolved by name. Its header lists the blocks (pc, flags, cflags, size, code hash);
++ * when the JIT is about to translate one of them and the guest's code bytes still
++ * hash the same, x86_translate_code makes a one-instruction "trampoline" TB that
++ * calls helper_aot_run, which runs the compiled block. Compiled blocks jump to each
++ * other directly (tail calls) while they stay valid: a block is valid once its
++ * trampoline ran in the current generation; the generation moves on whenever a TLB
++ * flush touches a page holding valid blocks or the TB cache is flushed, and a block
++ * whose trampoline TB is invalidated (its code bytes written) is invalid at once.
++ *
++ * This program is free software; you can redistribute it and/or modify it under
++ * the terms of the GNU General Public License as published by the Free Software
++ * Foundation; either version 2 of the License, or (at your option) any later
++ * version.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/bitmap.h"
++#include "qemu/thread.h"
++#include "qemu/timer.h"
++#include "qemu/units.h"
++#include "exec/aot.h"
++#include "exec/translation-block.h"
++#include "exec/target_page.h"
++#include "exec/tlb-flags.h"
++#include "hw/core/cpu.h"
++#include "exec/cpu-common.h"
++#include "exec/tb-flush.h"
++#include "exec/helper-proto-common.h"
++#include "accel/tcg/probe.h"
++#include "accel/tcg/cpu-mmu-index.h"
++#include "accel/tcg/cpu-ops.h"
++#include "tb-code-hash.h"
++#include "elf.h"
++
++#include <sys/mman.h>
++
++#define AOT_DIR "/data/xemu/aot"
++#define AOT_MAGIC 0x31544f41554d4558ull   /* "XEMUAOT1" */
++#define AOT_VERSION 1
++
++bool aot_use = true;
++bool aot_record = true;
++bool aot_recording;
++bool aot_loaded;
++
++static const AotTarget *target;
++
++/* --- the loaded file (layouts shared with scripts/aot_rt.h) ------------------------------- */
++
++typedef struct AotEntry {
++    uint32_t pc, cs_base, flags, cflags;
++    uint16_t size, icount;
++    uint32_t pad;
++    uint64_t hash;
++} AotEntry;
++
++typedef struct AotHeader {
++    uint64_t magic;
++    uint32_t version;
++    uint32_t nb_entries;          /* blocks 1..n (entry 0 unused) */
++    uint64_t abi_key;
++    uint32_t title_id;
++    uint32_t nb_imports;
++    const AotEntry *entries;
++    uint32_t *valid;              /* [n + 1]: == *gen when valid */
++    uint32_t *gen;
++    void **imports;               /* filled here, by name */
++    const char *const *import_names;
++    void (*enter)(void *env, uint32_t id);
++    uint32_t *cur;                /* [0] the insn's pc, [1] its cc_op, before a call */
++    const char *built;
++} AotHeader;
++
++static AotHeader *hdr;
++static uint8_t *map_base;
++static size_t map_size;
++static uint32_t *index_head;      /* hash of (pc, flags) -> first block, chained by index_next */
++static uint32_t *index_next;
++static uint32_t index_mask;
++static unsigned long *valid_pages;   /* virtual 4 KiB pages holding blocks entered this generation */
++static uint32_t loaded_title;
++static char loaded_path[128];
++
++/* counters (read by the monitor thread without locks) */
++static uint64_t st_runs, st_trampolines, st_gens, st_misses_hash;
++
++static inline uint32_t index_hash(uint32_t pc, uint32_t flags)
++{
++    return ((pc * 0x9E3779B1u) ^ (flags * 0x85EBCA77u)) >> 7;
++}
++
++static void aot_unload(void)
++{
++    if (map_base) {
++        aot_loaded = false;
++        smp_mb();
++        munmap(map_base, map_size);
++    }
++    map_base = NULL;
++    hdr = NULL;
++    g_free(index_head);
++    g_free(index_next);
++    index_head = index_next = NULL;
++    g_free(valid_pages);
++    valid_pages = NULL;
++    loaded_title = 0;
++    loaded_path[0] = '\0';
++}
++
++static void *aot_import(const char *name)
++{
++    for (size_t i = 0; i < target->nb_helpers; i++) {
++        if (!strcmp(target->helpers[i].name, name)) {
++            return target->helpers[i].func;
++        }
++    }
++    return NULL;
++}
++
++/* Map an ELF64 shared object made by scripts/aot-build.py; NULL (and a log line) if not. */
++static bool aot_map(const char *path, const uint8_t *f, size_t len)
++{
++    const Elf64_Ehdr *eh = (const void *)f;
++    const Elf64_Phdr *ph;
++    const Elf64_Shdr *sh;
++    uint64_t lo = UINT64_MAX, hi = 0;
++    const Elf64_Dyn *dyn = NULL;
++    uint64_t rela = 0, relasz = 0, relaent = sizeof(Elf64_Rela);
++    const Elf64_Sym *symtab = NULL;
++    const char *strtab = NULL;
++    size_t nsyms = 0;
++    AotHeader *h = NULL;
++
++    if (len < sizeof(*eh) || memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0 ||
++        eh->e_ident[EI_CLASS] != ELFCLASS64 || eh->e_machine != EM_X86_64 ||
++        eh->e_type != ET_DYN || eh->e_phoff + (uint64_t)eh->e_phnum * sizeof(*ph) > len ||
++        eh->e_shoff + (uint64_t)eh->e_shnum * sizeof(*sh) > len) {
++        fprintf(stderr, "aot: %s is not an x86-64 shared object\n", path);
++        return false;
++    }
++    ph = (const void *)(f + eh->e_phoff);
++    for (int i = 0; i < eh->e_phnum; i++) {
++        if (ph[i].p_type == PT_LOAD) {
++            lo = MIN(lo, ph[i].p_vaddr & ~0xfffull);
++            hi = MAX(hi, ph[i].p_vaddr + ph[i].p_memsz);
++        }
++    }
++    if (lo != 0 || hi == 0 || hi > 1024 * MiB) {
++        fprintf(stderr, "aot: %s: odd load layout\n", path);
++        return false;
++    }
++    map_size = ROUND_UP(hi, 16 * KiB);
++    /* the PS4 gives execute permission only at mmap time (as for the JIT's buffer) */
++    map_base = mmap(NULL, map_size, PROT_READ | PROT_WRITE | PROT_EXEC,
++                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++    if (map_base == MAP_FAILED) {
++        fprintf(stderr, "aot: %s: no %zu MiB of executable memory\n", path, map_size >> 20);
++        map_base = NULL;
++        return false;
++    }
++    for (int i = 0; i < eh->e_phnum; i++) {
++        if (ph[i].p_type != PT_LOAD) {
++            continue;
++        }
++        if (ph[i].p_offset + ph[i].p_filesz > len) {
++            fprintf(stderr, "aot: %s: truncated\n", path);
++            return false;
++        }
++        memcpy(map_base + ph[i].p_vaddr, f + ph[i].p_offset, ph[i].p_filesz);
++        /* the rest (bss) is already zero */
++    }
++    for (int i = 0; i < eh->e_phnum; i++) {
++        if (ph[i].p_type == PT_DYNAMIC) {
++            dyn = (const void *)(map_base + ph[i].p_vaddr);
++        }
++    }
++    for (; dyn && dyn->d_tag != DT_NULL; dyn++) {
++        switch (dyn->d_tag) {
++        case DT_RELA: rela = dyn->d_un.d_ptr; break;
++        case DT_RELASZ: relasz = dyn->d_un.d_val; break;
++        case DT_RELAENT: relaent = dyn->d_un.d_val; break;
++        default: break;
++        }
++    }
++    for (uint64_t off = 0; rela && off + sizeof(Elf64_Rela) <= relasz; off += relaent) {
++        const Elf64_Rela *r = (const void *)(map_base + rela + off);
++        if (ELF64_R_TYPE(r->r_info) == R_X86_64_NONE) {
++            continue;
++        }
++        if (ELF64_R_TYPE(r->r_info) != R_X86_64_RELATIVE || r->r_offset + 8 > map_size) {
++            fprintf(stderr, "aot: %s: relocation type %u (only relative ones are expected)\n",
++                    path, (unsigned)ELF64_R_TYPE(r->r_info));
++            return false;
++        }
++        *(uint64_t *)(map_base + r->r_offset) = (uint64_t)(uintptr_t)map_base + r->r_addend;
++    }
++    /* the header: the one exported symbol, found through the section headers */
++    sh = (const void *)(f + eh->e_shoff);
++    for (int i = 0; i < eh->e_shnum; i++) {
++        if (sh[i].sh_type == SHT_DYNSYM && sh[i].sh_link < eh->e_shnum &&
++            sh[i].sh_offset + sh[i].sh_size <= len) {
++            symtab = (const void *)(f + sh[i].sh_offset);
++            nsyms = sh[i].sh_size / sizeof(Elf64_Sym);
++            strtab = (const char *)(f + sh[sh[i].sh_link].sh_offset);
++        }
++    }
++    for (size_t i = 0; i < nsyms; i++) {
++        if (!strcmp(strtab + symtab[i].st_name, "aot_header") && symtab[i].st_value < map_size) {
++            h = (AotHeader *)(map_base + symtab[i].st_value);
++        }
++    }
++    if (!h) {
++        fprintf(stderr, "aot: %s has no aot_header\n", path);
++        return false;
++    }
++    if (h->magic != AOT_MAGIC || h->version != AOT_VERSION) {
++        fprintf(stderr, "aot: %s: format %u, this build reads %u\n", path, h->version, AOT_VERSION);
++        return false;
++    }
++    if (h->abi_key != target->abi_key) {
++        fprintf(stderr, "aot: %s was recorded by another build (ABI %016" PRIx64 ", this %016"
++                PRIx64 "): record again\n", path, h->abi_key, target->abi_key);
++        return false;
++    }
++    for (uint32_t i = 0; i < h->nb_imports; i++) {
++        h->imports[i] = aot_import(h->import_names[i]);
++        if (!h->imports[i]) {
++            fprintf(stderr, "aot: %s calls helper %s, which this build lacks\n", path,
++                    h->import_names[i]);
++            return false;
++        }
++    }
++    hdr = h;
++    return true;
++}
++
++static bool aot_load(const char *path)
++{
++    g_autofree char *data = NULL;
++    gsize len = 0;
++    int64_t t0 = get_clock();
++
++    if (!g_file_get_contents(path, &data, &len, NULL)) {
++        return false;
++    }
++    if (!aot_map(path, (const uint8_t *)data, len)) {
++        aot_unload();
++        return false;
++    }
++    /* the (pc, flags) index for x86_translate_code */
++    index_mask = pow2ceil(MAX(hdr->nb_entries * 2, 1024)) - 1;
++    index_head = g_new0(uint32_t, index_mask + 1);
++    index_next = g_new0(uint32_t, hdr->nb_entries + 1);
++    for (uint32_t id = 1; id <= hdr->nb_entries; id++) {
++        const AotEntry *e = &hdr->entries[id];
++        uint32_t h = index_hash(e->pc, e->flags) & index_mask;
++        index_next[id] = index_head[h];
++        index_head[h] = id;
++    }
++    valid_pages = bitmap_new(1u << (32 - 12));
++    *hdr->gen = 1;
++    snprintf(loaded_path, sizeof(loaded_path), "%s", path);
++    smp_mb();
++    aot_loaded = true;
++    fprintf(stderr, "aot: %s: %u translated blocks, %u helpers, built %s, mapped in %.0f ms"
++            " (%zu MiB)\n", path, hdr->nb_entries, hdr->nb_imports, hdr->built ? hdr->built : "?",
++            (get_clock() - t0) / 1e6, map_size >> 20);
++    return true;
++}
++
++/* --- recording -------------------------------------------------------------------------- */
++
++static QemuMutex rec_lock;
++static QemuCond rec_cond;
++static QemuThread rec_thread;
++static GQueue rec_queue = G_QUEUE_INIT;     /* GStrings to write, under rec_lock */
++static GString rec_close;                     /* queued: close the file (title change) */
++static GString *rec_buf;
++static char rec_path[160];
++static FILE *rec_file;                        /* the writer thread's */
++static GHashTable *rec_seen;                  /* keys written this session */
++static GHashTable *rec_why;                   /* reason -> count, under rec_lock */
++static uint64_t st_rec_blocks, st_rec_bytes, st_rec_skipped, st_rec_known;
++static bool rec_thread_started;
++
++static void *rec_writer(void *arg)
++{
++    qemu_mutex_lock(&rec_lock);
++    for (;;) {
++        GString *chunk;
++        while (!(chunk = g_queue_pop_head(&rec_queue))) {
++            qemu_cond_wait(&rec_cond, &rec_lock);
++        }
++        if (chunk == &rec_close) {
++            if (rec_file) {
++                fclose(rec_file);
++                rec_file = NULL;
++            }
++            continue;
++        }
++        if (!rec_file && rec_path[0]) {
++            rec_file = fopen(rec_path, "a");
++        }
++        qemu_mutex_unlock(&rec_lock);
++        if (rec_file) {
++            fwrite(chunk->str, 1, chunk->len, rec_file);
++            fflush(rec_file);
++        }
++        qatomic_add(&st_rec_bytes, chunk->len);
++        g_string_free(chunk, true);
++        qemu_mutex_lock(&rec_lock);
++    }
++    return NULL;
++}
++
++static void rec_push(GString *chunk)
++{
++    qemu_mutex_lock(&rec_lock);
++    g_queue_push_tail(&rec_queue, chunk);
++    qemu_cond_signal(&rec_cond);
++    qemu_mutex_unlock(&rec_lock);
++}
++
++static void rec_flush(void)
++{
++    if (rec_buf && rec_buf->len) {
++        rec_push(rec_buf);
++        rec_buf = g_string_sized_new(512 * KiB);
++    }
++}
++
++static void rec_stop(void)
++{
++    if (!aot_recording) {
++        return;
++    }
++    aot_recording = false;
++    rec_flush();
++    rec_push(&rec_close);
++}
++
++static void rec_start(uint32_t title)
++{
++    char dir[96];
++    g_autofree char *abi = NULL;
++
++    snprintf(dir, sizeof(dir), AOT_DIR "/%08x", title);
++    if (g_mkdir_with_parents(dir, 0777) != 0) {
++        fprintf(stderr, "aot: can't make %s\n", dir);
++        return;
++    }
++    abi = g_strdup_printf("%s/aot_abi.h", dir);
++    g_file_set_contents(abi, target->abi_header, -1, NULL);
++    qemu_mutex_lock(&rec_lock);
++    /* one file per session; the build merges them and drops blocks seen twice */
++    for (int n = 0; n < 10000; n++) {
++        snprintf(rec_path, sizeof(rec_path), "%s/blocks-%04d.c", dir, n);
++        if (access(rec_path, F_OK) != 0) {
++            break;
++        }
++    }
++    qemu_mutex_unlock(&rec_lock);
++    if (!rec_thread_started) {
++        qemu_thread_create(&rec_thread, "aot-writer", rec_writer, NULL, QEMU_THREAD_DETACHED);
++        rec_thread_started = true;
++    }
++    if (!rec_buf) {
++        rec_buf = g_string_sized_new(512 * KiB);
++    }
++    g_hash_table_remove_all(rec_seen);
++    aot_recording = true;
++    fprintf(stderr, "aot: recording blocks to %s\n", rec_path);
++}
++
++static uint64_t rec_key(uint32_t pc, uint32_t flags, uint32_t cflags, uint64_t hash)
++{
++    return hash ^ ((uint64_t)pc << 32 | flags) * 0x9E3779B97F4A7C15ull ^ cflags;
++}
++
++static uint32_t aot_cflags(uint32_t cf)
++{
++    return cf & ~(CF_INVALID | CF_CLUSTER_MASK);
++}
++
++void aot_record_tb(TCGContext *s, TranslationBlock *tb, vaddr pc)
++{
++    uint32_t cf = aot_cflags(tb_cflags(tb));
++    const char *why = NULL;
++    gpointer key;
++
++    if (!aot_recording || tb->aot_id) {
++        return;
++    }
++    if ((cf & (CF_COUNT_MASK | CF_SINGLE_STEP | CF_USE_ICOUNT | CF_NOIRQ | CF_BP_PAGE |
++               CF_NO_GOTO_TB | CF_NO_GOTO_PTR | CF_MEMI_ONLY | CF_PARALLEL)) ||
++        !(cf & CF_PCREL)) {
++        why = "block flags (single step, I/O, icount)";
++    } else if (tb->cs_base != 0 || pc > UINT32_MAX) {
++        why = "segmented code";
++    } else if (target->title_flags_ok && !target->title_flags_ok(tb->flags)) {
++        why = "not 32-bit protected mode";
++    }
++    if (!why) {
++        key = (gpointer)(uintptr_t)rec_key(pc, tb->flags, cf, tb->ihash);
++        if (g_hash_table_contains(rec_seen, key)) {
++            return;
++        }
++        g_hash_table_add(rec_seen, key);
++        /* already in the loaded file: nothing new to record */
++        if (aot_loaded) {
++            for (uint32_t id = index_head[index_hash(pc, tb->flags) & index_mask]; id;
++                 id = index_next[id]) {
++                const AotEntry *e = &hdr->entries[id];
++                if (e->pc == pc && e->flags == tb->flags && e->cflags == cf &&
++                    e->hash == tb->ihash && e->size == tb->size) {
++                    st_rec_known++;
++                    return;
++                }
++            }
++        }
++        if (tcg_aot_emit_tb(s, tb, pc, rec_buf, &why)) {
++            st_rec_blocks++;
++            if (rec_buf->len >= 256 * KiB) {
++                rec_flush();
++            }
++            return;
++        }
++        /* a failed emit may have left a partial record in rec_buf: it writes only on success */
++    }
++    st_rec_skipped++;
++    qemu_mutex_lock(&rec_lock);
++    gpointer n = g_hash_table_lookup(rec_why, why);
++    if (!n) {
++        g_hash_table_insert(rec_why, g_strdup(why), GUINT_TO_POINTER(1));
++    } else {
++        g_hash_table_insert(rec_why, g_strdup(why), GUINT_TO_POINTER(GPOINTER_TO_UINT(n) + 1));
++    }
++    qemu_mutex_unlock(&rec_lock);
++}
++
++/* --- the game ---------------------------------------------------------------------------- */
++
++void aot_set_title(uint32_t title_id)
++{
++    char path[96];
++
++    if (!target) {
++        return;
++    }
++    rec_stop();
++    if (loaded_title != title_id) {
++        aot_unload();
++        if (title_id && aot_use) {
++            snprintf(path, sizeof(path), AOT_DIR "/%08x.aot", title_id);
++            if (access(path, R_OK) == 0 && aot_load(path)) {
++                loaded_title = title_id;
++            }
++        }
++    }
++    if (title_id && aot_record) {
++        rec_start(title_id);
++    }
++}
++
++/* --- running ----------------------------------------------------------------------------- */
++
++int aot_find(CPUState *cpu, const TranslationBlock *tb, vaddr pc, uint16_t *size)
++{
++    uint32_t cf = aot_cflags(tb_cflags(tb));
++    CPUArchState *env = cpu_env(cpu);
++
++    if (!aot_loaded || !aot_use || pc > UINT32_MAX || tb->cs_base != 0) {
++        return 0;
++    }
++    for (uint32_t id = index_head[index_hash(pc, tb->flags) & index_mask]; id; id = index_next[id]) {
++        const AotEntry *e = &hdr->entries[id];
++        int mmu_idx = cpu_mmu_index(cpu, true);
++        void *host;
++        bool mapped = true;
++
++        if (e->pc != pc || e->flags != tb->flags || e->cflags != cf) {
++            continue;
++        }
++        /* the block's bytes must be readable code (no fault from looking) */
++        for (vaddr p = pc & TARGET_PAGE_MASK; p < pc + e->size; p += TARGET_PAGE_SIZE) {
++            int fl = probe_access_flags(env, p, 1, MMU_INST_FETCH, mmu_idx, true, &host, 0);
++            if (fl & (TLB_INVALID_MASK | TLB_MMIO)) {
++                mapped = false;
++                break;
++            }
++        }
++        if (!mapped) {
++            continue;
++        }
++        if (tb_code_hash_func(env, pc, e->size) != e->hash) {
++            st_misses_hash++;
++            continue;
++        }
++        *size = e->size;
++        st_trampolines++;
++        return id;
++    }
++    return 0;
++}
++
++void HELPER(aot_run)(CPUArchState *env, uint32_t id)
++{
++    const AotEntry *e;
++
++    if (unlikely(!aot_loaded || id == 0 || id > hdr->nb_entries)) {
++        /*
++         * A trampoline from before the file changed (aot_set_title flushes them, but
++         * one may run before the flush): drop all TBs and go back to the main loop,
++         * which retranslates this one, rather than loop on it.
++         */
++        queue_tb_flush(env_cpu(env));
++        cpu_loop_exit(env_cpu(env));
++    }
++    e = &hdr->entries[id];
++    hdr->valid[id] = *hdr->gen;
++    set_bit(e->pc >> 12, valid_pages);
++    set_bit((e->pc + e->size - 1) >> 12, valid_pages);
++    st_runs++;
++    hdr->enter(env, id);
++}
++
++void aot_entered(int id)
++{
++}
++
++void aot_tb_invalidated(int id)
++{
++    if (aot_loaded && id > 0 && (uint32_t)id <= hdr->nb_entries) {
++        hdr->valid[id] = 0;
++    }
++}
++
++static void aot_new_generation(void)
++{
++    (*hdr->gen)++;
++    if (*hdr->gen == 0) {
++        memset(hdr->valid, 0, (hdr->nb_entries + 1) * sizeof(uint32_t));
++        *hdr->gen = 1;
++    }
++    bitmap_zero(valid_pages, 1u << (32 - 12));
++    st_gens++;
++}
++
++void aot_tlb_flushed(void)
++{
++    if (aot_loaded) {
++        aot_new_generation();
++    }
++}
++
++void aot_tlb_flushed_page(vaddr addr)
++{
++    if (aot_loaded && addr <= UINT32_MAX) {
++        uint32_t p = addr >> 12;
++        if (test_bit(p, valid_pages) || (p > 0 && test_bit(p - 1, valid_pages))) {
++            aot_new_generation();
++        }
++    }
++}
++
++void aot_tlb_flushed_range(vaddr addr, vaddr len)
++{
++    if (!aot_loaded) {
++        return;
++    }
++    if (len > 64 * TARGET_PAGE_SIZE || addr > UINT32_MAX) {
++        aot_new_generation();
++        return;
++    }
++    for (vaddr a = addr; a < addr + len; a += TARGET_PAGE_SIZE) {
++        uint32_t p = a >> 12;
++        if (test_bit(p, valid_pages) || (p > 0 && test_bit(p - 1, valid_pages))) {
++            aot_new_generation();
++            return;
++        }
++    }
++}
++
++void aot_tb_flushed(void)
++{
++    if (aot_loaded) {
++        aot_new_generation();
++    }
++}
++
++bool aot_restore_state(CPUState *cpu, uintptr_t host_pc)
++{
++    if (!aot_loaded || host_pc < (uintptr_t)map_base || host_pc >= (uintptr_t)map_base + map_size) {
++        return false;
++    }
++    target->restore(cpu, hdr->cur[0], (int)hdr->cur[1]);
++    return true;
++}
++
++bool aot_unwind_state_data(CPUState *cpu, uintptr_t host_pc, uint64_t *data)
++{
++    if (!aot_loaded || host_pc < (uintptr_t)map_base || host_pc >= (uintptr_t)map_base + map_size) {
++        return false;
++    }
++    /* as insn_start's words in a PC-relative block: the pc's page offset, cc_op */
++    data[0] = hdr->cur[0] & ~TARGET_PAGE_MASK;
++    data[1] = hdr->cur[1];
++    return true;
++}
++
++void aot_stats(GString *out, bool verbose)
++{
++    if (aot_loaded) {
++        uint32_t valid = 0;
++        if (verbose) {
++            for (uint32_t id = 1; id <= hdr->nb_entries; id++) {
++                valid += hdr->valid[id] == *hdr->gen;
++            }
++        }
++        g_string_append_printf(out, "aot: %s %u blocks, %" PRIu64 " entries from the JIT, %"
++                               PRIu64 " trampolines, %" PRIu64 " code changed, %" PRIu64
++                               " generations", loaded_path, hdr->nb_entries, st_runs,
++                               st_trampolines, st_misses_hash, st_gens);
++        if (verbose) {
++            g_string_append_printf(out, ", %u valid now", valid);
++        }
++    } else {
++        g_string_append(out, "aot: no translated code loaded");
++    }
++    if (aot_recording || st_rec_blocks) {
++        g_string_append_printf(out, "; recorded %" PRIu64 " blocks (%" PRIu64 " KiB written, %"
++                               PRIu64 " already compiled, %" PRIu64 " not translatable)",
++                               st_rec_blocks, qatomic_read(&st_rec_bytes) >> 10, st_rec_known,
++                               st_rec_skipped);
++    }
++    if (verbose && st_rec_skipped) {
++        GHashTableIter it;
++        gpointer k, v;
++        qemu_mutex_lock(&rec_lock);
++        g_hash_table_iter_init(&it, rec_why);
++        while (g_hash_table_iter_next(&it, &k, &v)) {
++            g_string_append_printf(out, "\n  not translated: %u x %s", GPOINTER_TO_UINT(v),
++                                   (const char *)k);
++        }
++        qemu_mutex_unlock(&rec_lock);
++    }
++}
++
++void aot_register_target(const AotTarget *t)
++{
++    target = t;
++    qemu_mutex_init(&rec_lock);
++    qemu_cond_init(&rec_cond);
++    rec_seen = g_hash_table_new(g_direct_hash, g_direct_equal);
++    rec_why = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
++}
 diff --git a/accel/tcg/cputlb.c b/accel/tcg/cputlb.c
-index b9ae474..8da2039 100644
+index b9ae474..b81c2a9 100644
 --- a/accel/tcg/cputlb.c
 +++ b/accel/tcg/cputlb.c
-@@ -900,6 +900,76 @@ static void tlb_reset_dirty_range_locked(CPUTLBEntryFull *full, CPUTLBEntry *ent
+@@ -46,6 +46,7 @@
+ #include "tb-hash.h"
+ #include "tb-internal.h"
+ #include "tlb-bounds.h"
++#include "exec/aot.h"
+ #include "internal-common.h"
+ #ifdef CONFIG_PLUGIN
+ #include "qemu/plugin-memory.h"
+@@ -391,6 +392,7 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
+     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
+ 
+     tcg_flush_jmp_cache(cpu);
++    aot_tlb_flushed();
+ 
+     if (to_clean == ALL_MMUIDX_BITS) {
+         qatomic_set(&cpu->neg.tlb.c.full_flush_count,
+@@ -551,6 +553,7 @@ static void tlb_flush_page_by_mmuidx_async_0(CPUState *cpu,
+      */
+     tb_jmp_cache_clear_page(cpu, addr - TARGET_PAGE_SIZE);
+     tb_jmp_cache_clear_page(cpu, addr);
++    aot_tlb_flushed_page(addr);
+ }
+ 
+ /**
+@@ -734,6 +737,7 @@ static void tlb_flush_range_by_mmuidx_async_0(CPUState *cpu,
+         }
+     }
+     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
++    aot_tlb_flushed_range(d.addr, d.len);
+ 
+     /*
+      * If the length is larger than the jump cache size, then it will take
+@@ -900,6 +904,76 @@ static void tlb_reset_dirty_range_locked(CPUTLBEntryFull *full, CPUTLBEntry *ent
      }
  }
  
@@ -79,7 +783,7 @@ index b9ae474..8da2039 100644
  /*
   * Called with tlb_c.lock held.
   * Called only from the vCPU context, i.e. the TLB's owner thread.
-@@ -917,6 +987,49 @@ static inline void copy_tlb_helper_locked(CPUTLBEntry *d, const CPUTLBEntry *s)
+@@ -917,6 +991,49 @@ static inline void copy_tlb_helper_locked(CPUTLBEntry *d, const CPUTLBEntry *s)
  void tlb_reset_dirty(CPUState *cpu, uintptr_t start, uintptr_t length)
  {
      int mmu_idx;
@@ -129,7 +833,7 @@ index b9ae474..8da2039 100644
  
      qemu_spin_lock(&cpu->neg.tlb.c.lock);
      for (mmu_idx = 0; mmu_idx < NB_MMU_MODES; mmu_idx++) {
-@@ -959,6 +1072,9 @@ static void tlb_set_dirty(CPUState *cpu, vaddr addr)
+@@ -959,6 +1076,9 @@ static void tlb_set_dirty(CPUState *cpu, vaddr addr)
      qemu_spin_lock(&cpu->neg.tlb.c.lock);
      for (mmu_idx = 0; mmu_idx < NB_MMU_MODES; mmu_idx++) {
          tlb_set_dirty1_locked(tlb_entry(cpu, mmu_idx, addr), addr);
@@ -139,7 +843,7 @@ index b9ae474..8da2039 100644
      }
  
      for (mmu_idx = 0; mmu_idx < NB_MMU_MODES; mmu_idx++) {
-@@ -1184,6 +1300,9 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
+@@ -1184,6 +1304,9 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
  
      copy_tlb_helper_locked(te, &tn);
      tlb_n_used_entries_inc(cpu, mmu_idx);
@@ -149,7 +853,7 @@ index b9ae474..8da2039 100644
      qemu_spin_unlock(&tlb->c.lock);
  }
  
-@@ -1325,6 +1444,18 @@ static bool victim_tlb_hit(CPUState *cpu, size_t mmu_idx, size_t index,
+@@ -1325,6 +1448,18 @@ static bool victim_tlb_hit(CPUState *cpu, size_t mmu_idx, size_t index,
              copy_tlb_helper_locked(&tmptlb, tlb);
              copy_tlb_helper_locked(tlb, vtlb);
              copy_tlb_helper_locked(vtlb, &tmptlb);
@@ -168,6 +872,72 @@ index b9ae474..8da2039 100644
              qemu_spin_unlock(&cpu->neg.tlb.c.lock);
  
              CPUTLBEntryFull *f1 = &cpu->neg.tlb.d[mmu_idx].fulltlb[index];
+diff --git a/accel/tcg/meson.build b/accel/tcg/meson.build
+index 234a6e2..cf06995 100644
+--- a/accel/tcg/meson.build
++++ b/accel/tcg/meson.build
+@@ -30,6 +30,7 @@ user_ss.add(files(
+ ))
+ 
+ system_ss.add(files(
++  'aot.c',
+   'cputlb.c',
+   'icount-common.c',
+   'monitor.c',
+diff --git a/accel/tcg/tb-maint.c b/accel/tcg/tb-maint.c
+index d21a8bd..afbb05a 100644
+--- a/accel/tcg/tb-maint.c
++++ b/accel/tcg/tb-maint.c
+@@ -34,6 +34,7 @@
+ #include "tb-context.h"
+ #include "tb-internal.h"
+ #include "internal-common.h"
++#include "exec/aot.h"
+ #ifdef CONFIG_USER_ONLY
+ #include "user/page-protection.h"
+ #define runstate_is_running()  true
+@@ -795,6 +796,7 @@ void tb_flush__exclusive_or_serial(void)
+     tcg_region_reset_all();
+     /* XXX: flush processor icache at this point if cache flush is expensive */
+     qatomic_inc(&tb_ctx.tb_flush_count);
++    aot_tb_flushed();       /* xemu-ps4: every trampoline is gone */
+     qemu_plugin_flush_cb();
+ }
+ 
+@@ -904,9 +906,19 @@ static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
+     CPUState *cpu;
+ 
+     if (tb_cflags(tb) & CF_PCREL) {
+-        /* A TB may be at any virtual address */
++        /*
++         * A TB may be at any virtual address. xemu-ps4: rather than clearing every
++         * CPU's whole jump cache for each invalidated TB (games that write next to
++         * their code did it thousands of times a second), clear the entry of the pc
++         * it was made for: an entry left elsewhere can't be used, as tb_lookup
++         * compares the cflags and an invalid TB has CF_INVALID.
++         */
++        uint32_t h = tb_jmp_cache_hash_func(tb->pc);
+         CPU_FOREACH(cpu) {
+-            tcg_flush_jmp_cache(cpu);
++            CPUJumpCache *jc = cpu->tb_jmp_cache;
++            if (qatomic_read(&jc->array[h].tb) == tb) {
++                qatomic_set(&jc->array[h].tb, NULL);
++            }
+         }
+     } else {
+         uint32_t h = tb_jmp_cache_hash_func(tb->pc);
+@@ -940,6 +952,11 @@ static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
+     qatomic_set(&tb->cflags, tb->cflags | CF_INVALID);
+     qemu_spin_unlock(&tb->jmp_lock);
+ 
++    /* xemu-ps4: its translated block's code bytes may have changed */
++    if (tb->aot_id) {
++        aot_tb_invalidated(tb->aot_id);
++    }
++
+     /* remove the TB from the hash list */
+     phys_pc = tb_page_addr0(tb);
+     h = tb_hash_func(phys_pc, (orig_cflags & CF_PCREL ? 0 : tb->pc),
 diff --git a/accel/tcg/tcg-accel-ops-mttcg.c b/accel/tcg/tcg-accel-ops-mttcg.c
 index cf1ee7a..c5cc4da 100644
 --- a/accel/tcg/tcg-accel-ops-mttcg.c
@@ -183,6 +953,50 @@ index cf1ee7a..c5cc4da 100644
          qemu_process_cpu_events(cpu);
  
          if (cpu_can_run(cpu)) {
+diff --git a/accel/tcg/tcg-runtime.h b/accel/tcg/tcg-runtime.h
+index 8436599..55fa152 100644
+--- a/accel/tcg/tcg-runtime.h
++++ b/accel/tcg/tcg-runtime.h
+@@ -25,6 +25,8 @@ DEF_HELPER_FLAGS_1(ctpop_i32, TCG_CALL_NO_RWG_SE, i32, i32)
+ DEF_HELPER_FLAGS_1(ctpop_i64, TCG_CALL_NO_RWG_SE, i64, i64)
+ 
+ DEF_HELPER_FLAGS_1(lookup_tb_ptr, TCG_CALL_NO_WG_SE, cptr, env)
++/* xemu-ps4: run an ahead-of-time translated block (accel/tcg/aot.c) */
++DEF_HELPER_FLAGS_2(aot_run, 0, void, env, i32)
+ 
+ DEF_HELPER_FLAGS_1(exit_atomic, TCG_CALL_NO_WG, noreturn, env)
+ 
+diff --git a/accel/tcg/translate-all.c b/accel/tcg/translate-all.c
+index 0871388..dda22ee 100644
+--- a/accel/tcg/translate-all.c
++++ b/accel/tcg/translate-all.c
+@@ -36,6 +36,7 @@
+ #include "tb-context.h"
+ #include "tb-internal.h"
+ #include "internal-common.h"
++#include "exec/aot.h"
+ #include "tcg/perf.h"
+ #include "tcg/insn-start-words.h"
+ 
+@@ -217,7 +218,8 @@ bool cpu_restore_state(CPUState *cpu, uintptr_t host_pc)
+             return true;
+         }
+     }
+-    return false;
++    /* xemu-ps4: a helper called from ahead-of-time translated code */
++    return aot_restore_state(cpu, host_pc);
+ }
+ 
+ bool cpu_unwind_state_data(CPUState *cpu, uintptr_t host_pc, uint64_t *data)
+@@ -228,7 +230,7 @@ bool cpu_unwind_state_data(CPUState *cpu, uintptr_t host_pc, uint64_t *data)
+             return cpu_unwind_data_from_tb(tb, host_pc, data) >= 0;
+         }
+     }
+-    return false;
++    return aot_unwind_state_data(cpu, host_pc, data);     /* xemu-ps4 */
+ }
+ 
+ void page_init(void)
 diff --git a/block.c b/block.c
 index 14ed7f1..6923af4 100644
 --- a/block.c
@@ -1149,6 +1963,110 @@ index 779a41b..6e94fa5 100644
  
      *ram_memory = ram;
      memory_region_add_subregion(system_memory, 0, ram);
+diff --git a/include/exec/aot.h b/include/exec/aot.h
+new file mode 100644
+index 0000000..f687aeb
+--- /dev/null
++++ b/include/exec/aot.h
+@@ -0,0 +1,84 @@
++/*
++ * xemu-ps4: the ahead-of-time translator ("translated game code").
++ *
++ * While a game runs, every block the JIT translates is also written out as C
++ * (tcg/tcg-aot.c.inc) into /data/xemu/aot/<title ID>/. A PC compiles those files
++ * with clang (scripts/aot-build.py) into /data/xemu/aot/<title ID>.aot, which the
++ * next start of that game loads: a block found there with the same code bytes runs
++ * the compiled code (a "trampoline" TB that calls it) instead of the JIT's.
++ *
++ * This program is free software; you can redistribute it and/or modify it under
++ * the terms of the GNU General Public License as published by the Free Software
++ * Foundation; either version 2 of the License, or (at your option) any later
++ * version.
++ */
++
++#ifndef EXEC_AOT_H
++#define EXEC_AOT_H
++
++#include "exec/vaddr.h"
++
++typedef struct TCGContext TCGContext;
++typedef struct TranslationBlock TranslationBlock;
++typedef struct CPUState CPUState;
++
++/* settings (ui/ps4/ps4-settings.c): run a loaded .aot, record blocks */
++extern bool aot_use;
++extern bool aot_record;
++
++/* set while blocks are written (tcg_gen_code calls aot_record_tb) / a .aot is loaded */
++extern bool aot_recording;
++extern bool aot_loaded;
++
++/*
++ * The game that starts now (its XBE's title ID; 0 = none): loads its .aot and opens
++ * its recording folder. Call with the machine not running code (before a reset/start).
++ */
++void aot_set_title(uint32_t title_id);
++
++/* tcg_gen_code, after liveness: write this TB as C (if it qualifies) */
++void aot_record_tb(TCGContext *s, TranslationBlock *tb, vaddr pc);
++/* tcg/tcg-aot.c.inc: the TB's ops as C; false with *why if they can't be */
++bool tcg_aot_emit_tb(TCGContext *s, const TranslationBlock *tb, uint64_t pc,
++                     GString *out, const char **why);
++
++/* The translated block for this TB (pc, flags, cflags, code bytes), or 0. */
++int aot_find(CPUState *cpu, const TranslationBlock *tb, vaddr pc, uint16_t *size);
++/* x86_translate_code: called for the trampoline TB's helper */
++void aot_entered(int id);
++
++/* invalidation: a trampoline TB went away; the TLB or the TB cache was flushed */
++void aot_tb_invalidated(int id);
++void aot_tlb_flushed(void);
++void aot_tlb_flushed_page(vaddr addr);
++void aot_tlb_flushed_range(vaddr addr, vaddr len);
++void aot_tb_flushed(void);
++
++/* cpu_restore_state / cpu_unwind_state_data for a host pc inside translated code */
++bool aot_restore_state(CPUState *cpu, uintptr_t host_pc);
++bool aot_unwind_state_data(CPUState *cpu, uintptr_t host_pc, uint64_t *data);
++
++/* one line for the monitor / the live console's "aot" command */
++void aot_stats(GString *out, bool verbose);
++
++/*
++ * The target's part (target/i386/tcg/aot-i386.c): the ABI header the generated C
++ * includes, its key, the helpers by name, and how env's eip / cc_op are restored.
++ */
++typedef struct AotHelperName {
++    const char *name;
++    void *func;
++} AotHelperName;
++
++typedef struct AotTarget {
++    const char *abi_header;          /* aot_abi.h's text */
++    uint64_t abi_key;
++    const AotHelperName *helpers;
++    size_t nb_helpers;
++    void (*restore)(CPUState *cpu, uint32_t pc, int cc_op);
++    int (*title_flags_ok)(uint32_t flags);   /* blocks worth recording (protected mode) */
++} AotTarget;
++
++void aot_register_target(const AotTarget *t);
++
++#endif
+diff --git a/include/exec/translation-block.h b/include/exec/translation-block.h
+index 433fa3b..fcf454b 100644
+--- a/include/exec/translation-block.h
++++ b/include/exec/translation-block.h
+@@ -145,6 +145,9 @@ struct TranslationBlock {
+     uintptr_t jmp_list_head;
+     uintptr_t jmp_list_next[2];
+     uintptr_t jmp_dest[2];
++
++    /* xemu-ps4: the ahead-of-time translated block this TB runs (0: the JIT's code) */
++    int32_t aot_id;
+ };
+ 
+ /* The alignment given to TranslationBlock during allocation. */
 diff --git a/include/qemu/osdep.h b/include/qemu/osdep.h
 index 4ca8ccb..29767da 100644
 --- a/include/qemu/osdep.h
@@ -1305,6 +2223,302 @@ index df65d22..9895b19 100644
  
  #include <sys/procctl.h>
  
+diff --git a/target/i386/tcg/aot-i386.c b/target/i386/tcg/aot-i386.c
+new file mode 100644
+index 0000000..6a54db5
+--- /dev/null
++++ b/target/i386/tcg/aot-i386.c
+@@ -0,0 +1,209 @@
++/*
++ * xemu-ps4: the x86 side of the ahead-of-time translator (include/exec/aot.h).
++ *
++ * - aot_abi.h: the offsets the generated C uses (scripts/aot_rt.h includes it), and
++ *   a key over them that a .aot must match to be loaded;
++ * - the helpers by name, for the .aot's imports;
++ * - the trampoline TB: a block of the guest's code that the .aot has (same flags,
++ *   same bytes) becomes one TB whose code calls helper_aot_run, then looks up the
++ *   next TB at whatever eip the compiled code left.
++ *
++ * This program is free software; you can redistribute it and/or modify it under
++ * the terms of the GNU General Public License as published by the Free Software
++ * Foundation; either version 2 of the License, or (at your option) any later
++ * version.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/fast-hash.h"
++#include "cpu.h"
++#include "exec/aot.h"
++#include "exec/translation-block.h"
++#include "exec/translator.h"
++#include "exec/target_page.h"
++#include "exec/tlb-common.h"
++#include "tcg/tcg.h"
++#include "tcg/tcg-op.h"
++#include "tcg/tcg-ldst.h"
++#include "exec/helper-proto.h"
++#include "exec/helper-gen-common.h"
++#include "helper-tcg.h"
++#include "aot-i386.h"
++
++/* --- helpers by name ----------------------------------------------------------------------- */
++
++#undef DEF_HELPER_FLAGS_0
++#undef DEF_HELPER_FLAGS_1
++#undef DEF_HELPER_FLAGS_2
++#undef DEF_HELPER_FLAGS_3
++#undef DEF_HELPER_FLAGS_4
++#undef DEF_HELPER_FLAGS_5
++#undef DEF_HELPER_FLAGS_6
++#undef DEF_HELPER_FLAGS_7
++#define AOT_H_ENTRY(name) { stringify(name), (void *)HELPER(name) },
++#define DEF_HELPER_FLAGS_0(name, f, r) AOT_H_ENTRY(name)
++#define DEF_HELPER_FLAGS_1(name, f, r, a) AOT_H_ENTRY(name)
++#define DEF_HELPER_FLAGS_2(name, f, r, a, b) AOT_H_ENTRY(name)
++#define DEF_HELPER_FLAGS_3(name, f, r, a, b, c) AOT_H_ENTRY(name)
++#define DEF_HELPER_FLAGS_4(name, f, r, a, b, c, d) AOT_H_ENTRY(name)
++#define DEF_HELPER_FLAGS_5(name, f, r, a, b, c, d, e) AOT_H_ENTRY(name)
++#define DEF_HELPER_FLAGS_6(name, f, r, a, b, c, d, e, g) AOT_H_ENTRY(name)
++#define DEF_HELPER_FLAGS_7(name, f, r, a, b, c, d, e, g, h) AOT_H_ENTRY(name)
++
++/* plain .data: in .data.rel.ro it made PacBrew create-fself emit the data segment twice */
++static AotHelperName aot_i386_helpers[] = {
++#include "helper.h"
++#include "accel/tcg/tcg-runtime.h"
++    /* the TLB-miss paths of guest loads and stores (tcg/tcg-ldst.h) */
++    { "ldub_mmu", (void *)helper_ldub_mmu },
++    { "lduw_mmu", (void *)helper_lduw_mmu },
++    { "ldul_mmu", (void *)helper_ldul_mmu },
++    { "ldq_mmu", (void *)helper_ldq_mmu },
++    { "ld16_mmu", (void *)helper_ld16_mmu },
++    { "stb_mmu", (void *)helper_stb_mmu },
++    { "stw_mmu", (void *)helper_stw_mmu },
++    { "stl_mmu", (void *)helper_stl_mmu },
++    { "stq_mmu", (void *)helper_stq_mmu },
++    { "st16_mmu", (void *)helper_st16_mmu },
++};
++
++/* --- the ABI the generated C was written against -------------------------------------------- */
++
++static AotTarget aot_i386;
++
++static void aot_i386_restore(CPUState *cpu, uint32_t pc, int cc_op)
++{
++    CPUX86State *env = cpu_env(cpu);
++
++    env->eip = pc;                  /* translated blocks run with a flat CS (base 0) */
++    if (cc_op >= 0 && cc_op < CC_OP_DYNAMIC) {
++        env->cc_op = cc_op;
++    }
++}
++
++static int aot_i386_flags_ok(uint32_t flags)
++{
++    return (flags & HF_PE_MASK) && (flags & HF_CS32_MASK) && (flags & HF_SS32_MASK) &&
++           !(flags & HF_VM_MASK);
++}
++
++void aot_i386_register(void)
++{
++    GString *h = g_string_new(NULL);
++    const char *regs[8] = { "EAX", "ECX", "EDX", "EBX", "ESP", "EBP", "ESI", "EDI" };
++    const int reg_idx[8] = { R_EAX, R_ECX, R_EDX, R_EBX, R_ESP, R_EBP, R_ESI, R_EDI };
++
++    g_string_append(h, "/* written by xemu-ps4 (target/i386/tcg/aot-i386.c): this build's layout */\n");
++    for (int i = 0; i < 8; i++) {
++        g_string_append_printf(h, "#define AOT_OFF_%s %zu\n", regs[i],
++                               offsetof(CPUX86State, regs[reg_idx[i]]));
++    }
++    g_string_append_printf(h, "#define AOT_OFF_EIP %zu\n", offsetof(CPUX86State, eip));
++    g_string_append_printf(h, "#define AOT_OFF_CC_DST %zu\n", offsetof(CPUX86State, cc_dst));
++    g_string_append_printf(h, "#define AOT_OFF_CC_SRC %zu\n", offsetof(CPUX86State, cc_src));
++    g_string_append_printf(h, "#define AOT_OFF_CC_OP %zu\n", offsetof(CPUX86State, cc_op));
++    g_string_append_printf(h, "#define AOT_PAGE_BITS %d\n", TARGET_PAGE_BITS);
++    g_string_append_printf(h, "#define AOT_TLB_ENTRY_BITS %d\n", CPU_TLB_ENTRY_BITS);
++    g_string_append_printf(h, "#define AOT_TLBF_MASK %zu\n", offsetof(CPUTLBDescFast, mask));
++    g_string_append_printf(h, "#define AOT_TLBF_TABLE %zu\n", offsetof(CPUTLBDescFast, table));
++    g_string_append_printf(h, "#define AOT_TLBE_READ %zu\n", offsetof(CPUTLBEntry, addr_read));
++    g_string_append_printf(h, "#define AOT_TLBE_WRITE %zu\n", offsetof(CPUTLBEntry, addr_write));
++    g_string_append_printf(h, "#define AOT_TLBE_ADDEND %zu\n", offsetof(CPUTLBEntry, addend));
++    g_string_append_printf(h, "#define AOT_CC_OP_DYNAMIC %d\n", CC_OP_DYNAMIC);
++    /* not used by the C, but any change to them changes the env offsets the C embeds */
++    g_string_append_printf(h, "#define AOT_SIZEOF_ENV %zu\n", sizeof(CPUX86State));
++    g_string_append_printf(h, "#define AOT_OFF_XMM %zu\n", offsetof(CPUX86State, xmm_regs));
++    g_string_append_printf(h, "#define AOT_OFF_FPREGS %zu\n", offsetof(CPUX86State, fpregs));
++    g_string_append_printf(h, "#define AOT_OFF_FPSTT %zu\n", offsetof(CPUX86State, fpstt));
++    g_string_append_printf(h, "#define AOT_OFF_MXCSR %zu\n", offsetof(CPUX86State, mxcsr));
++    g_string_append_printf(h, "#define AOT_OFF_SEGS %zu\n", offsetof(CPUX86State, segs));
++    g_string_append_printf(h, "#define AOT_OFF_ENV %zu\n", offsetof(X86CPU, env));
++    g_string_append_printf(h, "#define AOT_NEG_SIZE %zu\n", sizeof(CPUNegativeOffsetState));
++    g_string_append_printf(h, "#define AOT_FORMAT 1\n");
++    aot_i386.abi_key = fast_hash((const uint8_t *)h->str, h->len);
++    g_string_append_printf(h, "#define AOT_ABI_KEY 0x%016" PRIx64 "ull\n", aot_i386.abi_key);
++
++    aot_i386.abi_header = g_string_free(h, false);
++    aot_i386.helpers = aot_i386_helpers;
++    aot_i386.nb_helpers = ARRAY_SIZE(aot_i386_helpers);
++    aot_i386.restore = aot_i386_restore;
++    aot_i386.title_flags_ok = aot_i386_flags_ok;
++    aot_register_target(&aot_i386);
++}
++
++/* --- the trampoline TB ------------------------------------------------------------------------ */
++
++typedef struct AotDisas {
++    DisasContextBase base;
++    int id;
++    uint16_t size;
++} AotDisas;
++
++static void aot_tr_init(DisasContextBase *db, CPUState *cpu)
++{
++}
++
++static void aot_tr_tb_start(DisasContextBase *db, CPUState *cpu)
++{
++}
++
++static void aot_tr_insn_start(DisasContextBase *db, CPUState *cpu)
++{
++    target_ulong pc_arg = db->pc_next;
++
++    if (tb_cflags(db->tb) & CF_PCREL) {
++        pc_arg &= ~TARGET_PAGE_MASK;
++    }
++    tcg_gen_insn_start(pc_arg, CC_OP_DYNAMIC);
++}
++
++static void aot_tr_translate_insn(DisasContextBase *db, CPUState *cpu)
++{
++    AotDisas *d = container_of(db, AotDisas, base);
++    CPUX86State *env = cpu_env(cpu);
++
++    /* read the block's bytes the way the decoder would: the TB covers them all */
++    for (unsigned i = 0; i < d->size; i++) {
++        translator_ldub(env, db, db->pc_first + i);
++    }
++    db->pc_next = db->pc_first + d->size;
++    db->is_jmp = DISAS_NORETURN;
++}
++
++static void aot_tr_tb_stop(DisasContextBase *db, CPUState *cpu)
++{
++    AotDisas *d = container_of(db, AotDisas, base);
++
++    gen_helper_aot_run(tcg_env, tcg_constant_i32(d->id));
++    tcg_gen_lookup_and_goto_ptr();
++}
++
++static const TranslatorOps aot_tr_ops = {
++    .init_disas_context = aot_tr_init,
++    .tb_start = aot_tr_tb_start,
++    .insn_start = aot_tr_insn_start,
++    .translate_insn = aot_tr_translate_insn,
++    .tb_stop = aot_tr_tb_stop,
++};
++
++bool aot_i386_translate(CPUState *cpu, TranslationBlock *tb, int *max_insns, vaddr pc,
++                        void *host_pc)
++{
++    AotDisas d = { 0 };
++    uint16_t size = 0;
++    int id;
++
++    tb->aot_id = 0;
++    if (*max_insns < TCG_MAX_INSNS) {
++        return false;       /* a limited TB (I/O, an exception's retry): the JIT's */
++    }
++    id = aot_find(cpu, tb, pc, &size);
++    if (!id) {
++        return false;
++    }
++    d.id = id;
++    d.size = size;
++    tb->aot_id = id;
++    translator_loop(cpu, tb, max_insns, pc, host_pc, &aot_tr_ops, &d.base);
++    return true;
++}
+diff --git a/target/i386/tcg/aot-i386.h b/target/i386/tcg/aot-i386.h
+new file mode 100644
+index 0000000..ac1a1f4
+--- /dev/null
++++ b/target/i386/tcg/aot-i386.h
+@@ -0,0 +1,20 @@
++/*
++ * xemu-ps4: the x86 side of the ahead-of-time translator (aot-i386.c).
++ *
++ * This program is free software; you can redistribute it and/or modify it under
++ * the terms of the GNU General Public License as published by the Free Software
++ * Foundation; either version 2 of the License, or (at your option) any later
++ * version.
++ */
++
++#ifndef TARGET_I386_AOT_I386_H
++#define TARGET_I386_AOT_I386_H
++
++/* tcg_x86_init: the ABI header, helper names and restore hook for accel/tcg/aot.c */
++void aot_i386_register(void);
++
++/* x86_translate_code: a trampoline TB if the .aot has this block; false for the JIT */
++bool aot_i386_translate(CPUState *cpu, TranslationBlock *tb, int *max_insns, vaddr pc,
++                        void *host_pc);
++
++#endif
+diff --git a/target/i386/tcg/meson.build b/target/i386/tcg/meson.build
+index b2733e3..f04bf47 100644
+--- a/target/i386/tcg/meson.build
++++ b/target/i386/tcg/meson.build
+@@ -11,7 +11,8 @@ i386_ss.add(when: 'CONFIG_TCG', if_true: files(
+   'mpx_helper.c',
+   'seg_helper.c',
+   'tcg-cpu.c',
+-  'translate.c'), if_false: files('tcg-stub.c'))
++  'translate.c',
++  'aot-i386.c'), if_false: files('tcg-stub.c'))
+ 
+ subdir('system')
+ subdir('user')
+diff --git a/target/i386/tcg/translate.c b/target/i386/tcg/translate.c
+index c753caf..f30dea3 100644
+--- a/target/i386/tcg/translate.c
++++ b/target/i386/tcg/translate.c
+@@ -34,6 +34,8 @@
+ #include "decode-new.h"
+ 
+ #include "exec/log.h"
++#include "exec/aot.h"
++#include "aot-i386.h"
+ 
+ static int g_use_hard_fpu;
+ 
+@@ -4230,6 +4232,7 @@ void tcg_x86_init(void)
+ #if defined(XBOX) && defined(__x86_64__)
+     g_use_hard_fpu = g_config.perf.hard_fpu;
+ #endif
++    aot_i386_register();
+ }
+ 
+ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
+@@ -4423,6 +4426,10 @@ void x86_translate_code(CPUState *cpu, TranslationBlock *tb,
+ {
+     DisasContext dc;
+ 
++    tb->aot_id = 0;
++    if (unlikely(aot_loaded) && aot_i386_translate(cpu, tb, max_insns, pc, host_pc)) {
++        return;     /* a trampoline into the ahead-of-time translated block */
++    }
+     tcg_ctx->disas_ctx = &dc;
+     translator_loop(cpu, tb, max_insns, pc, host_pc, &i386_tr_ops, &dc.base);
+     tcg_ctx->disas_ctx = NULL;
+@@ -4430,5 +4437,8 @@ void x86_translate_code(CPUState *cpu, TranslationBlock *tb,
+ 
+ void gen_bb_epilogue(void)
+ {
++    if (!tcg_ctx->disas_ctx) {
++        return;     /* an ahead-of-time trampoline (aot-i386.c) caches no FP registers */
++    }
+     gen_flush_fp((DisasContext *)tcg_ctx->disas_ctx);
+ }
 diff --git a/tcg/region.c b/tcg/region.c
 index 2181267..337e782 100644
 --- a/tcg/region.c
@@ -1336,6 +2550,1353 @@ index 2181267..337e782 100644
      if (tb_size < MIN_CODE_GEN_BUFFER_SIZE) {
          tb_size = MIN_CODE_GEN_BUFFER_SIZE;
      }
+diff --git a/tcg/tcg-aot.c.inc b/tcg/tcg-aot.c.inc
+new file mode 100644
+index 0000000..a728890
+--- /dev/null
++++ b/tcg/tcg-aot.c.inc
+@@ -0,0 +1,1310 @@
++/*
++ * xemu-ps4: a translation block written out as C, for the ahead-of-time
++ * translator (accel/tcg/aot.c records these on the console, scripts/aot-build.py
++ * compiles them with clang on a PC, and the result runs instead of the JIT's code).
++ *
++ * Included at the end of tcg/tcg.c: it walks the TB's ops after the optimizer and
++ * liveness, where tcg_gen_code would allocate registers and emit host code, and
++ * prints one C statement (or a few) per op. Everything the generated code needs
++ * from this build (env offsets, TLB layout) is a number taken from the ops or from
++ * accel/tcg/aot.c's ABI header, so the C is only valid for the build that wrote it
++ * (the loader compares the ABI key).
++ *
++ * The guest registers that pass from block to block are the C function's
++ * parameters (eax..edi, cc_dst, cc_src, cc_op: scripts/aot_rt.h, AOT_PARAMS), kept
++ * in host registers across the blocks by a preserve_none calling convention and
++ * musttail calls; the other globals live in env as for the JIT. Before anything
++ * that can read env (a helper, a TLB miss, a return to the JIT) the changed
++ * registers are stored; after a helper that may write globals they are reloaded.
++ *
++ * This program is free software; you can redistribute it and/or modify it under
++ * the terms of the GNU General Public License as published by the Free Software
++ * Foundation; either version 2 of the License, or (at your option) any later
++ * version.
++ */
++
++#include "exec/aot.h"
++#include "hw/core/cpu.h"
++
++/* The globals that are C parameters (in this order: AOT_PARAMS in aot_rt.h). */
++static const char *const aot_passed_names[] = {
++    "eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi",
++    "cc_dst", "cc_src", "cc_op",
++};
++
++typedef struct AotEmit {
++    TCGContext *s;
++    GString *o;
++    const char *fail;
++    char failbuf[96];
++    uint64_t tb_pc;          /* the TB's virtual pc (cs_base 0) */
++    uint64_t cur_pc;         /* the current guest instruction's pc */
++    int cur_cc;              /* its cc_op at insn start (CC_OP_DYNAMIC: env) */
++    bool have_insn;
++    bool skip_exit_tb;       /* a goto_tb was just emitted: its exit_tb goes */
++    TCGTemp *lookup_ptr;     /* the lookup_tb_ptr call's result */
++    bool lookup_pending;
++    int x87_csr_set;         /* host MXCSR holds the x87 value (flcr) */
++    TCGTemp *eip;            /* the eip global */
++    /* eip's value where it is known statically (direct jumps name their target) */
++    bool eip_known;
++    uint32_t eip_val;
++    int nb_labels;
++    int8_t *lab_seen;        /* per label: 0 none yet, 1 known state, -1 unknown */
++    uint32_t *lab_val;
++    bool flow_ends;          /* the previous op never falls through */
++    /* per temp index */
++    uint8_t *passed;         /* 1 + index in aot_passed_names, 0 if not passed */
++    uint8_t *used;           /* referenced at all */
++    uint8_t *written;        /* globals: written somewhere in the TB */
++    uint8_t *dirty;          /* globals: env is older than the C variable */
++    uint8_t *declared;
++    int nb_temps;
++} AotEmit;
++
++static void aot_failf(AotEmit *e, const char *fmt, ...) G_GNUC_PRINTF(2, 3);
++static void aot_failf(AotEmit *e, const char *fmt, ...)
++{
++    va_list ap;
++    if (e->fail) {
++        return;
++    }
++    va_start(ap, fmt);
++    vsnprintf(e->failbuf, sizeof(e->failbuf), fmt, ap);
++    va_end(ap);
++    e->fail = e->failbuf;
++}
++
++static const char *aot_ctype(TCGType t)
++{
++    switch (t) {
++    case TCG_TYPE_I32: return "uint32_t";
++    case TCG_TYPE_I64: return "uint64_t";
++    case TCG_TYPE_F32: return "float";
++    case TCG_TYPE_F64: return "double";
++    case TCG_TYPE_V64: return "aotv64";
++    case TCG_TYPE_V128: return "aotv128";
++    case TCG_TYPE_V256: return "aotv256";
++    default: return NULL;
++    }
++}
++
++static const char *aot_stype(TCGType t)
++{
++    return t == TCG_TYPE_I32 ? "int32_t" : "int64_t";
++}
++
++static int aot_bits(TCGType t)
++{
++    return t == TCG_TYPE_I32 ? 32 : 64;
++}
++
++static int aot_vbytes(TCGType t)
++{
++    switch (t) {
++    case TCG_TYPE_V64: return 8;
++    case TCG_TYPE_V128: return 16;
++    case TCG_TYPE_V256: return 32;
++    default: return 0;
++    }
++}
++
++/* The C name or literal of an argument temp, in a static ring of buffers. */
++static const char *aot_t(AotEmit *e, TCGArg arg)
++{
++    static char ring[16][64];
++    static int ri;
++    char *b = ring[ri++ & 15];
++    TCGTemp *ts = arg_temp(arg);
++    int idx = temp_idx(ts);
++
++    switch (ts->kind) {
++    case TEMP_FIXED:
++        snprintf(b, 64, "((uintptr_t)env)");
++        break;
++    case TEMP_GLOBAL:
++        snprintf(b, 64, "g_%s", ts->name);
++        break;
++    case TEMP_CONST:
++        switch (ts->type) {
++        case TCG_TYPE_I32:
++            snprintf(b, 64, "0x%" PRIx32 "u", (uint32_t)ts->val);
++            break;
++        case TCG_TYPE_I64:
++            snprintf(b, 64, "0x%" PRIx64 "ull", (uint64_t)ts->val);
++            break;
++        case TCG_TYPE_V64:
++            snprintf(b, 64, "((aotv64){0x%" PRIx64 "ull})", (uint64_t)ts->val);
++            break;
++        case TCG_TYPE_V128:
++            snprintf(b, 64, "AOT_VC128(0x%" PRIx64 "ull)", (uint64_t)ts->val);
++            break;
++        case TCG_TYPE_V256:
++            snprintf(b, 64, "AOT_VC256(0x%" PRIx64 "ull)", (uint64_t)ts->val);
++            break;
++        default:
++            aot_failf(e, "constant of type %d", ts->type);
++            snprintf(b, 64, "0");
++            break;
++        }
++        break;
++    default:
++        snprintf(b, 64, "t%d", idx);
++        break;
++    }
++    return b;
++}
++
++/* A pointer-sized base for ld/st: env or a temp holding a host address. */
++static const char *aot_base(AotEmit *e, TCGArg arg)
++{
++    static char ring[4][80];
++    static int ri;
++    char *b = ring[ri++ & 3];
++    TCGTemp *ts = arg_temp(arg);
++    if (ts->kind == TEMP_FIXED) {
++        return "((char *)env)";
++    }
++    snprintf(b, 80, "((char *)(uintptr_t)%s)", aot_t(e, arg));
++    return b;
++}
++
++static void aot_note_temp(AotEmit *e, TCGArg arg, bool out)
++{
++    TCGTemp *ts = arg_temp(arg);
++    int idx = temp_idx(ts);
++
++    e->used[idx] = 1;
++    if (ts->kind == TEMP_FIXED) {
++        if (ts != tcgv_ptr_temp(tcg_env)) {
++            aot_failf(e, "fixed temp %s", ts->name ? ts->name : "?");
++        }
++        if (out) {
++            aot_failf(e, "write to env");
++        }
++        return;
++    }
++    if (!aot_ctype(ts->type)) {
++        aot_failf(e, "temp type %d", ts->type);
++        return;
++    }
++    if (ts->kind == TEMP_GLOBAL) {
++        if (ts->indirect_reg || ts->mem_base != tcgv_ptr_temp(tcg_env)) {
++            aot_failf(e, "global %s not in env", ts->name);
++            return;
++        }
++        if (out) {
++            e->written[idx] = 1;
++        }
++    }
++}
++
++/* Store the globals whose C copy is newer than env (all of them if 'all'). */
++static void aot_sync(AotEmit *e, bool all)
++{
++    for (int i = 0; i < e->nb_temps; i++) {
++        TCGTemp *ts = &e->s->temps[i];
++        if (ts->kind != TEMP_GLOBAL || !(e->dirty[i] || (all && e->used[i]))) {
++            continue;
++        }
++        if (!e->dirty[i] && !e->written[i] && !e->passed[i] && ts != e->eip) {
++            continue;   /* loaded from env and never changed */
++        }
++        g_string_append_printf(e->o, " AOT_ST_%s(%" PRIdPTR ", g_%s);",
++                               ts->type == TCG_TYPE_I32 ? "I32" : "I64",
++                               ts->mem_offset, ts->name);
++        e->dirty[i] = 0;
++    }
++}
++
++/* Reload every global the block keeps in C variables (after a helper may write them). */
++static void aot_reload(AotEmit *e)
++{
++    for (int i = 0; i < e->nb_temps; i++) {
++        TCGTemp *ts = &e->s->temps[i];
++        if (ts->kind != TEMP_GLOBAL || !(e->used[i] || e->passed[i])) {
++            continue;
++        }
++        g_string_append_printf(e->o, " g_%s = AOT_LD_%s(%" PRIdPTR ");", ts->name,
++                               ts->type == TCG_TYPE_I32 ? "I32" : "I64", ts->mem_offset);
++        e->dirty[i] = 0;
++    }
++}
++
++static void aot_mark_all_dirty(AotEmit *e)
++{
++    for (int i = 0; i < e->nb_temps; i++) {
++        TCGTemp *ts = &e->s->temps[i];
++        if (ts->kind == TEMP_GLOBAL && (e->written[i] || e->passed[i] || ts == e->eip)) {
++            e->dirty[i] = 1;
++        }
++    }
++}
++
++static void aot_cur(AotEmit *e)
++{
++    g_string_append_printf(e->o, " AOT_CUR(0x%" PRIx64 "u, %d);", e->cur_pc, e->cur_cc);
++}
++
++static const char *aot_cond(AotEmit *e, TCGCond c, TCGType t, const char *a, const char *b)
++{
++    static char ring[4][192];
++    static int ri;
++    char *r = ring[ri++ & 3];
++    const char *st = aot_stype(t);
++
++    switch (c) {
++    case TCG_COND_NEVER: return "0";
++    case TCG_COND_ALWAYS: return "1";
++    case TCG_COND_EQ: snprintf(r, 192, "(%s == %s)", a, b); break;
++    case TCG_COND_NE: snprintf(r, 192, "(%s != %s)", a, b); break;
++    case TCG_COND_TSTEQ: snprintf(r, 192, "((%s & %s) == 0)", a, b); break;
++    case TCG_COND_TSTNE: snprintf(r, 192, "((%s & %s) != 0)", a, b); break;
++    case TCG_COND_LT: snprintf(r, 192, "((%s)%s < (%s)%s)", st, a, st, b); break;
++    case TCG_COND_GE: snprintf(r, 192, "((%s)%s >= (%s)%s)", st, a, st, b); break;
++    case TCG_COND_GT: snprintf(r, 192, "((%s)%s > (%s)%s)", st, a, st, b); break;
++    case TCG_COND_LE: snprintf(r, 192, "((%s)%s <= (%s)%s)", st, a, st, b); break;
++    case TCG_COND_LTU: snprintf(r, 192, "(%s < %s)", a, b); break;
++    case TCG_COND_GEU: snprintf(r, 192, "(%s >= %s)", a, b); break;
++    case TCG_COND_GTU: snprintf(r, 192, "(%s > %s)", a, b); break;
++    case TCG_COND_LEU: snprintf(r, 192, "(%s <= %s)", a, b); break;
++    default:
++        aot_failf(e, "condition %d", c);
++        return "0";
++    }
++    return r;
++}
++
++/* Lane vector type names for vector ops: u32x4 and so on (aot_rt.h). */
++static void aot_lanes(TCGType t, unsigned vece, char *u, char *s, int *bits, int *count)
++{
++    int b = 8 << vece, n = aot_vbytes(t) * 8 / b;
++    sprintf(u, "u%dx%d", b, n);
++    sprintf(s, "s%dx%d", b, n);
++    *bits = b;
++    *count = n;
++}
++
++static const char *aot_vcond(AotEmit *e, TCGCond c, const char *u, const char *s,
++                             const char *a, const char *b)
++{
++    static char ring[2][256];
++    static int ri;
++    char *r = ring[ri++ & 1];
++    switch (c) {
++    case TCG_COND_EQ: snprintf(r, 256, "((%s)%s == (%s)%s)", u, a, u, b); break;
++    case TCG_COND_NE: snprintf(r, 256, "((%s)%s != (%s)%s)", u, a, u, b); break;
++    case TCG_COND_TSTEQ: snprintf(r, 256, "(((%s)%s & (%s)%s) == 0)", u, a, u, b); break;
++    case TCG_COND_TSTNE: snprintf(r, 256, "(((%s)%s & (%s)%s) != 0)", u, a, u, b); break;
++    case TCG_COND_LT: snprintf(r, 256, "((%s)%s < (%s)%s)", s, a, s, b); break;
++    case TCG_COND_GE: snprintf(r, 256, "((%s)%s >= (%s)%s)", s, a, s, b); break;
++    case TCG_COND_GT: snprintf(r, 256, "((%s)%s > (%s)%s)", s, a, s, b); break;
++    case TCG_COND_LE: snprintf(r, 256, "((%s)%s <= (%s)%s)", s, a, s, b); break;
++    case TCG_COND_LTU: snprintf(r, 256, "((%s)%s < (%s)%s)", u, a, u, b); break;
++    case TCG_COND_GEU: snprintf(r, 256, "((%s)%s >= (%s)%s)", u, a, u, b); break;
++    case TCG_COND_GTU: snprintf(r, 256, "((%s)%s > (%s)%s)", u, a, u, b); break;
++    case TCG_COND_LEU: snprintf(r, 256, "((%s)%s <= (%s)%s)", u, a, u, b); break;
++    default:
++        aot_failf(e, "vector condition %d", c);
++        return "0";
++    }
++    return r;
++}
++
++static void aot_emit_vec(AotEmit *e, TCGOp *op)
++{
++    TCGOpcode c = op->opc;
++    TCGType t = TCGOP_TYPE(op);
++    unsigned vece = TCGOP_VECE(op);
++    const char *vt = aot_ctype(t);
++    char u[16], s[16];
++    int bits, n;
++    GString *o = e->o;
++
++    if (!aot_vbytes(t)) {
++        aot_failf(e, "vector type %d", t);
++        return;
++    }
++    aot_lanes(t, vece, u, s, &bits, &n);
++#define A(i) aot_t(e, op->args[i])
++    switch (c) {
++    case INDEX_op_mov_vec:
++        g_string_append_printf(o, " %s = %s;", A(0), A(1));
++        break;
++    case INDEX_op_dup_vec: {
++        TCGTemp *src = arg_temp(op->args[1]);
++        g_string_append_printf(o, " { %s _x = (%s)", vt, vt);
++        g_string_append_printf(o, "(%s){", u);
++        for (int i = 0; i < n; i++) {
++            g_string_append_printf(o, "%s(uint%d_t)%s", i ? "," : "", bits, A(1));
++        }
++        g_string_append_printf(o, "}; %s = _x; }", A(0));
++        (void)src;
++        break;
++    }
++    case INDEX_op_dupm_vec:
++        g_string_append_printf(o, " { uint%d_t _l; __builtin_memcpy(&_l, %s + %" PRId64 ", %d);"
++                               " %s = (%s)(%s){", bits, aot_base(e, op->args[1]),
++                               (int64_t)op->args[2], bits / 8, A(0), vt, u);
++        for (int i = 0; i < n; i++) {
++            g_string_append_printf(o, "%s_l", i ? "," : "");
++        }
++        g_string_append(o, "}; }");
++        break;
++    case INDEX_op_ld_vec:
++        g_string_append_printf(o, " __builtin_memcpy(&%s, %s + %" PRId64 ", %d);", A(0),
++                               aot_base(e, op->args[1]), (int64_t)op->args[2], aot_vbytes(t));
++        break;
++    case INDEX_op_st_vec:
++        g_string_append_printf(o, " { %s _v = %s; __builtin_memcpy(%s + %" PRId64 ", &_v, %d); }",
++                               vt, A(0), aot_base(e, op->args[1]), (int64_t)op->args[2],
++                               aot_vbytes(t));
++        break;
++    case INDEX_op_and_vec: g_string_append_printf(o, " %s = %s & %s;", A(0), A(1), A(2)); break;
++    case INDEX_op_or_vec: g_string_append_printf(o, " %s = %s | %s;", A(0), A(1), A(2)); break;
++    case INDEX_op_xor_vec: g_string_append_printf(o, " %s = %s ^ %s;", A(0), A(1), A(2)); break;
++    case INDEX_op_andc_vec: g_string_append_printf(o, " %s = %s & ~%s;", A(0), A(1), A(2)); break;
++    case INDEX_op_orc_vec: g_string_append_printf(o, " %s = %s | ~%s;", A(0), A(1), A(2)); break;
++    case INDEX_op_nand_vec: g_string_append_printf(o, " %s = ~(%s & %s);", A(0), A(1), A(2)); break;
++    case INDEX_op_nor_vec: g_string_append_printf(o, " %s = ~(%s | %s);", A(0), A(1), A(2)); break;
++    case INDEX_op_eqv_vec: g_string_append_printf(o, " %s = ~(%s ^ %s);", A(0), A(1), A(2)); break;
++    case INDEX_op_not_vec: g_string_append_printf(o, " %s = ~%s;", A(0), A(1)); break;
++    case INDEX_op_add_vec:
++        g_string_append_printf(o, " %s = (%s)((%s)%s + (%s)%s);", A(0), vt, u, A(1), u, A(2));
++        break;
++    case INDEX_op_sub_vec:
++        g_string_append_printf(o, " %s = (%s)((%s)%s - (%s)%s);", A(0), vt, u, A(1), u, A(2));
++        break;
++    case INDEX_op_mul_vec:
++        g_string_append_printf(o, " %s = (%s)((%s)%s * (%s)%s);", A(0), vt, u, A(1), u, A(2));
++        break;
++    case INDEX_op_neg_vec:
++        g_string_append_printf(o, " %s = (%s)(-(%s)%s);", A(0), vt, u, A(1));
++        break;
++    case INDEX_op_abs_vec:
++        g_string_append_printf(o, " %s = (%s)__builtin_elementwise_abs((%s)%s);", A(0), vt, s, A(1));
++        break;
++    case INDEX_op_ssadd_vec:
++        g_string_append_printf(o, " %s = (%s)__builtin_elementwise_add_sat((%s)%s, (%s)%s);",
++                               A(0), vt, s, A(1), s, A(2));
++        break;
++    case INDEX_op_usadd_vec:
++        g_string_append_printf(o, " %s = (%s)__builtin_elementwise_add_sat((%s)%s, (%s)%s);",
++                               A(0), vt, u, A(1), u, A(2));
++        break;
++    case INDEX_op_sssub_vec:
++        g_string_append_printf(o, " %s = (%s)__builtin_elementwise_sub_sat((%s)%s, (%s)%s);",
++                               A(0), vt, s, A(1), s, A(2));
++        break;
++    case INDEX_op_ussub_vec:
++        g_string_append_printf(o, " %s = (%s)__builtin_elementwise_sub_sat((%s)%s, (%s)%s);",
++                               A(0), vt, u, A(1), u, A(2));
++        break;
++    case INDEX_op_smin_vec:
++        g_string_append_printf(o, " %s = (%s)__builtin_elementwise_min((%s)%s, (%s)%s);",
++                               A(0), vt, s, A(1), s, A(2));
++        break;
++    case INDEX_op_umin_vec:
++        g_string_append_printf(o, " %s = (%s)__builtin_elementwise_min((%s)%s, (%s)%s);",
++                               A(0), vt, u, A(1), u, A(2));
++        break;
++    case INDEX_op_smax_vec:
++        g_string_append_printf(o, " %s = (%s)__builtin_elementwise_max((%s)%s, (%s)%s);",
++                               A(0), vt, s, A(1), s, A(2));
++        break;
++    case INDEX_op_umax_vec:
++        g_string_append_printf(o, " %s = (%s)__builtin_elementwise_max((%s)%s, (%s)%s);",
++                               A(0), vt, u, A(1), u, A(2));
++        break;
++    case INDEX_op_shli_vec:
++        g_string_append_printf(o, " %s = (%s)((%s)%s << %d);", A(0), vt, u, A(1),
++                               (int)(op->args[2] & (bits - 1)));
++        break;
++    case INDEX_op_shri_vec:
++        g_string_append_printf(o, " %s = (%s)((%s)%s >> %d);", A(0), vt, u, A(1),
++                               (int)(op->args[2] & (bits - 1)));
++        break;
++    case INDEX_op_sari_vec:
++        g_string_append_printf(o, " %s = (%s)((%s)%s >> %d);", A(0), vt, s, A(1),
++                               (int)(op->args[2] & (bits - 1)));
++        break;
++    case INDEX_op_rotli_vec: {
++        int k = op->args[2] & (bits - 1);
++        if (k == 0) {
++            g_string_append_printf(o, " %s = %s;", A(0), A(1));
++        } else {
++            g_string_append_printf(o, " %s = (%s)(((%s)%s << %d) | ((%s)%s >> %d));", A(0), vt,
++                                   u, A(1), k, u, A(1), bits - k);
++        }
++        break;
++    }
++    case INDEX_op_shls_vec:
++        g_string_append_printf(o, " %s = (%s)((%s)%s << (uint%d_t)(%s & %d));", A(0), vt, u, A(1),
++                               bits, A(2), bits - 1);
++        break;
++    case INDEX_op_shrs_vec:
++        g_string_append_printf(o, " %s = (%s)((%s)%s >> (uint%d_t)(%s & %d));", A(0), vt, u, A(1),
++                               bits, A(2), bits - 1);
++        break;
++    case INDEX_op_sars_vec:
++        g_string_append_printf(o, " %s = (%s)((%s)%s >> (int%d_t)(%s & %d));", A(0), vt, s, A(1),
++                               bits, A(2), bits - 1);
++        break;
++    case INDEX_op_rotls_vec:
++        g_string_append_printf(o, " { uint%d_t _k = %s & %d; %s = _k ? (%s)(((%s)%s << _k) |"
++                               " ((%s)%s >> (uint%d_t)(%d - _k))) : %s; }", bits, A(2), bits - 1,
++                               A(0), vt, u, A(1), u, A(1), bits, bits, A(1));
++        break;
++    case INDEX_op_shlv_vec:
++        g_string_append_printf(o, " %s = (%s)((%s)%s << ((%s)%s & %d));", A(0), vt, u, A(1), u,
++                               A(2), bits - 1);
++        break;
++    case INDEX_op_shrv_vec:
++        g_string_append_printf(o, " %s = (%s)((%s)%s >> ((%s)%s & %d));", A(0), vt, u, A(1), u,
++                               A(2), bits - 1);
++        break;
++    case INDEX_op_sarv_vec:
++        g_string_append_printf(o, " %s = (%s)((%s)%s >> ((%s)%s & %d));", A(0), vt, s, A(1), s,
++                               A(2), bits - 1);
++        break;
++    case INDEX_op_rotlv_vec:
++    case INDEX_op_rotrv_vec: {
++        bool left = c == INDEX_op_rotlv_vec;
++        g_string_append_printf(o, " { %s _k = (%s)%s & %d, _a = (%s)%s;"
++                               " %s = (%s)((_a %s _k) | (_a %s ((%d - _k) & %d))); }",
++                               u, u, A(2), bits - 1, u, A(1), A(0), vt, left ? "<<" : ">>",
++                               left ? ">>" : "<<", bits, bits - 1);
++        break;
++    }
++    case INDEX_op_cmp_vec:
++        g_string_append_printf(o, " %s = (%s)%s;", A(0), vt,
++                               aot_vcond(e, op->args[3], u, s, A(1), A(2)));
++        break;
++    case INDEX_op_bitsel_vec:
++        g_string_append_printf(o, " %s = (%s & %s) | (%s & ~%s);", A(0), A(2), A(1), A(3), A(1));
++        break;
++    case INDEX_op_cmpsel_vec:
++        g_string_append_printf(o, " { %s _m = (%s)%s; %s = (%s & _m) | (%s & ~_m); }", vt, vt,
++                               aot_vcond(e, op->args[5], u, s, A(1), A(2)), A(0), A(3), A(4));
++        break;
++    default:
++        aot_failf(e, "op %s", tcg_op_defs[c].name);
++        break;
++    }
++#undef A
++}
++
++/* x87 ops on host SSE (xemu's hard FPU), as tcg/i386/tcg-target.c.inc emits them. */
++static void aot_emit_fp(AotEmit *e, TCGOp *op)
++{
++    TCGOpcode c = op->opc;
++    GString *o = e->o;
++#define A(i) aot_t(e, op->args[i])
++    switch (c) {
++    case INDEX_op_flcr:
++        g_string_append_printf(o, " AOT_SETCSR(%s);", A(0));
++        e->x87_csr_set = 1;
++        break;
++    case INDEX_op_ld80f_f32:
++        g_string_append_printf(o, " %s = AOT_LD80_F32(%s);", A(0), aot_base(e, op->args[1]));
++        break;
++    case INDEX_op_ld80f_f64:
++        g_string_append_printf(o, " %s = AOT_LD80_F64(%s);", A(0), aot_base(e, op->args[1]));
++        break;
++    case INDEX_op_st80f_f32:
++    case INDEX_op_st80f_f64:
++        g_string_append_printf(o, " AOT_ST80(%s, %s);", aot_base(e, op->args[1]), A(0));
++        break;
++    case INDEX_op_abs_f32: g_string_append_printf(o, " %s = __builtin_fabsf(%s);", A(0), A(1)); break;
++    case INDEX_op_abs_f64: g_string_append_printf(o, " %s = __builtin_fabs(%s);", A(0), A(1)); break;
++    case INDEX_op_chs_f32: case INDEX_op_chs_f64:
++        g_string_append_printf(o, " %s = -%s;", A(0), A(1));
++        break;
++    case INDEX_op_add_f32: case INDEX_op_add_f64:
++        g_string_append_printf(o, " %s = %s + %s;", A(0), A(1), A(2));
++        break;
++    case INDEX_op_sub_f32: case INDEX_op_sub_f64:
++        g_string_append_printf(o, " %s = %s - %s;", A(0), A(1), A(2));
++        break;
++    case INDEX_op_mul_f32: case INDEX_op_mul_f64:
++        g_string_append_printf(o, " %s = %s * %s;", A(0), A(1), A(2));
++        break;
++    case INDEX_op_div_f32: case INDEX_op_div_f64:
++        g_string_append_printf(o, " %s = %s / %s;", A(0), A(1), A(2));
++        break;
++    case INDEX_op_sqrt_f32:
++        g_string_append_printf(o, " %s = __builtin_sqrtf(%s);", A(0), A(1));
++        break;
++    case INDEX_op_sqrt_f64:
++        g_string_append_printf(o, " %s = __builtin_sqrt(%s);", A(0), A(1));
++        break;
++    case INDEX_op_com_f32:
++        g_string_append_printf(o, " %s = AOT_COMISS(%s, %s);", A(0), A(1), A(2));
++        break;
++    case INDEX_op_com_f64:
++        g_string_append_printf(o, " %s = AOT_COMISD(%s, %s);", A(0), A(1), A(2));
++        break;
++    case INDEX_op_sin_f32: g_string_append_printf(o, " %s = AOT_FSIN32(%s);", A(0), A(1)); break;
++    case INDEX_op_sin_f64: g_string_append_printf(o, " %s = AOT_FSIN64(%s);", A(0), A(1)); break;
++    case INDEX_op_cos_f32: g_string_append_printf(o, " %s = AOT_FCOS32(%s);", A(0), A(1)); break;
++    case INDEX_op_cos_f64: g_string_append_printf(o, " %s = AOT_FCOS64(%s);", A(0), A(1)); break;
++    case INDEX_op_cvt32f_f64: g_string_append_printf(o, " %s = (double)%s;", A(0), A(1)); break;
++    case INDEX_op_cvt64f_f32: g_string_append_printf(o, " %s = (float)%s;", A(0), A(1)); break;
++    case INDEX_op_cvt32f_i32: g_string_append_printf(o, " %s = AOT_CVTSS2SI(%s);", A(0), A(1)); break;
++    case INDEX_op_cvt32f_i64: g_string_append_printf(o, " %s = AOT_CVTSS2SI64(%s);", A(0), A(1)); break;
++    case INDEX_op_cvt64f_i32: g_string_append_printf(o, " %s = AOT_CVTSD2SI(%s);", A(0), A(1)); break;
++    case INDEX_op_cvt64f_i64: g_string_append_printf(o, " %s = AOT_CVTSD2SI64(%s);", A(0), A(1)); break;
++    case INDEX_op_cvt32i_f32: g_string_append_printf(o, " %s = (float)(int32_t)%s;", A(0), A(1)); break;
++    case INDEX_op_cvt32i_f64: g_string_append_printf(o, " %s = (double)(int32_t)%s;", A(0), A(1)); break;
++    case INDEX_op_cvt64i_f32: g_string_append_printf(o, " %s = (float)(int64_t)%s;", A(0), A(1)); break;
++    case INDEX_op_cvt64i_f64: g_string_append_printf(o, " %s = (double)(int64_t)%s;", A(0), A(1)); break;
++    case INDEX_op_mov32f_i32: g_string_append_printf(o, " %s = AOT_F2U(%s);", A(0), A(1)); break;
++    case INDEX_op_mov32i_f32: g_string_append_printf(o, " %s = AOT_U2F(%s);", A(0), A(1)); break;
++    case INDEX_op_mov64f_i64: g_string_append_printf(o, " %s = AOT_D2U(%s);", A(0), A(1)); break;
++    case INDEX_op_mov64i_f64: g_string_append_printf(o, " %s = AOT_U2D(%s);", A(0), A(1)); break;
++    case INDEX_op_mov_f32: case INDEX_op_mov_f64:
++        g_string_append_printf(o, " %s = %s;", A(0), A(1));
++        break;
++    default:
++        aot_failf(e, "op %s", tcg_op_defs[c].name);
++        break;
++    }
++#undef A
++}
++
++static void aot_emit_qemu_ldst(AotEmit *e, TCGOp *op)
++{
++    TCGOpcode c = op->opc;
++    bool is_ld = c == INDEX_op_qemu_ld || c == INDEX_op_qemu_ld2;
++    bool pair = c == INDEX_op_qemu_ld2 || c == INDEX_op_qemu_st2;
++    int nout = is_ld ? (pair ? 2 : 1) : 0;
++    int nin = is_ld ? 1 : (pair ? 3 : 2);
++    MemOpIdx oi = op->args[nout + nin];
++    MemOp mop = get_memop(oi);
++    unsigned mmu = get_mmuidx(oi);
++    MemOp size = mop & MO_SIZE;
++    TCGAtomAlign aa;
++    unsigned a_mask, s_mask;
++    uint32_t cmp_mask, adj;
++    int fast_ofs;
++    const char *addr = aot_t(e, op->args[is_ld ? nout : nin - 1]);
++
++    if (mop & MO_BSWAP) {
++        aot_failf(e, "big-endian access");
++        return;
++    }
++    if (e->s->addr_type != TCG_TYPE_I32) {
++        aot_failf(e, "64-bit guest addresses");
++        return;
++    }
++    aa = atom_and_align_for_opc(e->s, mop, MO_ATOM_IFALIGN, size == MO_128);
++    a_mask = (1u << aa.align) - 1;
++    s_mask = (1u << size) - 1;
++    cmp_mask = (uint32_t)TARGET_PAGE_MASK | a_mask;
++    adj = a_mask >= s_mask ? 0 : s_mask - a_mask;
++    fast_ofs = tlb_mask_table_ofs(e->s, mmu);
++
++    /* the slow path makes env current (MMIO, a fault's longjmp) and names the insn */
++    if (is_ld) {
++        TCGType t = arg_temp(op->args[0])->type;
++        if (pair) {
++            g_string_append_printf(e->o, " AOT_LD128(%s, %s, %s, %d, %uu, 0x%xu, %u, 0x%" PRIx64
++                                   "u, %d);", aot_t(e, op->args[0]), aot_t(e, op->args[1]), addr,
++                                   fast_ofs, adj, cmp_mask, (unsigned)oi, e->cur_pc, e->cur_cc);
++        } else {
++            static const char *ext[] = { "uint8_t", "uint16_t", "uint32_t", "uint64_t" };
++            static const char *sext[] = { "int8_t", "int16_t", "int32_t", "int64_t" };
++            g_string_append_printf(e->o, " AOT_LD(%s, %s, %s, %d, %s, %d, %uu, 0x%xu, %u, 0x%"
++                                   PRIx64 "u, %d);", aot_t(e, op->args[0]), aot_ctype(t), addr,
++                                   1 << size, (mop & MO_SIGN) ? sext[size] : ext[size], fast_ofs,
++                                   adj, cmp_mask, (unsigned)oi, e->cur_pc, e->cur_cc);
++        }
++    } else {
++        if (pair) {
++            g_string_append_printf(e->o, " AOT_ST128(%s, %s, %s, %d, %uu, 0x%xu, %u, 0x%" PRIx64
++                                   "u, %d);", aot_t(e, op->args[0]), aot_t(e, op->args[1]), addr,
++                                   fast_ofs, adj, cmp_mask, (unsigned)oi, e->cur_pc, e->cur_cc);
++        } else {
++            static const char *st[] = { "uint8_t", "uint16_t", "uint32_t", "uint64_t" };
++            g_string_append_printf(e->o, " AOT_ST(%s, %s, %d, %s, %d, %uu, 0x%xu, %u, 0x%" PRIx64
++                                   "u, %d);", aot_t(e, op->args[0]), addr, 1 << size, st[size],
++                                   fast_ofs, adj, cmp_mask, (unsigned)oi, e->cur_pc, e->cur_cc);
++        }
++    }
++}
++
++static void aot_emit_call(AotEmit *e, TCGOp *op)
++{
++    const TCGHelperInfo *info = tcg_call_info(op);
++    void *func = tcg_call_func(op);
++    int nb_oargs = TCGOP_CALLO(op), nb_iargs = TCGOP_CALLI(op);
++    unsigned flags = info->flags;
++    unsigned tm = info->typemask;
++    static const char *ctypes[8] = { "void", "void", "uint32_t", "int32_t", "uint64_t",
++                                     "int64_t", "uintptr_t", NULL };
++    const char *rt;
++    int nargs = 0;
++    GString *o = e->o;
++
++    if (func != info->func || !info->name) {
++        aot_failf(e, "call to a plugin");
++        return;
++    }
++    if (!strcmp(info->name, "lookup_tb_ptr")) {
++        /* the goto_ptr that follows becomes the translated code's own lookup */
++        e->lookup_ptr = arg_temp(op->args[0]);
++        e->lookup_pending = true;
++        return;
++    }
++    if (nb_oargs > 1) {
++        aot_failf(e, "helper %s returns two values", info->name);
++        return;
++    }
++    for (int i = 1; i < 8 && (tm >> (3 * i)) & 7; i++) {
++        if (!ctypes[(tm >> (3 * i)) & 7]) {
++            aot_failf(e, "helper %s takes Int128", info->name);
++            return;
++        }
++        nargs++;
++    }
++    if (nargs != nb_iargs) {
++        aot_failf(e, "helper %s: %d args, op has %d", info->name, nargs, nb_iargs);
++        return;
++    }
++    rt = ctypes[tm & 7];
++    if (!rt) {
++        aot_failf(e, "helper %s returns Int128", info->name);
++        return;
++    }
++
++    if (!(flags & TCG_CALL_NO_READ_GLOBALS)) {
++        aot_cur(e);
++        aot_sync(e, false);
++    }
++    g_string_append_printf(o, " ");
++    if (nb_oargs) {
++        g_string_append_printf(o, "%s = (%s)", aot_t(e, op->args[0]),
++                               aot_ctype(arg_temp(op->args[0])->type));
++    }
++    g_string_append_printf(o, "((%s (*)(", rt);
++    for (int i = 0; i < nargs; i++) {
++        g_string_append_printf(o, "%s%s", i ? ", " : "", ctypes[(tm >> (3 * (i + 1))) & 7]);
++    }
++    if (!nargs) {
++        g_string_append(o, "void");
++    }
++    g_string_append_printf(o, "))AOT_H(%s))(", info->name);
++    for (int i = 0; i < nargs; i++) {
++        unsigned tc = (tm >> (3 * (i + 1))) & 7;
++        g_string_append_printf(o, "%s(%s)%s", i ? ", " : "", ctypes[tc],
++                               aot_t(e, op->args[nb_oargs + i]));
++    }
++    g_string_append(o, ");");
++    if (flags & TCG_CALL_NO_RETURN) {
++        g_string_append(o, " __builtin_unreachable();");
++        return;
++    }
++    if (!(flags & (TCG_CALL_NO_READ_GLOBALS | TCG_CALL_NO_WRITE_GLOBALS))) {
++        aot_reload(e);
++        e->x87_csr_set = 0;
++    }
++}
++
++/* A branch to a label: remember eip's static value there. */
++static void aot_lab_note(AotEmit *e, int id)
++{
++    if (id < 0 || id > e->nb_labels) {
++        return;
++    }
++    if (!e->eip_known) {
++        e->lab_seen[id] = -1;
++    } else if (e->lab_seen[id] == 0) {
++        e->lab_seen[id] = 1;
++        e->lab_val[id] = e->eip_val;
++    } else if (e->lab_seen[id] == 1 && e->lab_val[id] != e->eip_val) {
++        e->lab_seen[id] = -1;
++    }
++}
++
++/* Before a jump to another block: the globals that are not parameters go to env. */
++static void aot_sync_np(AotEmit *e)
++{
++    for (int i = 0; i < e->nb_temps; i++) {
++        TCGTemp *ts = &e->s->temps[i];
++        if (ts->kind != TEMP_GLOBAL || e->passed[i] || ts == e->eip || !e->dirty[i]) {
++            continue;
++        }
++        g_string_append_printf(e->o, " AOT_ST_%s(%" PRIdPTR ", g_%s);",
++                               ts->type == TCG_TYPE_I32 ? "I32" : "I64",
++                               ts->mem_offset, ts->name);
++        e->dirty[i] = 0;
++    }
++}
++
++/*
++ * A jump to the block at eip. Where eip is known here the target is named (the build
++ * makes it a tail call to that block's function, still checked against eip at run
++ * time); otherwise the translated code looks eip up in its own table.
++ */
++static void aot_emit_jump(AotEmit *e)
++{
++    if (e->eip_known) {
++        g_string_append_printf(e->o, " AOT_GOTO_PC(0x%08" PRIx32 "u);", e->eip_val);
++    } else {
++        g_string_append(e->o, " AOT_IND();");
++    }
++}
++
++/* After each op: globals it wrote, eip's static value, whether control falls through. */
++static void aot_after_op(AotEmit *e, TCGOp *op)
++{
++    TCGOpcode c = op->opc;
++    const TCGOpDef *def = &tcg_op_defs[c];
++    int no = c == INDEX_op_call ? TCGOP_CALLO(op) : def->nb_oargs;
++    bool wrote_eip = false;
++
++    if (c == INDEX_op_discard) {
++        no = 0;
++    }
++    for (int i = 0; i < no; i++) {
++        TCGTemp *ts = arg_temp(op->args[i]);
++        if (ts->kind == TEMP_GLOBAL) {
++            e->dirty[temp_idx(ts)] = 1;
++            if (ts == e->eip) {
++                wrote_eip = true;
++            }
++        }
++    }
++    if (wrote_eip) {
++        TCGTemp *a1 = def->nb_iargs >= 1 ? arg_temp(op->args[no]) : NULL;
++        TCGTemp *a2 = def->nb_iargs >= 2 ? arg_temp(op->args[no + 1]) : NULL;
++        if (c == INDEX_op_mov && a1 && a1->kind == TEMP_CONST) {
++            e->eip_known = true;
++            e->eip_val = (uint32_t)a1->val;
++        } else if (e->eip_known && a1 == e->eip && a2 && a2->kind == TEMP_CONST &&
++                   (c == INDEX_op_add || c == INDEX_op_sub || c == INDEX_op_and)) {
++            uint32_t v = (uint32_t)a2->val;
++            e->eip_val = c == INDEX_op_add ? e->eip_val + v :
++                         c == INDEX_op_sub ? e->eip_val - v : e->eip_val & v;
++        } else {
++            e->eip_known = false;
++        }
++    }
++    e->flow_ends = c == INDEX_op_br || c == INDEX_op_exit_tb || c == INDEX_op_goto_ptr ||
++                   (c == INDEX_op_call && (tcg_call_flags(op) & TCG_CALL_NO_RETURN));
++}
++
++/* The ops of the current TB as the body of a C function; false (and *why) if it can't be. */
++bool tcg_aot_emit_tb(TCGContext *s, const TranslationBlock *tb, uint64_t pc, GString *out,
++                     const char **why)
++{
++    AotEmit e = { .s = s, .tb_pc = pc, .cur_pc = pc, .cur_cc = -1 };
++    TCGOp *op;
++    GString *body = g_string_sized_new(4096);
++    static char whybuf[96];
++    int n = s->nb_temps;
++
++    e.nb_temps = n;
++    e.passed = g_new0(uint8_t, n);
++    e.used = g_new0(uint8_t, n);
++    e.written = g_new0(uint8_t, n);
++    e.dirty = g_new0(uint8_t, n);
++    e.declared = g_new0(uint8_t, n);
++    e.o = body;
++    e.nb_labels = s->nb_labels;
++    e.lab_seen = g_new0(int8_t, e.nb_labels + 1);
++    e.lab_val = g_new0(uint32_t, e.nb_labels + 1);
++    e.eip_known = true;          /* a block is entered with eip == its pc */
++    e.eip_val = (uint32_t)pc;
++
++    for (int i = 0; i < s->nb_globals; i++) {
++        TCGTemp *ts = &s->temps[i];
++        if (ts->kind != TEMP_GLOBAL || !ts->name) {
++            continue;
++        }
++        for (int k = 0; k < ARRAY_SIZE(aot_passed_names); k++) {
++            if (!strcmp(ts->name, aot_passed_names[k])) {
++                e.passed[i] = k + 1;
++            }
++        }
++        if (!strcmp(ts->name, "eip")) {
++            e.eip = ts;
++        }
++    }
++    if (!e.eip) {
++        aot_failf(&e, "no eip global");
++    }
++
++    /* pass 1: what is used and written, and anything unsupported */
++    QTAILQ_FOREACH(op, &s->ops, link) {
++        TCGOpcode c = op->opc;
++        const TCGOpDef *def = &tcg_op_defs[c];
++        int no, ni;
++        if (c == INDEX_op_insn_start || c == INDEX_op_set_label || c == INDEX_op_br ||
++            c == INDEX_op_mb || c == INDEX_op_exit_tb || c == INDEX_op_goto_tb) {
++            continue;
++        }
++        if (c == INDEX_op_call) {
++            no = TCGOP_CALLO(op);
++            ni = TCGOP_CALLI(op);
++        } else {
++            no = def->nb_oargs;
++            ni = def->nb_iargs;
++        }
++        switch (c) {
++        case INDEX_op_plugin_cb: case INDEX_op_plugin_mem_cb:
++        case INDEX_op_brcond2_i32: case INDEX_op_setcond2_i32: case INDEX_op_dup2_vec:
++            aot_failf(&e, "op %s", def->name);
++            break;
++        default:
++            break;
++        }
++        for (int i = 0; i < no + ni; i++) {
++            aot_note_temp(&e, op->args[i], i < no);
++        }
++        if (e.fail) {
++            break;
++        }
++    }
++
++    /* every global the block keeps: passed ones are always there; eip always */
++    for (int i = 0; i < n && !e.fail; i++) {
++        TCGTemp *ts = &s->temps[i];
++        if (ts->kind == TEMP_GLOBAL && (e.passed[i] || ts == e.eip)) {
++            e.used[i] = 1;
++            e.dirty[i] = 1;      /* env is not current at entry (chained from another block) */
++        }
++    }
++
++    /* pass 2: the statements */
++    if (!e.fail) {
++        aot_mark_all_dirty(&e);
++    }
++    QTAILQ_FOREACH(op, &s->ops, link) {
++        TCGOpcode c = op->opc;
++        const TCGOpDef *def = &tcg_op_defs[c];
++        TCGType t;
++        const char *ct, *st;
++        int w;
++        GString *o = body;
++
++        if (e.fail) {
++            break;
++        }
++        if (e.skip_exit_tb && c != INDEX_op_exit_tb) {
++            aot_failf(&e, "goto_tb not followed by exit_tb");
++            break;
++        }
++        t = (def->flags & (TCG_OPF_INT | TCG_OPF_VECTOR)) ? TCGOP_TYPE(op) : TCG_TYPE_I32;
++        ct = aot_ctype(t);
++        st = aot_stype(t);
++        w = aot_bits(t);
++#define A(i) aot_t(&e, op->args[i])
++        if (def->flags & TCG_OPF_VECTOR) {
++            aot_emit_vec(&e, op);
++            g_string_append_c(o, '\n');
++            aot_after_op(&e, op);
++            continue;
++        }
++        if (def->flags & TCG_OPF_FP) {
++            aot_emit_fp(&e, op);
++            g_string_append_c(o, '\n');
++            aot_after_op(&e, op);
++            continue;
++        }
++        if (def->flags & TCG_OPF_INT) {
++            if (t != TCG_TYPE_I32 && t != TCG_TYPE_I64) {
++                aot_failf(&e, "%s of type %d", def->name, t);
++                break;
++            }
++        }
++        switch (c) {
++        case INDEX_op_insn_start: {
++            uint64_t p0 = tcg_get_insn_start_param(op, 0);
++            uint64_t cc = tcg_get_insn_start_param(op, 1);
++            if (tb_cflags(tb) & CF_PCREL) {
++                e.cur_pc = (pc & TARGET_PAGE_MASK) | p0;
++                if (e.cur_pc < pc) {     /* the TB crossed into the next page */
++                    e.cur_pc += TARGET_PAGE_SIZE;
++                }
++            } else {
++                e.cur_pc = p0;
++            }
++            e.cur_cc = (int)cc;
++            e.have_insn = true;
++            g_string_append_printf(o, "/* %08" PRIx64 " */", e.cur_pc);
++            break;
++        }
++        case INDEX_op_discard:
++            break;
++        case INDEX_op_mb:
++            g_string_append(o, " AOT_BARRIER();");
++            break;
++        case INDEX_op_set_label: {
++            int id = arg_label(op->args[0])->id;
++            g_string_append_printf(o, "L%d: ;", id);
++            aot_mark_all_dirty(&e);
++            /* eip where the paths meet: known only if every way in agrees */
++            if (e.flow_ends) {
++                e.eip_known = e.lab_seen[id] == 1;
++                e.eip_val = e.lab_val[id];
++            } else if (e.lab_seen[id] == -1 ||
++                       (e.lab_seen[id] == 1 && (!e.eip_known || e.lab_val[id] != e.eip_val))) {
++                e.eip_known = false;
++            }
++            break;
++        }
++        case INDEX_op_br:
++            aot_lab_note(&e, arg_label(op->args[0])->id);
++            g_string_append_printf(o, " goto L%d;", arg_label(op->args[0])->id);
++            break;
++        case INDEX_op_brcond:
++            aot_lab_note(&e, arg_label(op->args[3])->id);
++            g_string_append_printf(o, " if (%s) goto L%d;",
++                                   aot_cond(&e, op->args[2], t, A(0), A(1)),
++                                   arg_label(op->args[3])->id);
++            break;
++        case INDEX_op_mov:
++            g_string_append_printf(o, " %s = %s;", A(0), A(1));
++            break;
++        case INDEX_op_add: g_string_append_printf(o, " %s = (%s)(%s + %s);", A(0), ct, A(1), A(2)); break;
++        case INDEX_op_sub: g_string_append_printf(o, " %s = (%s)(%s - %s);", A(0), ct, A(1), A(2)); break;
++        case INDEX_op_mul: g_string_append_printf(o, " %s = (%s)(%s * %s);", A(0), ct, A(1), A(2)); break;
++        case INDEX_op_and: g_string_append_printf(o, " %s = %s & %s;", A(0), A(1), A(2)); break;
++        case INDEX_op_or: g_string_append_printf(o, " %s = %s | %s;", A(0), A(1), A(2)); break;
++        case INDEX_op_xor: g_string_append_printf(o, " %s = %s ^ %s;", A(0), A(1), A(2)); break;
++        case INDEX_op_andc: g_string_append_printf(o, " %s = %s & ~%s;", A(0), A(1), A(2)); break;
++        case INDEX_op_orc: g_string_append_printf(o, " %s = %s | ~%s;", A(0), A(1), A(2)); break;
++        case INDEX_op_eqv: g_string_append_printf(o, " %s = ~(%s ^ %s);", A(0), A(1), A(2)); break;
++        case INDEX_op_nand: g_string_append_printf(o, " %s = ~(%s & %s);", A(0), A(1), A(2)); break;
++        case INDEX_op_nor: g_string_append_printf(o, " %s = ~(%s | %s);", A(0), A(1), A(2)); break;
++        case INDEX_op_not: g_string_append_printf(o, " %s = ~%s;", A(0), A(1)); break;
++        case INDEX_op_neg: g_string_append_printf(o, " %s = (%s)(0 - %s);", A(0), ct, A(1)); break;
++        case INDEX_op_shl:
++            g_string_append_printf(o, " %s = (%s)(%s << (%s & %d));", A(0), ct, A(1), A(2), w - 1);
++            break;
++        case INDEX_op_shr:
++            g_string_append_printf(o, " %s = %s >> (%s & %d);", A(0), A(1), A(2), w - 1);
++            break;
++        case INDEX_op_sar:
++            g_string_append_printf(o, " %s = (%s)((%s)%s >> (%s & %d));", A(0), ct, st, A(1), A(2),
++                                   w - 1);
++            break;
++        case INDEX_op_rotl:
++            g_string_append_printf(o, " %s = AOT_ROTL%d(%s, %s);", A(0), w, A(1), A(2));
++            break;
++        case INDEX_op_rotr:
++            g_string_append_printf(o, " %s = AOT_ROTR%d(%s, %s);", A(0), w, A(1), A(2));
++            break;
++        case INDEX_op_clz:
++            g_string_append_printf(o, " %s = %s ? (%s)__builtin_clz%s(%s) : %s;", A(0), A(1), ct,
++                                   w == 64 ? "ll" : "", A(1), A(2));
++            break;
++        case INDEX_op_ctz:
++            g_string_append_printf(o, " %s = %s ? (%s)__builtin_ctz%s(%s) : %s;", A(0), A(1), ct,
++                                   w == 64 ? "ll" : "", A(1), A(2));
++            break;
++        case INDEX_op_ctpop:
++            g_string_append_printf(o, " %s = (%s)__builtin_popcount%s(%s);", A(0), ct,
++                                   w == 64 ? "ll" : "", A(1));
++            break;
++        case INDEX_op_bswap16: {
++            unsigned f = op->args[2];
++            g_string_append_printf(o, " %s = (%s)%s(uint16_t)__builtin_bswap16((uint16_t)%s);",
++                                   A(0), ct, (f & TCG_BSWAP_OS) ? "(int16_t)" : "", A(1));
++            break;
++        }
++        case INDEX_op_bswap32: {
++            unsigned f = op->args[2];
++            g_string_append_printf(o, " %s = (%s)%s__builtin_bswap32((uint32_t)%s);", A(0), ct,
++                                   (f & TCG_BSWAP_OS) ? "(int32_t)" : "", A(1));
++            break;
++        }
++        case INDEX_op_bswap64:
++            g_string_append_printf(o, " %s = __builtin_bswap64(%s);", A(0), A(1));
++            break;
++        case INDEX_op_deposit: {
++            unsigned pos = op->args[3], len = op->args[4];
++            uint64_t m = len >= 64 ? ~0ull : (1ull << len) - 1;
++            if (w == 32) {
++                m &= 0xffffffffull;
++            }
++            g_string_append_printf(o, " %s = (%s)((%s & ~((%s)0x%" PRIx64 "ull << %u)) |"
++                                   " (((%s)%s & 0x%" PRIx64 "ull) << %u));", A(0), ct, A(1), ct, m,
++                                   pos, ct, A(2), m, pos);
++            break;
++        }
++        case INDEX_op_extract: {
++            unsigned pos = op->args[2], len = op->args[3];
++            uint64_t m = len >= 64 ? ~0ull : (1ull << len) - 1;
++            g_string_append_printf(o, " %s = (%s)((%s >> %u) & 0x%" PRIx64 "ull);", A(0), ct, A(1),
++                                   pos, m);
++            break;
++        }
++        case INDEX_op_sextract: {
++            unsigned pos = op->args[2], len = op->args[3];
++            g_string_append_printf(o, " %s = (%s)((%s)(%s << %u) >> %u);", A(0), ct, st, A(1),
++                                   w - pos - len, w - len);
++            break;
++        }
++        case INDEX_op_extract2: {
++            unsigned pos = op->args[3];
++            if (pos == 0) {
++                g_string_append_printf(o, " %s = %s;", A(0), A(1));
++            } else {
++                g_string_append_printf(o, " %s = (%s)((%s >> %u) | (%s << %u));", A(0), ct, A(1),
++                                       pos, A(2), w - pos);
++            }
++            break;
++        }
++        case INDEX_op_divs:
++            g_string_append_printf(o, " %s = (%s)((%s)%s / (%s)%s);", A(0), ct, st, A(1), st, A(2));
++            break;
++        case INDEX_op_divu:
++            g_string_append_printf(o, " %s = %s / %s;", A(0), A(1), A(2));
++            break;
++        case INDEX_op_rems:
++            g_string_append_printf(o, " %s = (%s)((%s)%s %% (%s)%s);", A(0), ct, st, A(1), st, A(2));
++            break;
++        case INDEX_op_remu:
++            g_string_append_printf(o, " %s = %s %% %s;", A(0), A(1), A(2));
++            break;
++        case INDEX_op_divs2:
++        case INDEX_op_divu2: {
++            bool sg = c == INDEX_op_divs2;
++            const char *wide = w == 32 ? (sg ? "int64_t" : "uint64_t")
++                                       : (sg ? "__int128" : "unsigned __int128");
++            const char *nt = w == 32 ? (sg ? "int32_t" : "uint32_t") : (sg ? "int64_t" : "uint64_t");
++            g_string_append_printf(o, " { %s _n = ((%s)(%s)%s << %d) | %s; %s _d = (%s)%s;"
++                                   " %s = (%s)(_n / _d); %s = (%s)(_n %% _d); }",
++                                   wide, wide, nt, A(3), w, A(2), wide, nt, A(4), A(0), ct, A(1), ct);
++            break;
++        }
++        case INDEX_op_mulu2:
++        case INDEX_op_muls2: {
++            bool sg = c == INDEX_op_muls2;
++            const char *wide = w == 32 ? (sg ? "int64_t" : "uint64_t")
++                                       : (sg ? "__int128" : "unsigned __int128");
++            g_string_append_printf(o, " { %s _p = (%s)(%s)%s * (%s)(%s)%s; %s = (%s)_p;"
++                                   " %s = (%s)((unsigned __int128)_p >> %d); }",
++                                   wide, wide, sg ? st : ct, A(2), wide, sg ? st : ct, A(3), A(0),
++                                   ct, A(1), ct, w);
++            break;
++        }
++        case INDEX_op_muluh:
++        case INDEX_op_mulsh: {
++            bool sg = c == INDEX_op_mulsh;
++            const char *wide = w == 32 ? (sg ? "int64_t" : "uint64_t")
++                                       : (sg ? "__int128" : "unsigned __int128");
++            g_string_append_printf(o, " %s = (%s)(((%s)(%s)%s * (%s)(%s)%s) >> %d);", A(0), ct,
++                                   wide, sg ? st : ct, A(1), wide, sg ? st : ct, A(2), w);
++            break;
++        }
++        case INDEX_op_setcond:
++            g_string_append_printf(o, " %s = (%s)%s;", A(0), ct,
++                                   aot_cond(&e, op->args[3], t, A(1), A(2)));
++            break;
++        case INDEX_op_negsetcond:
++            g_string_append_printf(o, " %s = (%s)(0 - (%s)%s);", A(0), ct, ct,
++                                   aot_cond(&e, op->args[3], t, A(1), A(2)));
++            break;
++        case INDEX_op_movcond:
++            g_string_append_printf(o, " %s = %s ? %s : %s;", A(0),
++                                   aot_cond(&e, op->args[5], t, A(1), A(2)), A(3), A(4));
++            break;
++        case INDEX_op_addco:
++            g_string_append_printf(o, " { %s _r = %s + %s; aot_c = _r < %s; %s = _r; }", ct, A(1),
++                                   A(2), A(1), A(0));
++            break;
++        case INDEX_op_addci:
++            g_string_append_printf(o, " %s = (%s)(%s + %s + (%s)aot_c);", A(0), ct, A(1), A(2), ct);
++            break;
++        case INDEX_op_addcio:
++            g_string_append_printf(o, " { %s _s = %s + %s, _r = _s + (%s)aot_c;"
++                                   " aot_c = (_s < %s) | (_r < _s); %s = _r; }",
++                                   ct, A(1), A(2), ct, A(1), A(0));
++            break;
++        case INDEX_op_addc1o:
++            g_string_append_printf(o, " { %s _r = %s + %s + 1; aot_c = _r <= %s; %s = _r; }", ct,
++                                   A(1), A(2), A(1), A(0));
++            break;
++        case INDEX_op_subbo:
++            g_string_append_printf(o, " { %s _r = %s - %s; aot_c = %s < %s; %s = _r; }", ct, A(1),
++                                   A(2), A(1), A(2), A(0));
++            break;
++        case INDEX_op_subbi:
++            g_string_append_printf(o, " %s = (%s)(%s - %s - (%s)aot_c);", A(0), ct, A(1), A(2), ct);
++            break;
++        case INDEX_op_subbio:
++            g_string_append_printf(o, " { %s _s = %s - %s, _r = _s - (%s)aot_c;"
++                                   " aot_c = (%s < %s) | (_s < (%s)aot_c); %s = _r; }",
++                                   ct, A(1), A(2), ct, A(1), A(2), ct, A(0));
++            break;
++        case INDEX_op_subb1o:
++            g_string_append_printf(o, " { %s _r = %s - %s - 1; aot_c = %s <= %s; %s = _r; }", ct,
++                                   A(1), A(2), A(1), A(2), A(0));
++            break;
++        case INDEX_op_ext_i32_i64:
++            g_string_append_printf(o, " %s = (uint64_t)(int64_t)(int32_t)%s;", A(0), A(1));
++            break;
++        case INDEX_op_extu_i32_i64:
++            g_string_append_printf(o, " %s = (uint64_t)(uint32_t)%s;", A(0), A(1));
++            break;
++        case INDEX_op_extrl_i64_i32:
++            g_string_append_printf(o, " %s = (uint32_t)%s;", A(0), A(1));
++            break;
++        case INDEX_op_extrh_i64_i32:
++            g_string_append_printf(o, " %s = (uint32_t)(%s >> 32);", A(0), A(1));
++            break;
++        case INDEX_op_ld8u: case INDEX_op_ld8s: case INDEX_op_ld16u: case INDEX_op_ld16s:
++        case INDEX_op_ld32u: case INDEX_op_ld32s: case INDEX_op_ld: {
++            const char *lt;
++            int64_t off = op->args[2];
++            TCGTemp *base = arg_temp(op->args[1]);
++            switch (c) {
++            case INDEX_op_ld8u: lt = "uint8_t"; break;
++            case INDEX_op_ld8s: lt = "int8_t"; break;
++            case INDEX_op_ld16u: lt = "uint16_t"; break;
++            case INDEX_op_ld16s: lt = "int16_t"; break;
++            case INDEX_op_ld32u: lt = "uint32_t"; break;
++            case INDEX_op_ld32s: lt = "int32_t"; break;
++            default: lt = ct; break;
++            }
++            /* a global's slot in env is stale while the C variable holds it */
++            if (base->kind == TEMP_FIXED) {
++                for (int i = 0; i < n; i++) {
++                    TCGTemp *g = &s->temps[i];
++                    if (g->kind == TEMP_GLOBAL && g->mem_offset == off &&
++                        (e.used[i] || e.passed[i])) {
++                        aot_failf(&e, "load from global %s's slot", g->name);
++                    }
++                }
++            }
++            /* env fields before env (icount_decr, can_do_io) change behind our back */
++            g_string_append_printf(o, " %s = (%s)AOT_LDM%s(%s, %s, %" PRId64 ");", A(0), ct,
++                                   (base->kind == TEMP_FIXED && off < 0) ? "V" : "", lt,
++                                   aot_base(&e, op->args[1]), off);
++            break;
++        }
++        case INDEX_op_st8: case INDEX_op_st16: case INDEX_op_st32: case INDEX_op_st: {
++            const char *lt = c == INDEX_op_st8 ? "uint8_t" : c == INDEX_op_st16 ? "uint16_t" :
++                             c == INDEX_op_st32 ? "uint32_t" : ct;
++            TCGTemp *base = arg_temp(op->args[1]);
++            int64_t off = op->args[2];
++            /*
++             * can_do_io = false before a block's first insn (translator_loop): QEMU
++             * then retranslates any TB doing I/O before its last insn so that the I/O
++             * ends it (cpu_io_recompile), which needs a TB for the host pc. The
++             * translated code leaves I/O allowed instead, as QEMU did before 8.2 without
++             * icount: a device's interrupt is taken at the next block, not right after.
++             */
++            if (base->kind == TEMP_FIXED && c == INDEX_op_st8 &&
++                off == (int64_t)(offsetof(CPUState, neg.can_do_io) - sizeof(CPUState))) {
++                TCGTemp *v = arg_temp(op->args[0]);
++                if (v->kind == TEMP_CONST && v->val == 0) {
++                    break;
++                }
++            }
++            /* a store into a global's env slot would be undone by a later sync */
++            if (base->kind == TEMP_FIXED) {
++                for (int i = 0; i < n; i++) {
++                    TCGTemp *g = &s->temps[i];
++                    if (g->kind == TEMP_GLOBAL && g->mem_offset == off && e.used[i]) {
++                        aot_failf(&e, "store to global %s's slot", g->name);
++                    }
++                }
++            }
++            g_string_append_printf(o, " AOT_STM%s(%s, %s, %" PRId64 ", %s);",
++                                   (base->kind == TEMP_FIXED && off < 0) ? "V" : "", lt,
++                                   aot_base(&e, op->args[1]), off, A(0));
++            break;
++        }
++        case INDEX_op_qemu_ld: case INDEX_op_qemu_st:
++        case INDEX_op_qemu_ld2: case INDEX_op_qemu_st2:
++            aot_emit_qemu_ldst(&e, op);
++            break;
++        case INDEX_op_call:
++            aot_emit_call(&e, op);
++            break;
++        case INDEX_op_goto_tb:
++            /* direct jump to the block at eip: a tail call when it is translated too */
++            aot_sync_np(&e);
++            aot_emit_jump(&e);
++            e.skip_exit_tb = true;
++            break;
++        case INDEX_op_exit_tb:
++            if (e.skip_exit_tb) {
++                e.skip_exit_tb = false;
++                break;
++            }
++            aot_sync(&e, true);
++            if ((op->args[0] & TB_EXIT_MASK) == TB_EXIT_REQUESTED) {
++                g_string_append(o, " AOT_EXIT_REQ();");
++            } else {
++                g_string_append(o, " AOT_EXIT();");
++            }
++            break;
++        case INDEX_op_goto_ptr:
++            if (!e.lookup_pending || arg_temp(op->args[0]) != e.lookup_ptr) {
++                aot_failf(&e, "goto_ptr without lookup_tb_ptr");
++                break;
++            }
++            e.lookup_pending = false;
++            aot_sync_np(&e);
++            aot_emit_jump(&e);
++            break;
++        default:
++            aot_failf(&e, "op %s", def->name);
++            break;
++        }
++#undef A
++        g_string_append_c(o, '\n');
++        aot_after_op(&e, op);
++    }
++
++    if (!e.fail) {
++        /* declarations: temps, the non-passed globals (from env), the per-block sync */
++        g_string_append_printf(out, "//@aot pc=%08" PRIx64 " cs=%" PRIx64 " fl=%08x cf=%08x"
++                               " sz=%u ic=%u h=%016" PRIx64 "\n", pc, (uint64_t)tb->cs_base,
++                               tb->flags, tb_cflags(tb) & ~CF_INVALID, tb->size, tb->icount,
++                               tb->ihash);
++        g_string_append(out, "#define AOT_SYNC_NP()");
++        for (int i = 0; i < n; i++) {
++            TCGTemp *ts = &s->temps[i];
++            if (ts->kind == TEMP_GLOBAL && e.written[i] && !e.passed[i] && ts != e.eip) {
++                g_string_append_printf(out, " AOT_ST_%s(%" PRIdPTR ", g_%s);",
++                                       ts->type == TCG_TYPE_I32 ? "I32" : "I64",
++                                       ts->mem_offset, ts->name);
++            }
++        }
++        g_string_append(out, "\n");
++        for (int i = 0; i < n; i++) {
++            TCGTemp *ts = &s->temps[i];
++            if (!e.used[i] || e.passed[i] || ts == e.eip) {
++                continue;
++            }
++            if (ts->kind == TEMP_GLOBAL) {
++                g_string_append_printf(out, " %s g_%s = AOT_LD_%s(%" PRIdPTR ");\n",
++                                       aot_ctype(ts->type), ts->name,
++                                       ts->type == TCG_TYPE_I32 ? "I32" : "I64", ts->mem_offset);
++            } else if (ts->kind == TEMP_TB || ts->kind == TEMP_EBB) {
++                g_string_append_printf(out, " %s t%d;\n", aot_ctype(ts->type), i);
++            }
++        }
++        g_string_append_len(out, body->str, body->len);
++        g_string_append(out, "#undef AOT_SYNC_NP\n//@end\n");
++    } else {
++        snprintf(whybuf, sizeof(whybuf), "%s", e.fail);
++        *why = whybuf;
++    }
++
++    g_free(e.passed);
++    g_free(e.used);
++    g_free(e.written);
++    g_free(e.dirty);
++    g_free(e.declared);
++    g_free(e.lab_seen);
++    g_free(e.lab_val);
++    g_string_free(body, true);
++    return e.fail == NULL;
++}
+diff --git a/tcg/tcg.c b/tcg/tcg.c
+index 7967bbc..cb4a7e5 100644
+--- a/tcg/tcg.c
++++ b/tcg/tcg.c
+@@ -57,6 +57,7 @@
+ #include "tcg/tcg-temp-internal.h"
+ #include "tcg-internal.h"
+ #include "tcg/perf.h"
++#include "exec/aot.h"
+ #include "tcg-has.h"
+ #ifdef CONFIG_USER_ONLY
+ #include "user/guest-base.h"
+@@ -7022,6 +7023,11 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
+         }
+     }
+ 
++    /* xemu-ps4: the block as C for the ahead-of-time translator (accel/tcg/aot.c) */
++    if (unlikely(aot_recording)) {
++        aot_record_tb(s, tb, pc_start);
++    }
++
+     if (unlikely(qemu_loglevel_mask(CPU_LOG_TB_OP_OPT)
+                  && qemu_log_in_addr_range(pc_start))) {
+         FILE *logfile = qemu_log_trylock();
+@@ -7458,3 +7464,6 @@ void tcg_expand_vec_op(TCGOpcode o, TCGType t, unsigned e, TCGArg a0, ...)
+     g_assert_not_reached();
+ }
+ #endif
++
++/* xemu-ps4: a TB as C (the ahead-of-time translator) */
++#include "tcg-aot.c.inc"
 diff --git a/ui/meson.build b/ui/meson.build
 index ea46bf0..719cdc0 100644
 --- a/ui/meson.build
@@ -1414,10 +3975,10 @@ index 0000000..c473ccb
 +))
 diff --git a/ui/ps4/ps4-frontend.h b/ui/ps4/ps4-frontend.h
 new file mode 100644
-index 0000000..5197d3d
+index 0000000..eafad10
 --- /dev/null
 +++ b/ui/ps4/ps4-frontend.h
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,102 @@
 +/*
 + * xemu-ps4: the PS4 frontend's pieces (xemu-ps4.c, ps4-present.cc, ps4-hud.cc)
 + *
@@ -1505,6 +4066,8 @@ index 0000000..5197d3d
 +/* xemu-ps4.c: start or switch to a game (under the main loop lock): the disc in, and the machine
 + * started (from -S) or reset; pause/resume around the library */
 +bool ps4_launch_game(const char *path);
++/* ps4-launcher.cc: an ISO's default.xbe title ID (0 if it has none) */
++uint32_t ps4_iso_title_id(const char *path);
 +void ps4_pause_emulation(bool pause);
 +extern bool ps4_emulation_started;
 +
@@ -1520,10 +4083,10 @@ index 0000000..5197d3d
 +#endif
 diff --git a/ui/ps4/ps4-hud.cc b/ui/ps4/ps4-hud.cc
 new file mode 100644
-index 0000000..25ebc57
+index 0000000..f7db113
 --- /dev/null
 +++ b/ui/ps4/ps4-hud.cc
-@@ -0,0 +1,449 @@
+@@ -0,0 +1,457 @@
 +/*
 + * xemu-ps4: what is drawn over the emulated picture (ImGui): notifications and error messages
 + * (xemu-notifications.h, which the desktop's xui implements), the frame rate, what is missing
@@ -1710,7 +4273,8 @@ index 0000000..25ebc57
 +enum Page { kMain, kGames };
 +enum Row {
 +    kResume, kGamesRow, kEject, kReset, kScaling, kFilter, kShowFps, kShowStats, kCpuLayout,
-+    kResampler, kHrtf, kMonitor, kTlbIndex, kAutoProfile, kProfileNow, kQuit, kRowCount
++    kResampler, kHrtf, kMonitor, kTlbIndex, kAutoProfile, kAot, kAotRecord, kProfileNow, kQuit,
++    kRowCount
 +};
 +
 +struct Menu
@@ -1779,6 +4343,11 @@ index 0000000..25ebc57
 +        return std::string("TLB dirty index  < ") + (ps4_settings.tlb_index ? "On" : "Off") + " >  (restart)";
 +    case kAutoProfile:
 +        return std::string("Auto profile     < ") + (ps4_settings.auto_profile ? "On" : "Off") + " >";
++    case kAot:
++        return std::string("Translated code  < ") + (ps4_settings.aot ? "On" : "Off") + " >  (next game)";
++    case kAotRecord:
++        return std::string("Record for PC    < ") + (ps4_settings.aot_record ? "On" : "Off") +
++               " >  (next game)";
 +    case kProfileNow: return "Profile 8 s now (profiles/)";
 +    case kQuit: return "Quit xemu";
 +    }
@@ -1798,6 +4367,8 @@ index 0000000..25ebc57
 +    case kMonitor: ps4_settings.monitor_log = !ps4_settings.monitor_log; break;
 +    case kAutoProfile: ps4_settings.auto_profile = !ps4_settings.auto_profile; break;
 +    case kTlbIndex: ps4_settings.tlb_index = !ps4_settings.tlb_index; M.restartNote = true; break;
++    case kAot: ps4_settings.aot = !ps4_settings.aot; ps4_settings_apply_aot(); break;
++    case kAotRecord: ps4_settings.aot_record = !ps4_settings.aot_record; ps4_settings_apply_aot(); break;
 +    default: return;
 +    }
 +    ps4_settings_save();
@@ -1975,10 +4546,10 @@ index 0000000..25ebc57
 +}
 diff --git a/ui/ps4/ps4-launcher.cc b/ui/ps4/ps4-launcher.cc
 new file mode 100644
-index 0000000..77142e6
+index 0000000..a80721c
 --- /dev/null
 +++ b/ui/ps4/ps4-launcher.cc
-@@ -0,0 +1,688 @@
+@@ -0,0 +1,699 @@
 +/*
 + * xemu-ps4: the game library - the first screen at start (Settings: boot_launcher) and the quick
 + * menu's "Games". The Xbox waits stopped (QEMU's -S) until a game is picked; then the disc goes in
@@ -2034,6 +4605,7 @@ index 0000000..77142e6
 +struct Game
 +{
 +    std::string path, file, stem, title, titleId;
++    uint32_t titleIdRaw = 0;        // the certificate's title ID (the translated code's name)
 +    std::vector<uint8_t> rgba;      // the cover, until it is a texture
 +    int w = 0, h = 0;
 +    ImTextureID tex = 0;
@@ -2269,6 +4841,7 @@ index 0000000..77142e6
 +    if (cert + 0x5C <= head.size()) {
 +        char tid[16];
 +        const uint32_t id = rd32(&head[cert + 8]);
++        g.titleIdRaw = id;
 +        snprintf(tid, sizeof(tid), "%c%c-%03u", (char)(id >> 24), (char)((id >> 16) & 0xff), id & 0xffff);
 +        g.titleId = tid;
 +        std::string name;
@@ -2667,12 +5240,21 @@ index 0000000..77142e6
 +    dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), ImVec2(64.0f, by + 24.0f), IM_COL32_WHITE, hints);
 +    return true;
 +}
++
++/* the game's title ID for the translated code (xemu-ps4.c ps4_launch_game) */
++extern "C" uint32_t ps4_iso_title_id(const char *path)
++{
++    Game g;
++    g.path = path;
++    ReadIso(g);
++    return g.titleIdRaw;
++}
 diff --git a/ui/ps4/ps4-live.c b/ui/ps4/ps4-live.c
 new file mode 100644
-index 0000000..5071fcb
+index 0000000..c8b7a12
 --- /dev/null
 +++ b/ui/ps4/ps4-live.c
-@@ -0,0 +1,206 @@
+@@ -0,0 +1,210 @@
 +/*
 + * xemu-ps4: the live console - a TCP port on the PS4 (ps4.ini live_port, default 4445; 0 = off)
 + * to look into and steer the running emulator from a PC (scripts/live.py). One client at a time,
@@ -2702,6 +5284,7 @@ index 0000000..5071fcb
 +#include "qapi/qapi-commands-misc.h"
 +#include "exec/cpu-common.h"
 +#include "system/memory.h"
++#include "exec/aot.h"
 +#include "ps4-frontend.h"
 +#include "ps4-settings.h"
 +#include "ps4_kit_diag.h"
@@ -2782,10 +5365,13 @@ index 0000000..5071fcb
 +        args = line + strlen(line);
 +    }
 +    if (strcmp(line, "help") == 0) {
-+        g_string_append(out, "stats | hmp <monitor command> | mem <addr> [len] | profile [s] | dump | "
-+                             "get [key] | set <key> <value> | quit\n");
++        g_string_append(out, "stats | aot | hmp <monitor command> | mem <addr> [len] | profile [s] | "
++                             "dump | get [key] | set <key> <value> | quit\n");
 +    } else if (strcmp(line, "stats") == 0) {
 +        g_string_append(out, ps4_live_last_monitor);
++    } else if (strcmp(line, "aot") == 0) {
++        aot_stats(out, true);
++        g_string_append_c(out, '\n');
 +    } else if (strcmp(line, "hmp") == 0) {
 +        cmd_hmp(out, args);
 +    } else if (strcmp(line, "mem") == 0) {
@@ -3819,10 +6405,10 @@ index 0000000..a2486cb
 +}
 diff --git a/ui/ps4/ps4-settings.c b/ui/ps4/ps4-settings.c
 new file mode 100644
-index 0000000..ca6074a
+index 0000000..11ac43c
 --- /dev/null
 +++ b/ui/ps4/ps4-settings.c
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,164 @@
 +/*
 + * xemu-ps4: the PS4 frontend's own settings (ps4-settings.h), "key = value" lines in
 + * /data/xemu/ps4.ini. Unknown keys are ignored, missing ones keep their defaults.
@@ -3834,6 +6420,7 @@ index 0000000..ca6074a
 + */
 +
 +#include "qemu/osdep.h"
++#include "exec/aot.h"
 +#include "ps4-settings.h"
 +#include "ui/xemu-settings.h"
 +
@@ -3856,6 +6443,8 @@ index 0000000..ca6074a
 +    .live_port = 4445,
 +    .gdb_port = 0,
 +    .boot_launcher = true,
++    .aot = true,
++    .aot_record = true,
 +};
 +
 +typedef struct {
@@ -3882,7 +6471,15 @@ index 0000000..ca6074a
 +    { "live_port", T_INT, &ps4_settings.live_port, 0, 65535 },
 +    { "gdb_port", T_INT, &ps4_settings.gdb_port, 0, 65535 },
 +    { "boot_launcher", T_BOOL, &ps4_settings.boot_launcher, 0, 1 },
++    { "aot", T_BOOL, &ps4_settings.aot, 0, 1 },
++    { "aot_record", T_BOOL, &ps4_settings.aot_record, 0, 1 },
 +};
++
++void ps4_settings_apply_aot(void)
++{
++    aot_use = ps4_settings.aot;
++    aot_record = ps4_settings.aot_record;
++}
 +
 +void ps4_settings_load(void)
 +{
@@ -3955,6 +6552,9 @@ index 0000000..ca6074a
 +        } else {
 +            *(int *)fields[i].value = c;
 +        }
++        if (strncmp(key, "aot", 3) == 0) {
++            ps4_settings_apply_aot();
++        }
 +        if (strcmp(key, "poll_spin_us") == 0 && c >= 0) {
 +            extern int64_t ps4_poll_spin_ns;
 +            ps4_poll_spin_ns = (int64_t)c * 1000;
@@ -3975,10 +6575,10 @@ index 0000000..ca6074a
 +}
 diff --git a/ui/ps4/ps4-settings.h b/ui/ps4/ps4-settings.h
 new file mode 100644
-index 0000000..d19a522
+index 0000000..af429ed
 --- /dev/null
 +++ b/ui/ps4/ps4-settings.h
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,73 @@
 +/*
 + * xemu-ps4: the PS4 frontend's own settings (/data/xemu/ps4.ini), next to xemu's xemu.toml.
 + * Changed from the quick menu (ps4-hud.cc); "restart" ones apply at the next start.
@@ -4031,6 +6631,8 @@ index 0000000..d19a522
 +    int live_port;          /* the live console's TCP port, 0 = off (ps4-live.c) (restart) */
 +    int gdb_port;           /* QEMU's GDB stub for the guest CPU, 0 = off (restart) */
 +    bool boot_launcher;     /* start in the game library (ps4-launcher.cc) */
++    bool aot;               /* run a game's translated code (/data/xemu/aot/<ID>.aot) (next game) */
++    bool aot_record;        /* write the blocks a game runs as C for the PC's build (next game) */
 +} PS4Settings;
 +
 +extern PS4Settings ps4_settings;
@@ -4042,6 +6644,8 @@ index 0000000..d19a522
 +struct _GString;
 +void ps4_settings_describe(struct _GString *out, const char *key);
 +bool ps4_settings_set_text(const char *key, const char *value);
++/* aot / aot_record to the translator (accel/tcg/aot.c); they apply at the next game */
++void ps4_settings_apply_aot(void);
 +
 +#ifdef __cplusplus
 +}
@@ -4170,10 +6774,10 @@ index 0000000..24e9598
 +}
 diff --git a/ui/ps4/xemu-ps4.c b/ui/ps4/xemu-ps4.c
 new file mode 100644
-index 0000000..16fecb3
+index 0000000..841a0d3
 --- /dev/null
 +++ b/ui/ps4/xemu-ps4.c
-@@ -0,0 +1,1150 @@
+@@ -0,0 +1,1168 @@
 +/*
 + * xemu-ps4: the PS4 frontend (replaces ui/xemu.c and its SDL window + OpenGL).
 + *
@@ -4217,6 +6821,8 @@ index 0000000..16fecb3
 +#include "hw/xbox/nv2a/debug.h"
 +#include "hw/core/cpu.h"
 +#include "system/cpus.h"
++#include "exec/aot.h"
++#include "exec/tb-flush.h"
 +#include "qemu/timer.h"
 +#include "ps4-frontend.h"
 +#include "ps4-settings.h"
@@ -4778,20 +7384,23 @@ index 0000000..16fecb3
 +        last_resets = resets;
 +        last_walks = walks;
 +        ps4_heap_trim();
++        g_autoptr(GString) aot_line = g_string_new(NULL);
++        aot_stats(aot_line, false);
 +        snprintf(ps4_live_last_monitor, sizeof(ps4_live_last_monitor),
 +                 "presented %.1f/s (display in %.1f/s), guest flips %.1f/s, guest clock +%.2f s, "
-+                 "runstate %s, cpu pc 0x%08" PRIx64 " | GPU %d%% | %s | %s",
++                 "runstate %s, cpu pc 0x%08" PRIx64 " | GPU %d%% | %s | %s | %s",
 +                 (frames - last_frames) / 5.0, (display - last_display) / 5.0,
 +                 (flips - last_flips) / 5.0, (guest_ns - last_guest_ns) / 1e9,
-+                 RunState_str(runstate_get()), pc, ps4_perf_gpu, threads, loop_stats);
++                 RunState_str(runstate_get()), pc, ps4_perf_gpu, threads, loop_stats, aot_line->str);
 +        if (ps4_settings.monitor_log) {
 +            trace("monitor: presented %.1f/s (display in %.1f/s), guest flips %.1f/s, "
-+                  "guest clock +%.2f s, runstate %s, cpu pc 0x%08" PRIx64 "%s | GPU %d%% | %s | %s | %s",
++                  "guest clock +%.2f s, runstate %s, cpu pc 0x%08" PRIx64 "%s | GPU %d%% | %s | %s | %s"
++                  " | %s",
 +                  (frames - last_frames) / 5.0, (display - last_display) / 5.0,
 +                  (flips - last_flips) / 5.0, (guest_ns - last_guest_ns) / 1e9,
 +                  RunState_str(runstate_get()), pc,
 +                  cpu != NULL && cpu->halted ? " (halted)" : "", ps4_perf_gpu, threads, loop_stats,
-+                  pad_stats);
++                  pad_stats, aot_line->str);
 +        }
 +        /* (no cpu_dump_state here: from this thread, with the guest kernel running, it took
 +         * the process down in v00.07) */
@@ -5105,6 +7714,7 @@ index 0000000..16fecb3
 +    setenv("MESA_SHADER_CACHE_DIR", XEMU_DATA "/cache/mesa", 1);
 +    profiling = ps4_settings.profiler || access(XEMU_DATA "/profile.txt", F_OK) == 0;
 +    tlb_dirty_index_enabled = ps4_settings.tlb_index;
++    ps4_settings_apply_aot();
 +    if (profiling) {
 +        ps4_sampler_start();
 +        ps4_sampler_register_thread("main (display)");
@@ -5247,6 +7857,18 @@ index 0000000..16fecb3
 +{
 +    Error *err = NULL;
 +    const bool fresh = runstate_check(RUN_STATE_PRELAUNCH);
++    /*
++     * The game's translated code (accel/tcg/aot.c): its .aot loaded and its blocks recorded,
++     * with the Xbox's CPU stopped. The TBs made before (BIOS, another game) are dropped, so
++     * that the game's blocks go through the new file.
++     */
++    const uint32_t title_id = ps4_iso_title_id(path);
++    if (runstate_is_running()) {
++        vm_stop(RUN_STATE_PAUSED);
++    }
++    aot_set_title(title_id);
++    tb_flush__exclusive_or_serial();
++    trace("launch: title ID %08x", title_id);
 +    qmp_blockdev_change_medium("ide0-cd1", NULL, path, "raw", false, false, false, 0, &err);
 +    if (err) {
 +        trace("launch %s: %s", path, error_get_pretty(err));
