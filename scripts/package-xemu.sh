@@ -19,6 +19,10 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE/sce_sys"
 cp "$EBOOT" "$STAGE/eboot.bin"
 cp "$XEMUPS4/sce_sys/icon0.png" "$XEMUPS4/sce_sys/pic1.png" "$STAGE/sce_sys/"
+# the menus' fonts (xemu's data/, Apache-2.0 with its licence): /app0/data
+mkdir -p "$STAGE/data"
+cp "$XEMU_SRC/data/Roboto-Medium.ttf" "$XEMU_SRC/data/RobotoCondensed-Regular.ttf" \
+   "$XEMU_SRC/data/Roboto-LICENSE.txt" "$STAGE/data/"
 echo "$VERSION" > "$STAGE/version.txt"
 PKG="$(NO_RIGHT_SPRX=1 PSB="$HOME/ps4kit-build" bash "$PS4_KIT/scripts/make-pkg.sh" "$STAGE" XEMU00001 "xemu" "$VERSION" XEMUPS4 "$PSB/out" | tail -1)"
 ls -la "$PKG"

@@ -7,6 +7,11 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 source "$HERE/env.sh"
 B="$XEMU_BUILD"
 
+# Meson regenerates its build files (and reruns its CMake subprojects' compiler checks) when a
+# meson.build changed: that has to happen with the configure-time link flags, not the eboot's
+# below (the kit runtime's C++ made every check program fail to link).
+PS4_APP_LDFLAGS="-lSceNet $PS4_SYSROOT/lib/libps4compat.a" PS4_RT_LIB= ninja -C "$B" build.ninja
+
 # ps4-kit's runtime and presenter (port/CMakeLists.txt -> libxemups4_port.a, kit-link.env)
 P="$PSB/build/port"
 if [ ! -f "$P/build.ninja" ]; then

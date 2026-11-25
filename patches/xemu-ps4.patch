@@ -253,7 +253,7 @@ index 4c6ca71..83e4169 100644
  static void tty_serial_init(int fd, int speed,
                              int parity, int data_bits, int stop_bits)
 diff --git a/hw/xbox/mcpx/apu/apu.c b/hw/xbox/mcpx/apu/apu.c
-index 1ee6dc4..b6b5f93 100644
+index 1ee6dc4..d9b58b0 100644
 --- a/hw/xbox/mcpx/apu/apu.c
 +++ b/hw/xbox/mcpx/apu/apu.c
 @@ -259,6 +259,10 @@ static void *mcpx_apu_frame_thread(void *arg)
@@ -267,6 +267,24 @@ index 1ee6dc4..b6b5f93 100644
          if (d->pause_requested) {
              d->is_idle = true;
              qemu_cond_signal(&d->idle_cond);
+@@ -620,4 +624,5 @@ void mcpx_apu_init(PCIBus *bus, int devfn, MemoryRegion *ram)
+ 
+     d->ram = ram;
+     d->ram_ptr = memory_region_get_ram_ptr(d->ram);
++    d->ram_size = memory_region_size(d->ram);
+ }
+diff --git a/hw/xbox/mcpx/apu/apu_int.h b/hw/xbox/mcpx/apu/apu_int.h
+index ff13d42..a54b48d 100644
+--- a/hw/xbox/mcpx/apu/apu_int.h
++++ b/hw/xbox/mcpx/apu/apu_int.h
+@@ -87,6 +87,7 @@ typedef struct MCPXAPUState {
+ 
+     MemoryRegion *ram;
+     uint8_t *ram_ptr;
++    uint64_t ram_size;  /* xemu-ps4: bounds for the direct reads (vp.c apu_ld*) */
+     MemoryRegion mmio;
+ 
+     MCPXAPUVPState vp;
 diff --git a/hw/xbox/mcpx/apu/dsp/dsp_jit_stub.c b/hw/xbox/mcpx/apu/dsp/dsp_jit_stub.c
 new file mode 100644
 index 0000000..830c2ad
@@ -316,11 +334,117 @@ index 3429547..6ba7217 100644
    dependencies: [dsp56300_emu_ffi],
  )
  
+diff --git a/hw/xbox/mcpx/apu/vp/hrtf.h b/hw/xbox/mcpx/apu/vp/hrtf.h
+index fa35c48..3b3ead4 100644
+--- a/hw/xbox/mcpx/apu/vp/hrtf.h
++++ b/hw/xbox/mcpx/apu/vp/hrtf.h
+@@ -122,6 +122,32 @@ static inline void hrtf_filter_process(HrtfFilter *f,
+ 
+             // HRIR Convolution
+             float acc = 0.0f;
++#ifdef __PS4__
++            /*
++             * xemu-ps4: the same sums without the two "% HRTF_BUFLEN" a tap - integer divisions,
++             * ~25 cycles each on the Jaguar, 31 taps x 2 channels a sample for every 3D voice.
++             * The index steps down by one per tap and wraps at most once.
++             */
++            int idx1 = f->buf_pos - di;
++            if (idx1 < 0) {
++                idx1 += HRTF_BUFLEN;
++            }
++            if (dfrac > 0.0f) {
++                const float keep = 1 - dfrac;
++                int idx2 = idx1 - 1 < 0 ? idx1 - 1 + HRTF_BUFLEN : idx1 - 1;
++                for (int k = 0; k < HRTF_NUM_TAPS; k++) {
++                    const float s = buf[idx1] * keep + buf[idx2] * dfrac;
++                    acc += coeff[k] * s;
++                    idx1 = idx1 == 0 ? HRTF_BUFLEN - 1 : idx1 - 1;
++                    idx2 = idx2 == 0 ? HRTF_BUFLEN - 1 : idx2 - 1;
++                }
++            } else {
++                for (int k = 0; k < HRTF_NUM_TAPS; k++) {
++                    acc += coeff[k] * buf[idx1];
++                    idx1 = idx1 == 0 ? HRTF_BUFLEN - 1 : idx1 - 1;
++                }
++            }
++#else
+             for (int k = 0; k < HRTF_NUM_TAPS; k++) {
+                 int idx1 = (f->buf_pos - di - k + HRTF_BUFLEN) % HRTF_BUFLEN;
+                 float s = buf[idx1];
+@@ -133,11 +159,12 @@ static inline void hrtf_filter_process(HrtfFilter *f,
+                 }
+                 acc += coeff[k] * s;
+             }
++#endif
+ 
+             out[n][ch] = acc;
+         }
+ 
+-        f->buf_pos = (f->buf_pos + 1) % HRTF_BUFLEN;
++        f->buf_pos = f->buf_pos + 1 == HRTF_BUFLEN ? 0 : f->buf_pos + 1;
+     }
+ }
+ 
 diff --git a/hw/xbox/mcpx/apu/vp/vp.c b/hw/xbox/mcpx/apu/vp/vp.c
-index c57ecb6..66bb17f 100644
+index c57ecb6..9626c85 100644
 --- a/hw/xbox/mcpx/apu/vp/vp.c
 +++ b/hw/xbox/mcpx/apu/vp/vp.c
-@@ -134,13 +134,26 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
+@@ -30,6 +30,36 @@ static const struct {
+     { NV_PAPU_TVLMP, NV_PAPU_CVLMP, NV_PAPU_NVLMP }, // MP
+ };
+ 
++/*
++ * xemu-ps4: guest RAM read straight from its RAM block, as the stream ADPCM path below does with
++ * d->ram_ptr. Each ld*_phys is a whole memory dispatch (RCU, flat view lookup, region access),
++ * ~100 ns on the Jaguar, and the voice processor made several per sample per voice: in Halo 2 the
++ * two voice workers took ~70 % of a core each (v00.18). Anything outside RAM keeps the dispatch.
++ */
++static inline uint32_t apu_ldl(MCPXAPUState *d, hwaddr addr)
++{
++    if (likely(addr + 4 <= d->ram_size)) {
++        return ldl_le_p(d->ram_ptr + addr);
++    }
++    return ldl_le_phys(&address_space_memory, addr);
++}
++
++static inline uint32_t apu_lduw(MCPXAPUState *d, hwaddr addr)
++{
++    if (likely(addr + 2 <= d->ram_size)) {
++        return lduw_le_p(d->ram_ptr + addr);
++    }
++    return lduw_le_phys(&address_space_memory, addr);
++}
++
++static inline uint32_t apu_ldub(MCPXAPUState *d, hwaddr addr)
++{
++    if (likely(addr < d->ram_size)) {
++        return ldub_p(d->ram_ptr + addr);
++    }
++    return ldub_phys(&address_space_memory, addr);
++}
++
+ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
+                               int status)
+ {
+@@ -101,7 +131,7 @@ static uint32_t voice_get_mask(MCPXAPUState *d, uint16_t voice_handle,
+                                hwaddr offset, uint32_t mask)
+ {
+     hwaddr voice = d->regs[NV_PAPU_VPVADDR] + voice_handle * NV_PAVS_SIZE;
+-    return (ldl_le_phys(&address_space_memory, voice + offset) & mask) >>
++    return (apu_ldl(d, voice + offset) & mask) >>
+            ctz32(mask);
+ }
+ 
+@@ -110,7 +140,7 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
+ {
+     hwaddr voice = d->regs[NV_PAPU_VPVADDR]
+                     + voice_handle * NV_PAVS_SIZE;
+-    uint32_t v = ldl_le_phys(&address_space_memory, voice + offset) & ~mask;
++    uint32_t v = apu_ldl(d, voice + offset) & ~mask;
+     stl_le_phys(&address_space_memory, voice + offset,
+                 v | ((val << ctz32(mask)) & mask));
+ }
+@@ -134,13 +164,26 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
  static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
  {
      assert(v < MCPX_HW_MAX_VOICES);
@@ -349,7 +473,80 @@ index c57ecb6..66bb17f 100644
      }
  
      qemu_cond_signal(&d->cond);
-@@ -1170,8 +1183,22 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
+@@ -664,12 +707,13 @@ const MemoryRegionOps vp_ops = {
+     .write = vp_write,
+ };
+ 
+-static hwaddr get_data_ptr(hwaddr sge_base, unsigned int max_sge, uint32_t addr)
++static hwaddr get_data_ptr(MCPXAPUState *d, hwaddr sge_base, unsigned int max_sge,
++                           uint32_t addr)
+ {
+     unsigned int entry = addr / TARGET_PAGE_SIZE;
+     assert(entry <= max_sge);
+     uint32_t prd_address =
+-        ldl_le_phys(&address_space_memory, sge_base + entry * 4 * 2);
++        apu_ldl(d, sge_base + entry * 4 * 2);
+     // uint32_t prd_control =
+     //     ldl_le_phys(&address_space_memory, sge_base + entry * 4 * 2 + 4);
+     DPRINTF("Addr: 0x%08X, control: 0x%08X\n", prd_address, prd_control);
+@@ -955,8 +999,8 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
+         }
+ 
+         hwaddr addr = d->regs[NV_PAPU_VPSSLADDR] + page * 8;
+-        segment_offset = ldl_le_phys(&address_space_memory, addr);
+-        segment_length = ldl_le_phys(&address_space_memory, addr + 4);
++        segment_offset = apu_ldl(d, addr);
++        segment_length = apu_ldl(d, addr + 4);
+         assert(segment_offset != 0);
+         assert(segment_length != 0);
+         seg_len = (segment_length >> 0) & 0xffff;
+@@ -1026,10 +1070,10 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
+                     linear_addr += ba;
+                     for (unsigned int word_index = 0;
+                          word_index < (9 * samples_per_block); word_index++) {
+-                        hwaddr addr = get_data_ptr(d->regs[NV_PAPU_VPSGEADDR],
++                        hwaddr addr = get_data_ptr(d, d->regs[NV_PAPU_VPSGEADDR],
+                                                    0xFFFFFFFF, linear_addr);
+                         adpcm_block[word_index] =
+-                            ldl_le_phys(&address_space_memory, addr);
++                            apu_ldl(d, addr);
+                         linear_addr += 4;
+                     }
+                 }
+@@ -1052,7 +1096,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
+                 addr = segment_offset + cbo * block_size;
+             } else {
+                 uint32_t linear_addr = ba + cbo * block_size;
+-                addr = get_data_ptr(d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFF,
++                addr = get_data_ptr(d, d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFF,
+                                     linear_addr);
+             }
+ 
+@@ -1061,19 +1105,19 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
+                 float fval;
+                 switch (sample_size) {
+                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_U8:
+-                    ival = ldub_phys(&address_space_memory, addr);
++                    ival = apu_ldub(d, addr);
+                     fval = uint8_to_float(ival & 0xff);
+                     break;
+                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S16:
+-                    ival = lduw_le_phys(&address_space_memory, addr);
++                    ival = apu_lduw(d, addr);
+                     fval = int16_to_float(ival & 0xffff);
+                     break;
+                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S24:
+-                    ival = ldl_le_phys(&address_space_memory, addr);
++                    ival = apu_ldl(d, addr);
+                     fval = int24_to_float(ival);
+                     break;
+                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S32:
+-                    ival = ldl_le_phys(&address_space_memory, addr);
++                    ival = apu_ldl(d, addr);
+                     fval = int32_to_float(ival);
+                     break;
+                 default:
+@@ -1170,8 +1214,22 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
           * so use it for now.
           */
          // FIXME: Don't do 2ch resampling if this is a mono voice
@@ -372,7 +569,7 @@ index c57ecb6..66bb17f 100644
          if (filter->resampler == NULL) {
              fprintf(stderr, "src error: %s\n", src_strerror(err));
              assert(0);
-@@ -1597,6 +1624,9 @@ static void *voice_worker_thread(void *arg)
+@@ -1597,6 +1655,9 @@ static void *voice_worker_thread(void *arg)
      do {
          int64_t start_time = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
          g_dbg.vp.workers[worker_id].num_voices = self->queue_len;
@@ -382,7 +579,7 @@ index c57ecb6..66bb17f 100644
  
          if (self->queue_len) {
              qemu_mutex_unlock(&vwd->lock);
-@@ -1768,7 +1798,13 @@ static void voice_work_init(MCPXAPUState *d)
+@@ -1768,7 +1829,13 @@ static void voice_work_init(MCPXAPUState *d)
  {
      VoiceWorkDispatch *vwd = &d->vp.voice_work_dispatch;
  
@@ -1197,14 +1394,16 @@ index 0000000..ed24aa5
 +#include "backends/imgui_impl_vulkan.cpp"
 diff --git a/ui/ps4/meson.build b/ui/ps4/meson.build
 new file mode 100644
-index 0000000..cd4aad6
+index 0000000..c473ccb
 --- /dev/null
 +++ b/ui/ps4/meson.build
-@@ -0,0 +1,12 @@
+@@ -0,0 +1,14 @@
 +# xemu-ps4: the PS4 frontend (in place of ui/xemu.c and the OpenGL GUI in ui/xui)
 +xemu_ss.add(volk, files(
 +  'imgui-impl-vulkan-ps4.cc',
 +  'ps4-hud.cc',
++  'ps4-launcher.cc',
++  'ps4-live.c',
 +  'ps4-pad.c',
 +  'ps4-present.cc',
 +  'ps4-settings.c',
@@ -1215,10 +1414,10 @@ index 0000000..cd4aad6
 +))
 diff --git a/ui/ps4/ps4-frontend.h b/ui/ps4/ps4-frontend.h
 new file mode 100644
-index 0000000..6daddee
+index 0000000..5197d3d
 --- /dev/null
 +++ b/ui/ps4/ps4-frontend.h
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,100 @@
 +/*
 + * xemu-ps4: the PS4 frontend's pieces (xemu-ps4.c, ps4-present.cc, ps4-hud.cc)
 + *
@@ -1248,6 +1447,9 @@ index 0000000..6daddee
 +void ps4_present_shutdown(void);
 +/* frames presented so far, and those that had the emulated display in them */
 +void ps4_present_stats(uint64_t *frames, uint64_t *display_frames);
++
++/* ps4-present.cc: an RGBA picture as an ImGui texture (an ImTextureID; 0 when it can't be made) */
++unsigned long long ps4_present_texture(const unsigned char *rgba, int w, int h);
 +
 +/* ps4-pad.c: the DualShock 4 as an SDL virtual gamepad (after SDL's gamepad subsystem) */
 +void ps4_pad_init(void);
@@ -1279,6 +1481,9 @@ index 0000000..6daddee
 +void ps4_eject_disc(void);
 +void ps4_request_reset(void);
 +void ps4_request_quit(void);
++/* ps4-live.c: the live console (TCP), and the monitor's last line it reports */
++void ps4_live_start(int port);
++extern char ps4_live_last_monitor[1024];
 +/* xemu-ps4.c: an 8 s CPU profile of the emulation threads now (profiles/profile_N.txt) */
 +bool ps4_profile_now(const char *reason);
 +
@@ -1288,17 +1493,37 @@ index 0000000..6daddee
 +/* between ImGui::NewFrame and ImGui::Render (presenter) */
 +void ps4_hud_draw(void);
 +
++/* ps4-launcher.cc: the game library at start and from the quick menu (covers from the games'
++ * own title images or /data/xemu/covers) */
++extern bool ps4_launcher_active;
++void ps4_launcher_open(void);
++/* between ImGui::NewFrame and ImGui::Render; true while it covers the screen */
++bool ps4_launcher_draw(void);
++/* under the main loop lock: the game picked, if any (ps4_hud_update starts it) */
++const char *ps4_launcher_take_pick(void);
++
++/* xemu-ps4.c: start or switch to a game (under the main loop lock): the disc in, and the machine
++ * started (from -S) or reset; pause/resume around the library */
++bool ps4_launch_game(const char *path);
++void ps4_pause_emulation(bool pause);
++extern bool ps4_emulation_started;
++
 +#ifdef __cplusplus
 +}
++#endif
++
++#ifdef __cplusplus
++struct ImFont;
++extern ImFont *ps4_font_title, *ps4_font_small;
 +#endif
 +
 +#endif
 diff --git a/ui/ps4/ps4-hud.cc b/ui/ps4/ps4-hud.cc
 new file mode 100644
-index 0000000..457ade6
+index 0000000..25ebc57
 --- /dev/null
 +++ b/ui/ps4/ps4-hud.cc
-@@ -0,0 +1,432 @@
+@@ -0,0 +1,449 @@
 +/*
 + * xemu-ps4: what is drawn over the emulated picture (ImGui): notifications and error messages
 + * (xemu-notifications.h, which the desktop's xui implements), the frame rate, what is missing
@@ -1496,7 +1721,7 @@ index 0000000..457ade6
 +    std::vector<std::string> games;     // file names in kGamesDir
 +    // done under the main loop lock (ps4_hud_update): the menu draws without it
 +    std::string loadPath;
-+    bool eject = false, reset = false, quit = false;
++    bool eject = false, reset = false, quit = false, pause = false;
 +    bool restartNote = false;
 +} M;
 +
@@ -1535,7 +1760,7 @@ index 0000000..457ade6
 +    static const char *const filter[] = { "Smooth", "Sharp" };
 +    switch (row) {
 +    case kResume: return "Resume";
-+    case kGamesRow: return std::string("Load game...   (") + DiscName() + ")";
++    case kGamesRow: return std::string("Games...   (") + DiscName() + ")";
 +    case kEject: return "Eject disc";
 +    case kReset: return "Reset Xbox";
 +    case kScaling: return std::string("Picture          < ") + scaling[ps4_settings.scaling] + " >";
@@ -1582,7 +1807,13 @@ index 0000000..457ade6
 +{
 +    switch (row) {
 +    case kResume: ps4_menu_open = false; break;
-+    case kGamesRow: ScanGames(); M.page = kGames; break;
++    case kGamesRow:
++        ps4_menu_open = false;
++        if (ps4_emulation_started) {
++            M.pause = true;     // the game waits while the library is up (ps4_hud_update)
++        }
++        ps4_launcher_open();
++        break;
 +    case kEject: M.eject = true; ps4_menu_open = false; break;
 +    case kReset: M.reset = true; ps4_menu_open = false; break;
 +    case kQuit: M.quit = true; break;
@@ -1703,6 +1934,14 @@ index 0000000..457ade6
 +        Queue(ok ? (std::string("Disc: ") + DiscName()).c_str() : "Couldn't load the disc", !ok);
 +        M.loadPath.clear();
 +    }
++    if (const char *pick = ps4_launcher_take_pick()) {
++        const bool ok = ps4_launch_game(pick);
++        Queue(ok ? (std::string("Starting ") + DiscName()).c_str() : "Couldn't start the game", !ok);
++    }
++    if (M.pause) {
++        ps4_pause_emulation(true);
++        M.pause = false;
++    }
 +    if (M.eject) {
 +        ps4_eject_disc();
 +        M.eject = false;
@@ -1726,17 +1965,926 @@ index 0000000..457ade6
 +
 +extern "C" void ps4_hud_draw(void)
 +{
-+    DrawPerformance();
++    const bool library = ps4_launcher_draw();
++    if (!library) {
++        DrawPerformance();
++    }
 +    DrawSetupHelp();
 +    DrawMenu();
 +    DrawNotification();
 +}
+diff --git a/ui/ps4/ps4-launcher.cc b/ui/ps4/ps4-launcher.cc
+new file mode 100644
+index 0000000..77142e6
+--- /dev/null
++++ b/ui/ps4/ps4-launcher.cc
+@@ -0,0 +1,688 @@
++/*
++ * xemu-ps4: the game library - the first screen at start (Settings: boot_launcher) and the quick
++ * menu's "Games". The Xbox waits stopped (QEMU's -S) until a game is picked; then the disc goes in
++ * and it starts (xemu-ps4.c ps4_launch_game), so the BIOS boots straight into the game.
++ *
++ * Each game in /data/xemu/games (.iso: redump images or XISO) is read for its default.xbe: the title
++ * name and ID from the certificate, and the title image the Xbox dashboard shows (the "$$XTIMAGE"
++ * section, an XPR texture: DXT1/3/5 or 32-bit). A picture of the user's own in /data/xemu/covers
++ * (<iso name>.png or .jpg: box art) wins. Results are cached in /data/xemu/covers/cache.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include "ps4-frontend.h"
++#include "ps4-settings.h"
++#include "ui/xemu-settings.h"
++
++#include "imgui.h"
++
++#define STB_IMAGE_IMPLEMENTATION
++#define STB_IMAGE_STATIC
++#define STBI_ONLY_PNG
++#define STBI_ONLY_JPEG
++#define STBI_NO_STDIO_SUPPORT_EXCEPT_FILE
++#include "ui/thirdparty/stb_image/stb_image.h"
++
++#include <algorithm>
++#include <atomic>
++#include <cfloat>
++#include <cmath>
++#include <cstring>
++#include <dirent.h>
++#include <fcntl.h>
++#include <mutex>
++#include <string>
++#include <strings.h>
++#include <sys/stat.h>
++#include <thread>
++#include <unistd.h>
++#include <vector>
++
++#include <orbis/Pad.h>
++
++namespace
++{
++constexpr const char *kGames = "/data/xemu/games";
++constexpr const char *kCovers = "/data/xemu/covers";
++constexpr const char *kCache = "/data/xemu/covers/cache";
++
++struct Game
++{
++    std::string path, file, stem, title, titleId;
++    std::vector<uint8_t> rgba;      // the cover, until it is a texture
++    int w = 0, h = 0;
++    ImTextureID tex = 0;
++    bool userCover = false;
++};
++
++std::mutex sLock;
++std::vector<Game> sGames;           // guarded by sLock while the scan runs
++std::atomic<bool> sScanning { false };
++std::atomic<bool> sScanned { false };
++int sSel = 0;
++float sScroll = 0.0f;               // the carousel's position, easing to sSel
++const char *sPick = nullptr;        // the game to start (ps4_hud_update takes it)
++std::string sPickPath;
++bool sOpenedInGame = false;         // opened from the quick menu over a running game
++
++uint32_t rd32(const uint8_t *p)
++{
++    return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++uint16_t rd16(const uint8_t *p)
++{
++    return p[0] | p[1] << 8;
++}
++
++bool ReadAt(int fd, uint64_t off, void *buf, size_t len)
++{
++    return pread(fd, buf, len, (off_t)off) == (ssize_t)len;
++}
++
++// --- XDVDFS: the game partition and a file in its root ----------------------------------------
++
++// The partition's offset: 0 for an XISO, else the redump layouts (XGD1, XGD2, XGD3)
++bool FindPartition(int fd, uint64_t *base)
++{
++    static const uint64_t offsets[] = { 0, 0x18300000ull, 0xFD90000ull, 0x2080000ull };
++    for (uint64_t o : offsets) {
++        char magic[20];
++        if (ReadAt(fd, o + 0x10000, magic, sizeof(magic)) && memcmp(magic, "MICROSOFT*XBOX*MEDIA", 20) == 0) {
++            *base = o;
++            return true;
++        }
++    }
++    return false;
++}
++
++// The directory is a binary tree of entries: left/right child offsets (in 4-byte units, 0 none),
++// start sector, size, attributes, name length, name
++bool FindInDir(const std::vector<uint8_t> &dir, size_t off, const char *name, uint32_t *sector,
++               uint32_t *size, int depth)
++{
++    if (depth > 64 || off + 14 > dir.size()) {
++        return false;
++    }
++    const uint8_t *e = dir.data() + off;
++    const uint16_t left = rd16(e), right = rd16(e + 2);
++    if (left == 0xFFFF) {
++        return false;
++    }
++    const uint8_t len = e[13];
++    if (off + 14 + len <= dir.size() && len == strlen(name) && strncasecmp((const char *)e + 14, name, len) == 0) {
++        *sector = rd32(e + 4);
++        *size = rd32(e + 8);
++        return true;
++    }
++    return (left && FindInDir(dir, left * 4u, name, sector, size, depth + 1)) ||
++           (right && FindInDir(dir, right * 4u, name, sector, size, depth + 1));
++}
++
++// --- XPR textures (the XBE's title image) ---------------------------------------------------------
++
++void Rgb565(uint16_t c, uint8_t *o)
++{
++    o[0] = ((c >> 11) & 31) * 255 / 31;
++    o[1] = ((c >> 5) & 63) * 255 / 63;
++    o[2] = (c & 31) * 255 / 31;
++}
++
++// One 4x4 colour block of DXT1 (with its 1-bit alpha) or of DXT3/5 (always four colours)
++void DxtColour(const uint8_t *b, bool dxt1, uint8_t out[16][4])
++{
++    const uint16_t c0 = rd16(b), c1 = rd16(b + 2);
++    uint8_t pal[4][4] = {};
++    Rgb565(c0, pal[0]);
++    Rgb565(c1, pal[1]);
++    pal[0][3] = pal[1][3] = 255;
++    for (int i = 0; i < 3; i++) {
++        if (!dxt1 || c0 > c1) {
++            pal[2][i] = (2 * pal[0][i] + pal[1][i]) / 3;
++            pal[3][i] = (pal[0][i] + 2 * pal[1][i]) / 3;
++        } else {
++            pal[2][i] = (pal[0][i] + pal[1][i]) / 2;
++            pal[3][i] = 0;
++        }
++    }
++    pal[2][3] = 255;
++    pal[3][3] = (!dxt1 || c0 > c1) ? 255 : 0;
++    const uint32_t idx = rd32(b + 4);
++    for (int p = 0; p < 16; p++) {
++        memcpy(out[p], pal[(idx >> (2 * p)) & 3], 4);
++    }
++}
++
++void DxtAlpha5(const uint8_t *b, uint8_t out[16][4])
++{
++    uint8_t a[8] = { b[0], b[1] };
++    if (a[0] > a[1]) {
++        for (int i = 1; i < 7; i++) {
++            a[i + 1] = ((7 - i) * a[0] + i * a[1]) / 7;
++        }
++    } else {
++        for (int i = 1; i < 5; i++) {
++            a[i + 1] = ((5 - i) * a[0] + i * a[1]) / 5;
++        }
++        a[6] = 0;
++        a[7] = 255;
++    }
++    uint64_t bits = 0;
++    for (int i = 0; i < 6; i++) {
++        bits |= (uint64_t)b[2 + i] << (8 * i);
++    }
++    for (int p = 0; p < 16; p++) {
++        out[p][3] = a[(bits >> (3 * p)) & 7];
++    }
++}
++
++// The NV2A's swizzle (Morton order; the larger side's remaining bits follow): texel index of x, y
++uint32_t Swizzle(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
++{
++    uint32_t out = 0, bit = 0;
++    for (uint32_t m = 1; m < w || m < h; m <<= 1) {
++        if (m < w) {
++            out |= ((x & m) ? 1u : 0u) << bit++;
++        }
++        if (m < h) {
++            out |= ((y & m) ? 1u : 0u) << bit++;
++        }
++    }
++    return out;
++}
++
++bool DecodeXpr(const uint8_t *x, size_t n, Game &g)
++{
++    if (n < 32 || memcmp(x, "XPR0", 4) != 0) {
++        return false;
++    }
++    const uint32_t hdr = rd32(x + 8);
++    const uint32_t data = rd32(x + 16), format = rd32(x + 24), size = rd32(x + 28);
++    const uint32_t fmt = (format >> 8) & 0xff;
++    int w, h;
++    if (size) {
++        w = (size & 0xfff) + 1;
++        h = ((size >> 12) & 0xfff) + 1;
++    } else {
++        w = 1 << ((format >> 20) & 0xf);
++        h = 1 << ((format >> 24) & 0xf);
++    }
++    if (w > 1024 || h > 1024 || (uint64_t)hdr + data >= n) {
++        return false;
++    }
++    const uint8_t *px = x + hdr + data;
++    const size_t avail = n - hdr - data;
++    std::vector<uint8_t> out((size_t)w * h * 4);
++    switch (fmt) {
++    case 0x0C: case 0x0E: case 0x0F: {   // DXT1, DXT2/3, DXT4/5
++        const size_t blockBytes = fmt == 0x0C ? 8 : 16;
++        if (avail < (size_t)(w / 4) * (h / 4) * blockBytes) {
++            return false;
++        }
++        for (int by = 0; by < h / 4; by++) {
++            for (int bx = 0; bx < w / 4; bx++) {
++                const uint8_t *b = px + ((size_t)by * (w / 4) + bx) * blockBytes;
++                uint8_t texel[16][4];
++                if (fmt == 0x0C) {
++                    DxtColour(b, true, texel);
++                } else {
++                    DxtColour(b + 8, false, texel);
++                    if (fmt == 0x0E) {
++                        for (int p = 0; p < 16; p++) {
++                            texel[p][3] = ((b[p / 2] >> (4 * (p & 1))) & 15) * 17;
++                        }
++                    } else {
++                        DxtAlpha5(b, texel);
++                    }
++                }
++                for (int p = 0; p < 16; p++) {
++                    memcpy(&out[(((size_t)by * 4 + p / 4) * w + bx * 4 + p % 4) * 4], texel[p], 4);
++                }
++            }
++        }
++        break;
++    }
++    case 0x06: case 0x07: case 0x12: case 0x1E: {   // A8R8G8B8 / X8R8G8B8, swizzled or linear
++        if (avail < (size_t)w * h * 4) {
++            return false;
++        }
++        const bool linear = fmt >= 0x10;
++        for (int y = 0; y < h; y++) {
++            for (int xx = 0; xx < w; xx++) {
++                const uint8_t *s = px + (size_t)(linear ? y * w + xx : Swizzle(xx, y, w, h)) * 4;
++                uint8_t *d = &out[((size_t)y * w + xx) * 4];
++                d[0] = s[2];
++                d[1] = s[1];
++                d[2] = s[0];
++                d[3] = (fmt == 0x07 || fmt == 0x1E) ? 255 : s[3];
++            }
++        }
++        break;
++    }
++    default:
++        return false;
++    }
++    g.rgba.swap(out);
++    g.w = w;
++    g.h = h;
++    return true;
++}
++
++// --- default.xbe: title, title ID, title image ---------------------------------------------------
++
++void ReadXbe(int fd, uint64_t xbeOff, uint32_t xbeSize, Game &g)
++{
++    std::vector<uint8_t> head(std::min<uint32_t>(xbeSize, 0x10000));
++    if (head.size() < 0x180 || !ReadAt(fd, xbeOff, head.data(), head.size()) || memcmp(head.data(), "XBEH", 4) != 0) {
++        return;
++    }
++    const uint32_t base = rd32(&head[0x104]);
++    const uint32_t certAddr = rd32(&head[0x118]);
++    const uint32_t numSections = rd32(&head[0x11C]);
++    const uint32_t secAddr = rd32(&head[0x120]);
++    const uint32_t cert = certAddr - base;
++    if (cert + 0x5C <= head.size()) {
++        char tid[16];
++        const uint32_t id = rd32(&head[cert + 8]);
++        snprintf(tid, sizeof(tid), "%c%c-%03u", (char)(id >> 24), (char)((id >> 16) & 0xff), id & 0xffff);
++        g.titleId = tid;
++        std::string name;
++        for (int i = 0; i < 40; i++) {
++            const uint16_t c = rd16(&head[cert + 0xC + i * 2]);
++            if (c == 0) {
++                break;
++            }
++            if (c < 0x80) {
++                name += (char)c;
++            } else if (c < 0x800) {
++                name += (char)(0xC0 | (c >> 6));
++                name += (char)(0x80 | (c & 0x3F));
++            } else {
++                name += (char)(0xE0 | (c >> 12));
++                name += (char)(0x80 | ((c >> 6) & 0x3F));
++                name += (char)(0x80 | (c & 0x3F));
++            }
++        }
++        if (!name.empty()) {
++            g.title = name;
++        }
++    }
++    const uint32_t sec = secAddr - base;
++    for (uint32_t i = 0; i < numSections && i < 128 && sec + (i + 1) * 0x38 <= head.size(); i++) {
++        const uint8_t *s = &head[sec + i * 0x38];
++        const uint32_t raw = rd32(s + 0xC), rawSize = rd32(s + 0x10), nameAddr = rd32(s + 0x14);
++        const uint32_t nameOff = nameAddr - base;
++        if (nameOff + 10 > head.size() || memcmp(&head[nameOff], "$$XTIMAGE", 10) != 0) {
++            continue;
++        }
++        if (rawSize == 0 || rawSize > (4u << 20) || (uint64_t)raw + rawSize > xbeSize) {
++            return;
++        }
++        std::vector<uint8_t> img(rawSize);
++        if (ReadAt(fd, xbeOff + raw, img.data(), rawSize)) {
++            DecodeXpr(img.data(), img.size(), g);
++        }
++        return;
++    }
++}
++
++void ReadIso(Game &g)
++{
++    const int fd = open(g.path.c_str(), O_RDONLY);
++    if (fd < 0) {
++        return;
++    }
++    uint64_t base;
++    uint8_t vd[28];
++    if (FindPartition(fd, &base) && ReadAt(fd, base + 0x10000, vd, sizeof(vd))) {
++        const uint32_t rootSector = rd32(vd + 20), rootSize = rd32(vd + 24);
++        std::vector<uint8_t> dir(std::min<uint32_t>(rootSize, 1u << 20));
++        uint32_t sector, size;
++        if (!dir.empty() && ReadAt(fd, base + (uint64_t)rootSector * 2048, dir.data(), dir.size()) &&
++            FindInDir(dir, 0, "default.xbe", &sector, &size, 0)) {
++            ReadXbe(fd, base + (uint64_t)sector * 2048, size, g);
++        }
++    }
++    close(fd);
++}
++
++// --- the cache: title, ID and the cover's pixels, valid for the ISO's size and time ---------------
++
++std::string CachePath(const Game &g)
++{
++    return std::string(kCache) + "/" + g.stem + ".bin";
++}
++
++bool LoadCache(Game &g, const struct stat &st)
++{
++    FILE *f = fopen(CachePath(g).c_str(), "rb");
++    if (!f) {
++        return false;
++    }
++    uint32_t h[8];
++    bool ok = fread(h, sizeof(h), 1, f) == 1 && h[0] == 0x31564358 /* XCV1 */ &&
++              h[1] == (uint32_t)st.st_size && h[2] == (uint32_t)(st.st_size >> 32) &&
++              h[3] == (uint32_t)st.st_mtime && h[6] < 256 && h[7] < 32 && h[4] <= 1024 && h[5] <= 1024;
++    if (ok) {
++        std::string title(h[6], '\0'), tid(h[7], '\0');
++        ok = (h[6] == 0 || fread(&title[0], h[6], 1, f) == 1) && (h[7] == 0 || fread(&tid[0], h[7], 1, f) == 1);
++        g.w = h[4];
++        g.h = h[5];
++        g.rgba.resize((size_t)g.w * g.h * 4);
++        ok = ok && (g.rgba.empty() || fread(g.rgba.data(), g.rgba.size(), 1, f) == 1);
++        if (ok) {
++            if (!title.empty()) {
++                g.title = title;
++            }
++            g.titleId = tid;
++        }
++    }
++    fclose(f);
++    if (!ok) {
++        g.rgba.clear();
++        g.w = g.h = 0;
++    }
++    return ok;
++}
++
++void SaveCache(const Game &g, const struct stat &st)
++{
++    mkdir(kCovers, 0777);
++    mkdir(kCache, 0777);
++    FILE *f = fopen(CachePath(g).c_str(), "wb");
++    if (!f) {
++        return;
++    }
++    const uint32_t h[8] = { 0x31564358, (uint32_t)st.st_size, (uint32_t)(st.st_size >> 32), (uint32_t)st.st_mtime,
++                            (uint32_t)g.w, (uint32_t)g.h, (uint32_t)std::min<size_t>(g.title.size(), 255),
++                            (uint32_t)std::min<size_t>(g.titleId.size(), 31) };
++    fwrite(h, sizeof(h), 1, f);
++    fwrite(g.title.data(), h[6], 1, f);
++    fwrite(g.titleId.data(), h[7], 1, f);
++    if (!g.rgba.empty()) {
++        fwrite(g.rgba.data(), g.rgba.size(), 1, f);
++    }
++    fclose(f);
++}
++
++// The user's box art: /data/xemu/covers/<iso name>.png / .jpg
++bool LoadUserCover(Game &g)
++{
++    static const char *const exts[] = { ".png", ".jpg", ".jpeg", ".PNG", ".JPG" };
++    for (const char *e : exts) {
++        const std::string p = std::string(kCovers) + "/" + g.stem + e;
++        int w, h, n;
++        stbi_uc *px = stbi_load(p.c_str(), &w, &h, &n, 4);
++        if (px) {
++            // large pictures shrink to at most 512 a side (point sampling: it is only a cover)
++            int tw = w, th = h;
++            while (tw > 512 || th > 512) {
++                tw /= 2;
++                th /= 2;
++            }
++            g.rgba.resize((size_t)tw * th * 4);
++            for (int y = 0; y < th; y++) {
++                for (int x = 0; x < tw; x++) {
++                    memcpy(&g.rgba[((size_t)y * tw + x) * 4], px + ((size_t)(y * h / th) * w + x * w / tw) * 4, 4);
++                }
++            }
++            g.w = tw;
++            g.h = th;
++            g.userCover = true;
++            stbi_image_free(px);
++            return true;
++        }
++    }
++    return false;
++}
++
++void ScanGames()
++{
++    std::vector<std::string> files;
++    if (DIR *d = opendir(kGames)) {
++        while (dirent *e = readdir(d)) {
++            const char *dot = strrchr(e->d_name, '.');
++            if (e->d_name[0] != '.' && dot && (strcasecmp(dot, ".iso") == 0 || strcasecmp(dot, ".xiso") == 0)) {
++                files.emplace_back(e->d_name);
++            }
++        }
++        closedir(d);
++    }
++    std::sort(files.begin(), files.end(), [](const std::string &a, const std::string &b) {
++        return strcasecmp(a.c_str(), b.c_str()) < 0;
++    });
++    for (const std::string &f : files) {
++        Game g;
++        g.file = f;
++        g.path = std::string(kGames) + "/" + f;
++        g.stem = f.substr(0, f.rfind('.'));
++        g.title = g.stem;
++        struct stat st;
++        if (stat(g.path.c_str(), &st) == 0) {
++            if (!LoadCache(g, st)) {
++                ReadIso(g);
++                SaveCache(g, st);
++            }
++        }
++        Game user = g;
++        if (LoadUserCover(user)) {
++            g.rgba.swap(user.rgba);
++            g.w = user.w;
++            g.h = user.h;
++            g.userCover = true;
++        }
++        std::lock_guard<std::mutex> lock(sLock);
++        sGames.push_back(std::move(g));
++    }
++}
++
++void StartScan()
++{
++    if (sScanning.exchange(true)) {
++        return;
++    }
++    {
++        std::lock_guard<std::mutex> lock(sLock);
++        sGames.clear();
++    }
++    sScanned = false;
++    std::thread([] {
++        ScanGames();
++        sScanned = true;
++        sScanning = false;
++    }).detach();
++}
++
++// --- drawing ---------------------------------------------------------------------------------
++
++constexpr ImU32 kGreen = IM_COL32(16, 124, 16, 255);
++constexpr ImU32 kLime = IM_COL32(155, 240, 11, 255);
++
++void Glow(ImDrawList *dl, ImVec2 c, float r, ImU32 rgb, float alpha)
++{
++    for (int i = 12; i >= 1; i--) {
++        const float t = i / 12.0f;
++        dl->AddCircleFilled(c, r * t, (rgb & 0x00FFFFFF) | ((ImU32)(alpha * (1.0f - t) * 40.0f) << 24), 64);
++    }
++}
++
++void DrawCard(ImDrawList *dl, const Game &g, ImVec2 center, float scale, bool selected)
++{
++    const float cw = 300.0f * scale, ch = 420.0f * scale;
++    const ImVec2 a(center.x - cw / 2, center.y - ch / 2), b(center.x + cw / 2, center.y + ch / 2);
++    if (selected) {
++        for (int i = 6; i >= 1; i--) {
++            dl->AddRect(ImVec2(a.x - i * 3, a.y - i * 3), ImVec2(b.x + i * 3, b.y + i * 3),
++                        IM_COL32(155, 240, 11, 18 * (7 - i)), 18.0f + i * 3, 0, 3.0f);
++        }
++    }
++    dl->AddRectFilledMultiColor(a, b, IM_COL32(28, 34, 30, 255), IM_COL32(28, 34, 30, 255),
++                                IM_COL32(10, 14, 11, 255), IM_COL32(10, 14, 11, 255));
++    if (g.tex) {
++        // the picture as large as fits the card, its own aspect ratio
++        const float pad = 12.0f * scale;
++        const float aw = cw - 2 * pad, ah = ch - 2 * pad;
++        const float s = std::min(aw / g.w, ah / g.h);
++        const float iw = g.w * s, ih = g.h * s;
++        const ImVec2 ia(center.x - iw / 2, center.y - ih / 2);
++        dl->AddImageRounded(g.tex, ia, ImVec2(ia.x + iw, ia.y + ih), ImVec2(0, 0), ImVec2(1, 1),
++                            IM_COL32_WHITE, 10.0f * scale);
++    } else {
++        // no picture: the title on the card
++        ImFont *f = ps4_font_title ? ps4_font_title : ImGui::GetFont();
++        const float fs = f->FontSize * 0.6f * scale;
++        dl->AddText(f, fs, ImVec2(a.x + 20 * scale, center.y - fs), IM_COL32(220, 230, 220, 255), g.title.c_str(),
++                    nullptr, cw - 40 * scale);
++    }
++    dl->AddRect(a, b, selected ? kLime : IM_COL32(60, 70, 62, 255), 14.0f * scale, 0, selected ? 4.0f : 2.0f);
++    if (!selected) {
++        dl->AddRectFilled(a, b, IM_COL32(0, 0, 0, 110), 14.0f * scale);
++    }
++}
++
++void HandleInput(int count)
++{
++    if (ps4_menu_open) {
++        return;     // the quick menu (L3+R3) is over the library and takes the buttons
++    }
++    const uint32_t btn = ps4_pad_menu_pressed();
++    if (count > 0) {
++        if (btn & ORBIS_PAD_BUTTON_LEFT) {
++            sSel = (sSel + count - 1) % count;
++        }
++        if (btn & ORBIS_PAD_BUTTON_RIGHT) {
++            sSel = (sSel + 1) % count;
++        }
++        if (btn & ORBIS_PAD_BUTTON_L1) {
++            sSel = std::max(0, sSel - 5);
++        }
++        if (btn & ORBIS_PAD_BUTTON_R1) {
++            sSel = std::min(count - 1, sSel + 5);
++        }
++        if (btn & ORBIS_PAD_BUTTON_CROSS) {
++            std::lock_guard<std::mutex> lock(sLock);
++            sPickPath = sGames[sSel].path;
++            sPick = sPickPath.c_str();
++            ps4_launcher_active = false;
++        }
++    }
++    if (btn & ORBIS_PAD_BUTTON_TRIANGLE) {
++        // rescan (and re-read every game: the cache is only skipped for changed files)
++        StartScan();
++    }
++    if ((btn & ORBIS_PAD_BUTTON_CIRCLE) && sOpenedInGame) {
++        ps4_launcher_active = false;    // back to the game
++        ps4_pause_emulation(false);
++    }
++    if (btn & ORBIS_PAD_BUTTON_OPTIONS) {
++        ps4_menu_open = true;           // settings: the quick menu over the library
++    }
++}
++} // namespace
++
++bool ps4_launcher_active;
++
++void ps4_launcher_open(void)
++{
++    sOpenedInGame = ps4_emulation_started;
++    ps4_launcher_active = true;
++    if (!sScanned && !sScanning) {
++        StartScan();
++    }
++}
++
++const char *ps4_launcher_take_pick(void)
++{
++    const char *p = sPick;
++    sPick = nullptr;
++    return p;
++}
++
++bool ps4_launcher_draw(void)
++{
++    if (!ps4_launcher_active) {
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(sLock);
++    const int count = (int)sGames.size();
++    if (sSel >= count) {
++        sSel = std::max(0, count - 1);
++    }
++    // covers to textures, a few a frame
++    int uploads = 0;
++    for (Game &g : sGames) {
++        if (!g.tex && !g.rgba.empty() && uploads < 3) {
++            g.tex = (ImTextureID)ps4_present_texture(g.rgba.data(), g.w, g.h);
++            std::vector<uint8_t>().swap(g.rgba);
++            uploads++;
++        }
++    }
++    sLock.unlock();
++    HandleInput(count);
++    sLock.lock();
++
++    const ImVec2 screen = ImGui::GetIO().DisplaySize;
++    ImDrawList *dl = ImGui::GetBackgroundDrawList();
++    // the backdrop: black to a deep green, the dashboard's glow in the middle
++    dl->AddRectFilledMultiColor(ImVec2(0, 0), screen, IM_COL32(2, 8, 3, 255), IM_COL32(2, 8, 3, 255),
++                                IM_COL32(4, 30, 8, 255), IM_COL32(4, 30, 8, 255));
++    Glow(dl, ImVec2(screen.x * 0.5f, screen.y * 0.46f), screen.y * 0.75f, kGreen, 1.0f);
++    // the x in a circle, and the title
++    const ImVec2 logo(110.0f, 96.0f);
++    dl->AddCircleFilled(logo, 40.0f, kGreen, 48);
++    dl->AddCircle(logo, 40.0f, kLime, 48, 3.0f);
++    dl->AddLine(ImVec2(logo.x - 18, logo.y - 18), ImVec2(logo.x + 18, logo.y + 18), IM_COL32_WHITE, 8.0f);
++    dl->AddLine(ImVec2(logo.x + 18, logo.y - 18), ImVec2(logo.x - 18, logo.y + 18), IM_COL32_WHITE, 8.0f);
++    ImFont *big = ps4_font_title ? ps4_font_title : ImGui::GetFont();
++    ImFont *small = ps4_font_small ? ps4_font_small : ImGui::GetFont();
++    dl->AddText(big, big->FontSize, ImVec2(170.0f, 60.0f), IM_COL32_WHITE, "xemu");
++    char countText[64];
++    snprintf(countText, sizeof(countText), sScanning ? "Reading games... %d" : "%d games", count);
++    dl->AddText(small, small->FontSize, ImVec2(174.0f, 60.0f + big->FontSize), IM_COL32(160, 200, 160, 255), countText);
++
++    if (count == 0) {
++        const char *msg = sScanning ? "Looking for games..." : "Put your Xbox games (.iso) in /data/xemu/games";
++        const ImVec2 ts = big->CalcTextSizeA(big->FontSize * 0.7f, FLT_MAX, 0.0f, msg);
++        dl->AddText(big, big->FontSize * 0.7f, ImVec2((screen.x - ts.x) / 2, screen.y * 0.45f), IM_COL32_WHITE, msg);
++    } else {
++        // the carousel: the picked game in the middle, larger
++        sScroll += (sSel - sScroll) * 0.2f;
++        const float spacing = 340.0f;
++        const float cy = screen.y * 0.46f;
++        for (int pass = 0; pass < 2; pass++) {   // the others first, the selected one on top
++            for (int i = 0; i < count; i++) {
++                const bool sel = i == sSel;
++                if ((pass == 1) != sel) {
++                    continue;
++                }
++                const float dx = (i - sScroll) * spacing;
++                if (std::fabs(dx) > screen.x) {
++                    continue;
++                }
++                const float t = std::min(1.0f, std::fabs(i - sScroll));
++                DrawCard(dl, sGames[i], ImVec2(screen.x * 0.5f + dx, cy), 1.18f - 0.3f * t, sel);
++            }
++        }
++        const Game &g = sGames[sSel];
++        const ImVec2 ts = big->CalcTextSizeA(big->FontSize, FLT_MAX, 0.0f, g.title.c_str());
++        dl->AddText(big, big->FontSize, ImVec2((screen.x - ts.x) / 2, cy + 280.0f), IM_COL32_WHITE, g.title.c_str());
++        std::string sub = g.titleId.empty() ? g.file : g.titleId + "   " + g.file;
++        const ImVec2 ss = small->CalcTextSizeA(small->FontSize, FLT_MAX, 0.0f, sub.c_str());
++        dl->AddText(small, small->FontSize, ImVec2((screen.x - ss.x) / 2, cy + 290.0f + big->FontSize),
++                    IM_COL32(150, 190, 150, 255), sub.c_str());
++    }
++    // the blade along the bottom: what the buttons do
++    const float by = screen.y - 84.0f;
++    dl->AddRectFilledMultiColor(ImVec2(0, by), ImVec2(screen.x, screen.y), kGreen, IM_COL32(9, 80, 9, 255),
++                                IM_COL32(9, 80, 9, 255), kGreen);
++    dl->AddLine(ImVec2(0, by), ImVec2(screen.x, by), kLime, 3.0f);
++    const char *hints = sOpenedInGame
++                            ? "Cross  Play        Circle  Back to the game        Triangle  Refresh        Options  Settings"
++                            : "Cross  Play        L1 / R1  Page        Triangle  Refresh        Options  Settings";
++    dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), ImVec2(64.0f, by + 24.0f), IM_COL32_WHITE, hints);
++    return true;
++}
+diff --git a/ui/ps4/ps4-live.c b/ui/ps4/ps4-live.c
+new file mode 100644
+index 0000000..5071fcb
+--- /dev/null
++++ b/ui/ps4/ps4-live.c
+@@ -0,0 +1,206 @@
++/*
++ * xemu-ps4: the live console - a TCP port on the PS4 (ps4.ini live_port, default 4445; 0 = off)
++ * to look into and steer the running emulator from a PC (scripts/live.py). One client at a time,
++ * one command per line; every answer ends with a line holding a single ".".
++ *
++ *   help                 the commands
++ *   stats                the monitor's last line (frame rates, thread loads, main loop, TLB)
++ *   hmp <command>        a QEMU monitor command: info registers, x/64xb $eip, xp, info tlb,
++ *                        info mtree, stop, cont, system_reset, ... (as in xemu's desktop monitor)
++ *   mem <addr> [len]     guest physical memory, hex (len up to 4096, default 64)
++ *   profile [seconds]    a CPU profile of the emulation threads (profiles/profile_N.txt)
++ *   dump                 every thread's call stack into hang.log
++ *   get [key]            ps4.ini settings (all of them without a key)
++ *   set <key> <value>    change one (the live ones apply at once; see ps4-settings.h)
++ *   quit                 close the connection
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/thread.h"
++#include "qemu/main-loop.h"
++#include "qapi/error.h"
++#include "qapi/qapi-commands-misc.h"
++#include "exec/cpu-common.h"
++#include "system/memory.h"
++#include "ps4-frontend.h"
++#include "ps4-settings.h"
++#include "ps4_kit_diag.h"
++
++#include <netinet/in.h>
++#include <sys/socket.h>
++
++char ps4_live_last_monitor[1024];
++
++static int live_port;
++
++static void send_all(int fd, const char *s, size_t n)
++{
++    while (n > 0) {
++        ssize_t w = send(fd, s, n, 0);
++        if (w <= 0) {
++            return;
++        }
++        s += w;
++        n -= w;
++    }
++}
++
++static void reply(int fd, GString *out)
++{
++    if (out->len == 0 || out->str[out->len - 1] != '\n') {
++        g_string_append_c(out, '\n');
++    }
++    g_string_append(out, ".\n");
++    send_all(fd, out->str, out->len);
++}
++
++static void cmd_hmp(GString *out, const char *line)
++{
++    Error *err = NULL;
++    bql_lock();
++    char *text = qmp_human_monitor_command(line, false, 0, &err);
++    bql_unlock();
++    if (err) {
++        g_string_append_printf(out, "error: %s\n", error_get_pretty(err));
++        error_free(err);
++    }
++    if (text) {
++        g_string_append(out, text);
++        g_free(text);
++    }
++}
++
++static void cmd_mem(GString *out, const char *args)
++{
++    unsigned long long addr = 0, len = 64;
++    if (sscanf(args, "%llx %llu", &addr, &len) < 1) {
++        g_string_append(out, "usage: mem <hex address> [length]\n");
++        return;
++    }
++    len = MIN(len, 4096);
++    uint8_t buf[4096];
++    cpu_physical_memory_read(addr, buf, len);
++    for (unsigned long long i = 0; i < len; i += 16) {
++        g_string_append_printf(out, "%08llx:", addr + i);
++        for (unsigned long long j = i; j < MIN(i + 16, len); j++) {
++            g_string_append_printf(out, " %02x", buf[j]);
++        }
++        g_string_append_c(out, '\n');
++    }
++}
++
++static void run_command(int fd, char *line)
++{
++    g_autoptr(GString) out = g_string_new(NULL);
++    char *args = strchr(line, ' ');
++    if (args) {
++        *args++ = '\0';
++        while (*args == ' ') {
++            args++;
++        }
++    } else {
++        args = line + strlen(line);
++    }
++    if (strcmp(line, "help") == 0) {
++        g_string_append(out, "stats | hmp <monitor command> | mem <addr> [len] | profile [s] | dump | "
++                             "get [key] | set <key> <value> | quit\n");
++    } else if (strcmp(line, "stats") == 0) {
++        g_string_append(out, ps4_live_last_monitor);
++    } else if (strcmp(line, "hmp") == 0) {
++        cmd_hmp(out, args);
++    } else if (strcmp(line, "mem") == 0) {
++        cmd_mem(out, args);
++    } else if (strcmp(line, "profile") == 0) {
++        g_string_append(out, ps4_profile_now("live") ? "profiling: profiles/profile_N.txt in 8 s\n"
++                                                     : "a profile is running\n");
++    } else if (strcmp(line, "dump") == 0) {
++        ps4_dump_thread_stacks("/data/xemu/hang.log", "live console");
++        g_string_append(out, "thread stacks in /data/xemu/hang.log\n");
++    } else if (strcmp(line, "get") == 0) {
++        ps4_settings_describe(out, *args ? args : NULL);
++    } else if (strcmp(line, "set") == 0) {
++        char *val = strchr(args, ' ');
++        if (val == NULL) {
++            g_string_append(out, "usage: set <key> <value>\n");
++        } else {
++            *val++ = '\0';
++            g_string_append(out, ps4_settings_set_text(args, val) ? "ok\n" : "no such setting\n");
++            ps4_settings_save();
++        }
++    } else if (line[0] != '\0') {
++        g_string_append_printf(out, "unknown command '%s' (help)\n", line);
++    }
++    reply(fd, out);
++}
++
++static void *live_thread(void *opaque)
++{
++    int srv = socket(AF_INET, SOCK_STREAM, 0);
++    if (srv < 0) {
++        ps4_boot_tracef("live console: socket failed (%d)", errno);
++        return NULL;
++    }
++    int one = 1;
++    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
++    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(live_port) };
++    a.sin_addr.s_addr = htonl(INADDR_ANY);
++    if (bind(srv, (struct sockaddr *)&a, sizeof(a)) != 0 || listen(srv, 1) != 0) {
++        ps4_boot_tracef("live console: port %d not available (%d)", live_port, errno);
++        close(srv);
++        return NULL;
++    }
++    ps4_boot_tracef("live console on TCP port %d", live_port);
++    for (;;) {
++        int fd = accept(srv, NULL, NULL);
++        if (fd < 0) {
++            g_usleep(100000);
++            continue;
++        }
++        char buf[2048];
++        size_t have = 0;
++        for (;;) {
++            ssize_t r = recv(fd, buf + have, sizeof(buf) - 1 - have, 0);
++            if (r <= 0) {
++                break;
++            }
++            have += r;
++            buf[have] = '\0';
++            char *nl;
++            bool quit = false;
++            while ((nl = strchr(buf, '\n')) != NULL) {
++                *nl = '\0';
++                if (nl > buf && nl[-1] == '\r') {
++                    nl[-1] = '\0';
++                }
++                if (strcmp(buf, "quit") == 0) {
++                    quit = true;
++                } else {
++                    run_command(fd, buf);
++                }
++                size_t used = nl + 1 - buf;
++                memmove(buf, nl + 1, have - used + 1);
++                have -= used;
++            }
++            if (quit || have == sizeof(buf) - 1) {
++                break;
++            }
++        }
++        close(fd);
++    }
++    return NULL;
++}
++
++void ps4_live_start(int port)
++{
++    if (port <= 0) {
++        return;
++    }
++    live_port = port;
++    static QemuThread thread;
++    qemu_thread_create(&thread, "ps4-live", live_thread, NULL, QEMU_THREAD_DETACHED);
++}
 diff --git a/ui/ps4/ps4-pad.c b/ui/ps4/ps4-pad.c
 new file mode 100644
-index 0000000..032ad15
+index 0000000..c716d7a
 --- /dev/null
 +++ b/ui/ps4/ps4-pad.c
-@@ -0,0 +1,254 @@
+@@ -0,0 +1,262 @@
 +/*
 + * xemu-ps4: the DualShock 4 as an SDL gamepad. SDL has no PS4 joystick driver; its virtual
 + * gamepad stands in, fed from ScePad each time SDL updates its joysticks, so xemu-input.c binds,
@@ -1861,21 +3009,29 @@ index 0000000..032ad15
 +    }
 +    /* L3+R3: the quick menu; its presses don't reach the Xbox */
 +    {
-+        const uint32_t buttons = data.buttons & ~PS4_PAD_INTERCEPTED;
++        uint32_t buttons = data.buttons & ~PS4_PAD_INTERCEPTED;
 +        const uint32_t combo = ORBIS_PAD_BUTTON_L3 | ORBIS_PAD_BUTTON_R3;
-+        const bool was_open = ps4_menu_open;
++        const bool menus = ps4_menu_open || ps4_launcher_active;
++        if (menus) {
++            /* in the menus the left stick steps like the d-pad */
++            buttons |= data.leftStick.x < 48 ? ORBIS_PAD_BUTTON_LEFT : 0;
++            buttons |= data.leftStick.x > 208 ? ORBIS_PAD_BUTTON_RIGHT : 0;
++            buttons |= data.leftStick.y < 48 ? ORBIS_PAD_BUTTON_UP : 0;
++            buttons |= data.leftStick.y > 208 ? ORBIS_PAD_BUTTON_DOWN : 0;
++        }
++        const bool was_open = ps4_menu_open || ps4_launcher_active;
 +        if ((buttons & combo) == combo && (pad.prev_buttons & combo) != combo) {
 +            ps4_menu_open = !ps4_menu_open;
 +            pad.menu_pressed = 0;
-+        } else if (ps4_menu_open) {
++        } else if (menus) {
 +            pad.menu_pressed |= buttons & ~pad.prev_buttons;
 +        }
 +        pad.prev_buttons = buttons;
-+        if (was_open || ps4_menu_open) {
++        if (was_open || ps4_menu_open || ps4_launcher_active) {
 +            pad.held_from_menu = buttons;
 +        }
 +        pad.held_from_menu &= buttons;
-+        if (ps4_menu_open || (buttons & combo) == combo) {
++        if (ps4_menu_open || ps4_launcher_active || (buttons & combo) == combo) {
 +            data.buttons = 0;
 +            data.leftStick.x = data.leftStick.y = 128;
 +            data.rightStick.x = data.rightStick.y = 128;
@@ -1993,10 +3149,10 @@ index 0000000..032ad15
 +}
 diff --git a/ui/ps4/ps4-present.cc b/ui/ps4/ps4-present.cc
 new file mode 100644
-index 0000000..8f856ab
+index 0000000..a2486cb
 --- /dev/null
 +++ b/ui/ps4/ps4-present.cc
-@@ -0,0 +1,518 @@
+@@ -0,0 +1,664 @@
 +/*
 + * xemu-ps4: presents the emulated display on VideoOut, on the Vulkan renderer's own device and
 + * queue (the PS4 has no OpenGL to hand the picture to, as the desktop frontends do).
@@ -2021,8 +3177,12 @@ index 0000000..8f856ab
 +#include "backends/imgui_impl_vulkan.h"
 +
 +#include <algorithm>
++#include <unistd.h>
 +#include <cstdio>
 +#include <cstring>
++
++// the fonts (ps4-frontend.h's C++ part): titles and small print, null without the TTFs
++ImFont *ps4_font_title, *ps4_font_small;
 +
 +namespace
 +{
@@ -2051,6 +3211,7 @@ index 0000000..8f856ab
 +    VkDeviceMemory lastMemory = VK_NULL_HANDLE;
 +    uint32_t lastWidth = 0, lastHeight = 0;
 +    bool lastValid = false;
++    VkSampler textureSampler = VK_NULL_HANDLE;   // the launcher's covers (ps4_present_texture)
 +} P;
 +
 +bool Check(VkResult r, const char *what);
@@ -2261,7 +3422,20 @@ index 0000000..8f856ab
 +    io.IniFilename = nullptr;
 +    io.DisplaySize = ImVec2((float)ps4wsi::kWidth, (float)ps4wsi::kHeight);
 +    io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
-+    io.FontGlobalScale = 2.0f;      // sized for a TV across the room
++    // Roboto from the package (/app0/data, xemu's data/), sized for a TV across the room; the
++    // default font (doubled) when it is missing
++    // (ImGui asserts on a missing font file: look first)
++    ImFont *text = access("/app0/data/Roboto-Medium.ttf", R_OK) == 0 &&
++                           access("/app0/data/RobotoCondensed-Regular.ttf", R_OK) == 0
++                       ? io.Fonts->AddFontFromFileTTF("/app0/data/Roboto-Medium.ttf", 30.0f)
++                       : nullptr;
++    if (text) {
++        ps4_font_title = io.Fonts->AddFontFromFileTTF("/app0/data/Roboto-Medium.ttf", 54.0f);
++        ps4_font_small = io.Fonts->AddFontFromFileTTF("/app0/data/RobotoCondensed-Regular.ttf", 24.0f);
++        io.FontDefault = text;
++    } else {
++        io.FontGlobalScale = 2.0f;
++    }
 +    ImGui::StyleColorsDark();
 +    ImGui::GetStyle().ScaleAllSizes(2.0f);
 +
@@ -2279,7 +3453,7 @@ index 0000000..8f856ab
 +    info.MinImageCount = 2;
 +    info.ImageCount = P.imageCount;
 +    info.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
-+    info.DescriptorPoolSize = 64;
++    info.DescriptorPoolSize = 512;     // the font + one per cover (the launcher)
 +    if (!ImGui_ImplVulkan_Init(&info)) {
 +        fprintf(stderr, "ps4-present: ImGui_ImplVulkan_Init failed\n");
 +        return false;
@@ -2394,6 +3568,134 @@ index 0000000..8f856ab
 +    vkEndCommandBuffer(cmd);
 +}
 +} // namespace
++
++// An RGBA picture as an ImGui texture on the renderer's device (the launcher's covers): image,
++// upload through a staging buffer on the shared queue, view, and ImGui's descriptor set.
++extern "C" ImTextureID ps4_present_texture(const uint8_t *rgba, int w, int h)
++{
++    if (!P.ready || w <= 0 || h <= 0) {
++        return 0;
++    }
++    VkDevice dev = P.dev.device;
++    if (P.textureSampler == VK_NULL_HANDLE) {
++        VkSamplerCreateInfo si { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
++        si.magFilter = si.minFilter = VK_FILTER_LINEAR;
++        si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++        si.maxLod = 1.0f;
++        if (!Check(vkCreateSampler(dev, &si, nullptr, &P.textureSampler), "vkCreateSampler")) {
++            return 0;
++        }
++    }
++    VkImageCreateInfo ici { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
++    ici.imageType = VK_IMAGE_TYPE_2D;
++    ici.format = VK_FORMAT_R8G8B8A8_UNORM;
++    ici.extent = { (uint32_t)w, (uint32_t)h, 1 };
++    ici.mipLevels = 1;
++    ici.arrayLayers = 1;
++    ici.samples = VK_SAMPLE_COUNT_1_BIT;
++    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
++    ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++    VkImage image;
++    if (!Check(vkCreateImage(dev, &ici, nullptr, &image), "vkCreateImage (texture)")) {
++        return 0;
++    }
++    VkMemoryRequirements req;
++    vkGetImageMemoryRequirements(dev, image, &req);
++    VkMemoryAllocateInfo mai { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
++    mai.allocationSize = req.size;
++    mai.memoryTypeIndex = DeviceLocalMemoryType(req.memoryTypeBits);
++    VkDeviceMemory memory;
++    if (!Check(vkAllocateMemory(dev, &mai, nullptr, &memory), "vkAllocateMemory (texture)")) {
++        vkDestroyImage(dev, image, nullptr);
++        return 0;
++    }
++    vkBindImageMemory(dev, image, memory, 0);
++
++    // staging buffer, host visible
++    const VkDeviceSize bytes = (VkDeviceSize)w * h * 4;
++    VkBufferCreateInfo bci { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
++    bci.size = bytes;
++    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
++    VkBuffer staging;
++    vkCreateBuffer(dev, &bci, nullptr, &staging);
++    vkGetBufferMemoryRequirements(dev, staging, &req);
++    VkPhysicalDeviceMemoryProperties props;
++    vkGetPhysicalDeviceMemoryProperties(P.dev.physical_device, &props);
++    uint32_t hostType = 0;
++    for (uint32_t i = 0; i < props.memoryTypeCount; i++) {
++        const VkMemoryPropertyFlags want =
++            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++        if ((req.memoryTypeBits & (1u << i)) && (props.memoryTypes[i].propertyFlags & want) == want) {
++            hostType = i;
++            break;
++        }
++    }
++    mai.allocationSize = req.size;
++    mai.memoryTypeIndex = hostType;
++    VkDeviceMemory stagingMemory;
++    vkAllocateMemory(dev, &mai, nullptr, &stagingMemory);
++    vkBindBufferMemory(dev, staging, stagingMemory, 0);
++    void *map = nullptr;
++    vkMapMemory(dev, stagingMemory, 0, bytes, 0, &map);
++    memcpy(map, rgba, bytes);
++    vkUnmapMemory(dev, stagingMemory);
++
++    VkCommandBufferAllocateInfo cai { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
++    cai.commandPool = P.pool;
++    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++    cai.commandBufferCount = 1;
++    VkCommandBuffer cmd;
++    vkAllocateCommandBuffers(dev, &cai, &cmd);
++    VkCommandBufferBeginInfo bi { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
++    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++    vkBeginCommandBuffer(cmd, &bi);
++    ImageBarrier(cmd, image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
++                 VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                 VK_PIPELINE_STAGE_TRANSFER_BIT);
++    VkBufferImageCopy copy {};
++    copy.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
++    copy.imageExtent = { (uint32_t)w, (uint32_t)h, 1 };
++    vkCmdCopyBufferToImage(cmd, staging, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
++    ImageBarrier(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
++                 VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
++    vkEndCommandBuffer(cmd);
++    VkFenceCreateInfo fci { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
++    VkFence fence;
++    vkCreateFence(dev, &fci, nullptr, &fence);
++    VkSubmitInfo si { VK_STRUCTURE_TYPE_SUBMIT_INFO };
++    si.commandBufferCount = 1;
++    si.pCommandBuffers = &cmd;
++    nv2a_vk_ps4_queue_lock();
++    VkResult r = vkQueueSubmit(P.dev.queue, 1, &si, fence);
++    nv2a_vk_ps4_queue_unlock();
++    if (r == VK_SUCCESS) {
++        vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX);
++    }
++    vkDestroyFence(dev, fence, nullptr);
++    vkFreeCommandBuffers(dev, P.pool, 1, &cmd);
++    vkDestroyBuffer(dev, staging, nullptr);
++    vkFreeMemory(dev, stagingMemory, nullptr);
++    if (r != VK_SUCCESS) {
++        vkDestroyImage(dev, image, nullptr);
++        vkFreeMemory(dev, memory, nullptr);
++        return 0;
++    }
++
++    VkImageViewCreateInfo vi { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
++    vi.image = image;
++    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
++    vi.format = VK_FORMAT_R8G8B8A8_UNORM;
++    vi.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++    VkImageView view;
++    if (!Check(vkCreateImageView(dev, &vi, nullptr, &view), "vkCreateImageView (texture)")) {
++        return 0;
++    }
++    // (kept for the app's lifetime: covers are few and small)
++    return (ImTextureID)ImGui_ImplVulkan_AddTexture(P.textureSampler, view,
++                                                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++}
 +
 +extern "C" bool ps4_present_ready(void)
 +{
@@ -2517,10 +3819,10 @@ index 0000000..8f856ab
 +}
 diff --git a/ui/ps4/ps4-settings.c b/ui/ps4/ps4-settings.c
 new file mode 100644
-index 0000000..873c71c
+index 0000000..ca6074a
 --- /dev/null
 +++ b/ui/ps4/ps4-settings.c
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,150 @@
 +/*
 + * xemu-ps4: the PS4 frontend's own settings (ps4-settings.h), "key = value" lines in
 + * /data/xemu/ps4.ini. Unknown keys are ignored, missing ones keep their defaults.
@@ -2533,6 +3835,7 @@ index 0000000..873c71c
 +
 +#include "qemu/osdep.h"
 +#include "ps4-settings.h"
++#include "ui/xemu-settings.h"
 +
 +#define PS4_SETTINGS_PATH "/data/xemu/ps4.ini"
 +
@@ -2550,6 +3853,9 @@ index 0000000..873c71c
 +    .tlb_index = true,
 +    .auto_profile = true,
 +    .audio_resampler = 0,
++    .live_port = 4445,
++    .gdb_port = 0,
++    .boot_launcher = true,
 +};
 +
 +typedef struct {
@@ -2573,6 +3879,9 @@ index 0000000..873c71c
 +    { "tlb_index", T_BOOL, &ps4_settings.tlb_index, 0, 1 },
 +    { "auto_profile", T_BOOL, &ps4_settings.auto_profile, 0, 1 },
 +    { "audio_resampler", T_INT, &ps4_settings.audio_resampler, 0, 1 },
++    { "live_port", T_INT, &ps4_settings.live_port, 0, 65535 },
++    { "gdb_port", T_INT, &ps4_settings.gdb_port, 0, 65535 },
++    { "boot_launcher", T_BOOL, &ps4_settings.boot_launcher, 0, 1 },
 +};
 +
 +void ps4_settings_load(void)
@@ -2615,6 +3924,46 @@ index 0000000..873c71c
 +    g_string_free(s, true);
 +}
 +
++void ps4_settings_describe(GString *out, const char *key)
++{
++    for (size_t i = 0; i < ARRAY_SIZE(fields); i++) {
++        if (key == NULL || strcmp(key, fields[i].key) == 0) {
++            const int v = fields[i].type == T_BOOL ? *(bool *)fields[i].value : *(int *)fields[i].value;
++            g_string_append_printf(out, "%s = %d\n", fields[i].key, v);
++        }
++    }
++    if (key == NULL || strcmp(key, "hrtf") == 0) {
++        g_string_append_printf(out, "hrtf = %d\n", g_config.audio.hrtf);
++    }
++}
++
++bool ps4_settings_set_text(const char *key, const char *value)
++{
++    const int v = atoi(value);
++    if (strcmp(key, "hrtf") == 0) {
++        g_config.audio.hrtf = v != 0;
++        xemu_settings_save();
++        return true;
++    }
++    for (size_t i = 0; i < ARRAY_SIZE(fields); i++) {
++        if (strcmp(key, fields[i].key) != 0) {
++            continue;
++        }
++        const int c = MAX(fields[i].min, MIN(fields[i].max, v));
++        if (fields[i].type == T_BOOL) {
++            *(bool *)fields[i].value = c != 0;
++        } else {
++            *(int *)fields[i].value = c;
++        }
++        if (strcmp(key, "poll_spin_us") == 0 && c >= 0) {
++            extern int64_t ps4_poll_spin_ns;
++            ps4_poll_spin_ns = (int64_t)c * 1000;
++        }
++        return true;
++    }
++    return false;
++}
++
 +int ps4_voice_resampler(void)
 +{
 +    return ps4_settings.audio_resampler;
@@ -2626,10 +3975,10 @@ index 0000000..873c71c
 +}
 diff --git a/ui/ps4/ps4-settings.h b/ui/ps4/ps4-settings.h
 new file mode 100644
-index 0000000..42febbe
+index 0000000..d19a522
 --- /dev/null
 +++ b/ui/ps4/ps4-settings.h
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,69 @@
 +/*
 + * xemu-ps4: the PS4 frontend's own settings (/data/xemu/ps4.ini), next to xemu's xemu.toml.
 + * Changed from the quick menu (ps4-hud.cc); "restart" ones apply at the next start.
@@ -2679,12 +4028,20 @@ index 0000000..42febbe
 +    bool tlb_index;         /* TLB dirty index (accel/tcg/cputlb.c) (restart) */
 +    bool auto_profile;      /* an 8 s CPU profile when the game runs slowly (profiles/) */
 +    int audio_resampler;    /* the APU's voices: 0 linear, 1 sinc (xemu's default) (restart) */
++    int live_port;          /* the live console's TCP port, 0 = off (ps4-live.c) (restart) */
++    int gdb_port;           /* QEMU's GDB stub for the guest CPU, 0 = off (restart) */
++    bool boot_launcher;     /* start in the game library (ps4-launcher.cc) */
 +} PS4Settings;
 +
 +extern PS4Settings ps4_settings;
 +
 +void ps4_settings_load(void);
 +void ps4_settings_save(void);
++/* the live console (ps4-live.c): "key = value" lines of one or all settings; one set from text
++ * (also "hrtf", xemu's own) - false if there is no such key */
++struct _GString;
++void ps4_settings_describe(struct _GString *out, const char *key);
++bool ps4_settings_set_text(const char *key, const char *value);
 +
 +#ifdef __cplusplus
 +}
@@ -2813,10 +4170,10 @@ index 0000000..24e9598
 +}
 diff --git a/ui/ps4/xemu-ps4.c b/ui/ps4/xemu-ps4.c
 new file mode 100644
-index 0000000..924e112
+index 0000000..16fecb3
 --- /dev/null
 +++ b/ui/ps4/xemu-ps4.c
-@@ -0,0 +1,1081 @@
+@@ -0,0 +1,1150 @@
 +/*
 + * xemu-ps4: the PS4 frontend (replaces ui/xemu.c and its SDL window + OpenGL).
 + *
@@ -2845,6 +4202,7 @@ index 0000000..924e112
 +#include "qemu/rcu.h"
 +#include "qapi/error.h"
 +#include "qapi/qapi-commands-block.h"
++#include "qapi/qapi-commands-misc.h"
 +#include "ui/console.h"
 +#include "system/runstate.h"
 +#include "system/system.h"
@@ -3280,7 +4638,7 @@ index 0000000..924e112
 +    { "nv2a.pfifo_thread", 1, 640 },    /* the GPU: push buffer, Vulkan recording, submits */
 +    { "qemu_main", 2, 620 },            /* QEMU's main loop: timers, interrupts, disk I/O */
 +    { "mcpx.apu_thread", 3, 630 },      /* the APU's frame loop and its DSPs (interpreter) */
-+    { "mcpx.voice_worker", -1, 640 },
++    { "mcpx.voice_worker", -1, 680 },
 +    { "vblank-timer", -1, 600 },
 +    { "worker", -1, 700 },              /* QEMU's thread pool (disk reads) */
 +    { "call_rcu", -1, 720 },
@@ -3420,6 +4778,12 @@ index 0000000..924e112
 +        last_resets = resets;
 +        last_walks = walks;
 +        ps4_heap_trim();
++        snprintf(ps4_live_last_monitor, sizeof(ps4_live_last_monitor),
++                 "presented %.1f/s (display in %.1f/s), guest flips %.1f/s, guest clock +%.2f s, "
++                 "runstate %s, cpu pc 0x%08" PRIx64 " | GPU %d%% | %s | %s",
++                 (frames - last_frames) / 5.0, (display - last_display) / 5.0,
++                 (flips - last_flips) / 5.0, (guest_ns - last_guest_ns) / 1e9,
++                 RunState_str(runstate_get()), pc, ps4_perf_gpu, threads, loop_stats);
 +        if (ps4_settings.monitor_log) {
 +            trace("monitor: presented %.1f/s (display in %.1f/s), guest flips %.1f/s, "
 +                  "guest clock +%.2f s, runstate %s, cpu pc 0x%08" PRIx64 "%s | GPU %d%% | %s | %s | %s",
@@ -3654,7 +5018,9 @@ index 0000000..924e112
 +        }
 +        trace("presenting on VideoOut");
 +        const char *dvd = g_config.sys.files.dvd_path;
-+        if (dvd == NULL || dvd[0] == '\0' || access(dvd, R_OK) != 0) {
++        if (ps4_settings.boot_launcher) {
++            ps4_launcher_open();
++        } else if (dvd == NULL || dvd[0] == '\0' || access(dvd, R_OK) != 0) {
 +            ps4_hud_open_games();
 +        }
 +    }
@@ -3732,7 +5098,7 @@ index 0000000..924e112
 +    ps4_kit_set_new_thread_cores(shared_cores);
 +    ps4x_set_affinity(pthread_self(), shared_cores);
 +    if (ps4_settings.cpu_layout == PS4_CPU_PINNED) {
-+        ps4x_set_priority(pthread_self(), 660);
++        ps4x_set_priority(pthread_self(), 620);
 +    }
 +    /* RADV's shader cache: compiled pipelines kept between runs (ps4-kit Mesa patches 0023-0025) */
 +    mkdir(XEMU_DATA "/cache", 0777);
@@ -3794,10 +5160,24 @@ index 0000000..924e112
 +            }
 +        }
 +    }
++    if (ps4_settings.boot_launcher) {
++        /* the library first: the Xbox waits stopped until a game is picked (ps4_launch_game) */
++        g_ptr_array_add(args, (char *)"-S");
++    } else {
++        ps4_emulation_started = true;
++    }
++    if (ps4_settings.gdb_port > 0) {
++        g_ptr_array_add(args, (char *)"-gdb");
++        g_ptr_array_add(args, g_strdup_printf("tcp::%d", ps4_settings.gdb_port));
++        trace("GDB stub for the guest CPU on TCP port %d", ps4_settings.gdb_port);
++    }
 +    g_ptr_array_add(args, NULL);
 +    g_argc = args->len - 1;
 +    g_argv = (char **)args->pdata;
 +
++    /* QEMU names its threads for the system only when asked (-name debug-threads=on): the kit's
++     * profiler and thread dumps find threads by those names (v00.18's profile sampled nothing) */
++    qemu_thread_naming(true);
 +    nv2a_context_init();
 +
 +    qemu_sem_init(&display_init_sem, 0);
@@ -3815,6 +5195,7 @@ index 0000000..924e112
 +
 +    QemuThread monitor;
 +    qemu_thread_create(&monitor, "ps4-monitor", monitor_thread, NULL, QEMU_THREAD_DETACHED);
++    ps4_live_start(ps4_settings.live_port);
 +
 +    trace("main loop");
 +    while (!qatomic_read(&qemu_exiting)) {
@@ -3852,6 +5233,51 @@ index 0000000..924e112
 +        error_free(err);
 +    }
 +    xemu_settings_save();
++}
++
++/* a game has been started (the library then offers "back to the game") */
++bool ps4_emulation_started;
++
++/*
++ * The library's pick (ps4-launcher.cc), under the main loop lock: the disc in the drive, then the
++ * machine started - from its first stop (-S: the BIOS boots straight into the game) or, when a
++ * game was running, reset with the new disc.
++ */
++bool ps4_launch_game(const char *path)
++{
++    Error *err = NULL;
++    const bool fresh = runstate_check(RUN_STATE_PRELAUNCH);
++    qmp_blockdev_change_medium("ide0-cd1", NULL, path, "raw", false, false, false, 0, &err);
++    if (err) {
++        trace("launch %s: %s", path, error_get_pretty(err));
++        error_free(err);
++        return false;
++    }
++    xemu_settings_set_string(&g_config.sys.files.dvd_path, path);
++    xemu_settings_save();
++    xbox_smc_update_tray_state();
++    if (!fresh) {
++        qemu_system_reset_request(SHUTDOWN_CAUSE_HOST_UI);
++    }
++    if (!runstate_is_running()) {
++        qmp_cont(&err);
++        if (err) {
++            trace("launch: cont: %s", error_get_pretty(err));
++            error_free(err);
++        }
++    }
++    ps4_emulation_started = true;
++    trace("launch: %s (%s)", path, fresh ? "first start" : "reset with the new disc");
++    return true;
++}
++
++void ps4_pause_emulation(bool pause)
++{
++    if (pause && runstate_is_running()) {
++        vm_stop(RUN_STATE_PAUSED);
++    } else if (!pause && runstate_check(RUN_STATE_PAUSED)) {
++        vm_start();
++    }
 +}
 +
 +void ps4_request_reset(void)
