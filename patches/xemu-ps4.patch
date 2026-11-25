@@ -317,10 +317,62 @@ index 3429547..6ba7217 100644
  )
  
 diff --git a/hw/xbox/mcpx/apu/vp/vp.c b/hw/xbox/mcpx/apu/vp/vp.c
-index c57ecb6..a5dbf6f 100644
+index c57ecb6..66bb17f 100644
 --- a/hw/xbox/mcpx/apu/vp/vp.c
 +++ b/hw/xbox/mcpx/apu/vp/vp.c
-@@ -1597,6 +1597,9 @@ static void *voice_worker_thread(void *arg)
+@@ -134,13 +134,26 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
+ static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
+ {
+     assert(v < MCPX_HW_MAX_VOICES);
++#ifdef __PS4__
++    /*
++     * xemu-ps4: an unlock only clears the voice's bit, so it needn't wait for the APU lock, which
++     * the frame thread holds while the voices are processed (most of each 5.3 ms frame when the
++     * resampling was sinc): half of the game's VOICE_LOCK writes no longer stall the emulated CPU.
++     * The frame thread waiting for the voice sees the bit within 1 ms (voice_work_dispatch).
++     */
++    if (!lock) {
++        qatomic_and(&d->vp.voice_locked[v / 64], ~(1ULL << (v % 64)));
++        qemu_cond_signal(&d->cond);
++        return;
++    }
++#endif
+     qemu_mutex_lock(&d->lock);
+ 
+     uint64_t mask = 1LL << (v % 64);
+     if (lock) {
+-        d->vp.voice_locked[v / 64] |= mask;
++        qatomic_or(&d->vp.voice_locked[v / 64], mask);
+     } else {
+-        d->vp.voice_locked[v / 64] &= ~mask;
++        qatomic_and(&d->vp.voice_locked[v / 64], ~mask);
+     }
+ 
+     qemu_cond_signal(&d->cond);
+@@ -1170,8 +1183,22 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
+          * so use it for now.
+          */
+         // FIXME: Don't do 2ch resampling if this is a mono voice
++#ifdef __PS4__
++        /*
++         * xemu-ps4: libsamplerate's sinc converter (even "fastest") made the two voice workers
++         * take ~1.4 of the Jaguar's cores in Halo 2 (v00.17), with the APU lock held all the
++         * while (VOICE_LOCK writes from the game wait for it: the emulated CPU stalled at 11%).
++         * Linear interpolation - which, as the note above says, may be what the hardware does -
++         * unless Settings > Voice resampling asks for sinc (ps4.ini audio_resampler).
++         */
++        extern int ps4_voice_resampler(void);
++        filter->resampler = src_callback_new(&voice_resample_callback,
++                                           ps4_voice_resampler() ? SRC_SINC_FASTEST : SRC_LINEAR,
++                                           2, &err, filter);
++#else
+         filter->resampler = src_callback_new(&voice_resample_callback,
+                                            SRC_SINC_FASTEST, 2, &err, filter);
++#endif
+         if (filter->resampler == NULL) {
+             fprintf(stderr, "src error: %s\n", src_strerror(err));
+             assert(0);
+@@ -1597,6 +1624,9 @@ static void *voice_worker_thread(void *arg)
      do {
          int64_t start_time = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
          g_dbg.vp.workers[worker_id].num_voices = self->queue_len;
@@ -330,7 +382,7 @@ index c57ecb6..a5dbf6f 100644
  
          if (self->queue_len) {
              qemu_mutex_unlock(&vwd->lock);
-@@ -1768,7 +1771,13 @@ static void voice_work_init(MCPXAPUState *d)
+@@ -1768,7 +1798,13 @@ static void voice_work_init(MCPXAPUState *d)
  {
      VoiceWorkDispatch *vwd = &d->vp.voice_work_dispatch;
  
@@ -1243,10 +1295,10 @@ index 0000000..6daddee
 +#endif
 diff --git a/ui/ps4/ps4-hud.cc b/ui/ps4/ps4-hud.cc
 new file mode 100644
-index 0000000..decb257
+index 0000000..457ade6
 --- /dev/null
 +++ b/ui/ps4/ps4-hud.cc
-@@ -0,0 +1,426 @@
+@@ -0,0 +1,432 @@
 +/*
 + * xemu-ps4: what is drawn over the emulated picture (ImGui): notifications and error messages
 + * (xemu-notifications.h, which the desktop's xui implements), the frame rate, what is missing
@@ -1433,7 +1485,7 @@ index 0000000..decb257
 +enum Page { kMain, kGames };
 +enum Row {
 +    kResume, kGamesRow, kEject, kReset, kScaling, kFilter, kShowFps, kShowStats, kCpuLayout,
-+    kMonitor, kTlbIndex, kAutoProfile, kProfileNow, kQuit, kRowCount
++    kResampler, kHrtf, kMonitor, kTlbIndex, kAutoProfile, kProfileNow, kQuit, kRowCount
 +};
 +
 +struct Menu
@@ -1493,6 +1545,10 @@ index 0000000..decb257
 +    case kCpuLayout:
 +        return std::string("CPU layout       < ") +
 +               (ps4_settings.cpu_layout == PS4_CPU_PINNED ? "Pinned" : "Floating") + " >  (restart)";
++    case kResampler:
++        return std::string("Voice resampling < ") + (ps4_settings.audio_resampler ? "Sinc" : "Linear") +
++               " >  (restart)";
++    case kHrtf: return std::string("3D audio (HRTF)  < ") + (g_config.audio.hrtf ? "On" : "Off") + " >";
 +    case kMonitor: return std::string("Monitor log      < ") + (ps4_settings.monitor_log ? "On" : "Off") + " >";
 +    case kTlbIndex:
 +        return std::string("TLB dirty index  < ") + (ps4_settings.tlb_index ? "On" : "Off") + " >  (restart)";
@@ -1512,6 +1568,8 @@ index 0000000..decb257
 +    case kShowFps: ps4_settings.show_fps = !ps4_settings.show_fps; break;
 +    case kShowStats: ps4_settings.show_stats = !ps4_settings.show_stats; break;
 +    case kCpuLayout: ps4_settings.cpu_layout ^= 1; M.restartNote = true; break;
++    case kResampler: ps4_settings.audio_resampler ^= 1; M.restartNote = true; break;
++    case kHrtf: g_config.audio.hrtf = !g_config.audio.hrtf; xemu_settings_save(); return;
 +    case kMonitor: ps4_settings.monitor_log = !ps4_settings.monitor_log; break;
 +    case kAutoProfile: ps4_settings.auto_profile = !ps4_settings.auto_profile; break;
 +    case kTlbIndex: ps4_settings.tlb_index = !ps4_settings.tlb_index; M.restartNote = true; break;
@@ -2459,10 +2517,10 @@ index 0000000..8f856ab
 +}
 diff --git a/ui/ps4/ps4-settings.c b/ui/ps4/ps4-settings.c
 new file mode 100644
-index 0000000..f5e1420
+index 0000000..873c71c
 --- /dev/null
 +++ b/ui/ps4/ps4-settings.c
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,103 @@
 +/*
 + * xemu-ps4: the PS4 frontend's own settings (ps4-settings.h), "key = value" lines in
 + * /data/xemu/ps4.ini. Unknown keys are ignored, missing ones keep their defaults.
@@ -2491,6 +2549,7 @@ index 0000000..f5e1420
 +    .profiler = false,
 +    .tlb_index = true,
 +    .auto_profile = true,
++    .audio_resampler = 0,
 +};
 +
 +typedef struct {
@@ -2513,6 +2572,7 @@ index 0000000..f5e1420
 +    { "profiler", T_BOOL, &ps4_settings.profiler, 0, 1 },
 +    { "tlb_index", T_BOOL, &ps4_settings.tlb_index, 0, 1 },
 +    { "auto_profile", T_BOOL, &ps4_settings.auto_profile, 0, 1 },
++    { "audio_resampler", T_INT, &ps4_settings.audio_resampler, 0, 1 },
 +};
 +
 +void ps4_settings_load(void)
@@ -2555,16 +2615,21 @@ index 0000000..f5e1420
 +    g_string_free(s, true);
 +}
 +
++int ps4_voice_resampler(void)
++{
++    return ps4_settings.audio_resampler;
++}
++
 +int ps4_voice_workers(void)
 +{
 +    return ps4_settings.voice_workers;
 +}
 diff --git a/ui/ps4/ps4-settings.h b/ui/ps4/ps4-settings.h
 new file mode 100644
-index 0000000..b8ad6f0
+index 0000000..42febbe
 --- /dev/null
 +++ b/ui/ps4/ps4-settings.h
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,61 @@
 +/*
 + * xemu-ps4: the PS4 frontend's own settings (/data/xemu/ps4.ini), next to xemu's xemu.toml.
 + * Changed from the quick menu (ps4-hud.cc); "restart" ones apply at the next start.
@@ -2613,6 +2678,7 @@ index 0000000..b8ad6f0
 +    bool profiler;          /* the 1 kHz sampler (samples.log) (restart) */
 +    bool tlb_index;         /* TLB dirty index (accel/tcg/cputlb.c) (restart) */
 +    bool auto_profile;      /* an 8 s CPU profile when the game runs slowly (profiles/) */
++    int audio_resampler;    /* the APU's voices: 0 linear, 1 sinc (xemu's default) (restart) */
 +} PS4Settings;
 +
 +extern PS4Settings ps4_settings;
@@ -2747,10 +2813,10 @@ index 0000000..24e9598
 +}
 diff --git a/ui/ps4/xemu-ps4.c b/ui/ps4/xemu-ps4.c
 new file mode 100644
-index 0000000..d6ce7b6
+index 0000000..924e112
 --- /dev/null
 +++ b/ui/ps4/xemu-ps4.c
-@@ -0,0 +1,1072 @@
+@@ -0,0 +1,1081 @@
 +/*
 + * xemu-ps4: the PS4 frontend (replaces ui/xemu.c and its SDL window + OpenGL).
 + *
@@ -3372,7 +3438,7 @@ index 0000000..d6ce7b6
 +        static int64_t last_profile_ns;
 +        const int64_t now_ns = get_clock();
 +        const double flips_per_s = (flips - last_flips) / 5.0;
-+        slow_periods = runstate_is_running() && flips_per_s > 0.0 && flips_per_s < 20.0 ? slow_periods + 1 : 0;
++        slow_periods = runstate_is_running() && flips_per_s < 20.0 ? slow_periods + 1 : 0;
 +        if (ps4_settings.auto_profile && slow_periods >= 2 && auto_profiles < 2 &&
 +            guest_ns > 60 * NANOSECONDS_PER_SECOND &&
 +            (last_profile_ns == 0 || now_ns - last_profile_ns > 300 * NANOSECONDS_PER_SECOND)) {
@@ -3382,7 +3448,16 @@ index 0000000..d6ce7b6
 +                auto_profiles++;
 +                last_profile_ns = now_ns;
 +            }
-+        }        last_frames = frames;
++        }        /* no guest frame for 30 s while running: where every thread is, once (hang.log) */
++        static int stalled_periods;
++        static bool dumped;
++        stalled_periods = runstate_is_running() && flips == last_flips ? stalled_periods + 1 : 0;
++        if (stalled_periods >= 6 && !dumped && guest_ns > 60 * NANOSECONDS_PER_SECOND) {
++            dumped = true;
++            trace("no guest frame for 30 s: thread stacks in hang.log");
++            ps4_dump_thread_stacks(XEMU_DATA "/hang.log", "no guest frame for 30 s");
++        }
++        last_frames = frames;
 +        last_display = display;
 +        last_flips = flips;
 +        last_guest_ns = guest_ns;
