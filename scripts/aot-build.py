@@ -40,6 +40,9 @@ HEAD_RE = re.compile(r'//@aot pc=([0-9a-f]+) cs=([0-9a-f]+) fl=([0-9a-f]+) cf=([
                      r'sz=(\d+) ic=(\d+) h=([0-9a-f]+)')
 GOTO_RE = re.compile(r'AOT_GOTO_PC\(0x([0-9a-f]+)u\)')
 HELPER_RE = re.compile(r'AOT_H\((\w+)\)')
+# a global the block keeps in a C variable but never changes: loaded at its start, stored back at
+# every exit (the emitter took a discard for a write before v00.26: cc_src2 in most blocks)
+NP_DECL_RE = re.compile(r'^ (?:uint32_t|uint64_t) g_(\w+) = AOT_LD_I(?:32|64)\((\d+)\);$', re.M)
 CFLAGS = ['-O2', '-march=btver2', '-fPIC', '-fvisibility=hidden', '-ffreestanding', '-fno-builtin',
           '-fno-strict-aliasing', '-fwrapv', '-ffp-contract=off', '-frounding-math',
           '-fno-math-errno', '-mno-red-zone', '-fno-stack-protector',
@@ -87,6 +90,49 @@ def read_blocks(dirs):
     return blocks, abi
 
 
+def fpu_pointer_offsets(abi):
+    """env offsets of x87's last instruction/operand pointers (fpop, fpcs, fpds, fpip, fpdp).
+
+    QEMU stores them at every x87 instruction (5 stores and 2 loads); only FNSTENV, FNSAVE and
+    FXSAVE read them, and Xbox games and the kernel only save and restore them. The fields follow
+    fpregs[8] (16 bytes each) in CPUX86State."""
+    m = re.search(r'#define AOT_OFF_FPREGS (\d+)', abi)
+    if not m:
+        return []
+    f = int(m.group(1)) + 8 * 16
+    return [f, f + 2, f + 4, f + 8, f + 16]
+
+
+def simplify_body(body, fpu_ptr_re):
+    """C-level clean-ups of a recorded block; returns (body, x87 stores dropped, globals freed)."""
+    dropped = 0
+    if fpu_ptr_re is not None:
+        body, dropped = fpu_ptr_re.subn('', body)
+    freed = 0
+    for name, off in NP_DECL_RE.findall(body):
+        if len(re.findall(r'(?<![\w.])g_%s = ' % name, body)) == 1:     # just its declaration
+            body, k = re.subn(r' ?AOT_ST_I(?:32|64)\(%s, g_%s\);' % (off, name), '', body)
+            freed += k > 0
+    return body, dropped, freed
+
+
+def read_hot(path):
+    """Guest pcs to lay out first, hottest first: lines "<pc hex or F<id>_<pc>> [weight]"."""
+    hot = {}
+    for line in open(path):
+        parts = line.split()
+        if not parts or parts[0].startswith('#'):
+            continue
+        tok = parts[0].split('_')[-1]
+        try:
+            pc = int(tok, 16)
+        except ValueError:
+            continue
+        w = float(parts[1]) if len(parts) > 1 else 1.0
+        hot[pc] = hot.get(pc, 0.0) + w
+    return hot
+
+
 def ix_hash(pc, fl, mask):
     return ((((pc * 0x9E3779B1) & 0xffffffff) ^ ((fl * 0x85EBCA77) & 0xffffffff)) >> 7) & mask
 
@@ -107,6 +153,10 @@ def main():
     ap.add_argument('--jobs', type=int, default=os.cpu_count() or 4)
     ap.add_argument('--clang', default=os.environ.get('AOT_CLANG', 'clang-21'))
     ap.add_argument('--work', default=None)
+    ap.add_argument('--hot', default=None,
+                    help='guest pcs to place first (scripts/aot-hotblocks.py --hot-out)')
+    ap.add_argument('--keep-fpu-pointers', action='store_true',
+                    help="keep x87's last instruction/operand pointer stores")
     a = ap.parse_args()
 
     t0 = time.time()
@@ -143,7 +193,14 @@ def main():
                                               f'aot_fast_rd_{fast_mmu}', f'aot_fast_wr_{fast_mmu}']
     imp_set = set(imports)
     chained = unresolved = inlined = 0
+    offs = [] if a.keep_fpu_pointers else fpu_pointer_offsets(abi)
+    fpu_ptr_re = re.compile(r' ?AOT_STM\(uint(?:16|32|64)_t, \(\(char \*\)env\), (?:%s), [^;]*\);'
+                            % '|'.join(str(o) for o in offs)) if offs else None
+    x87_dropped = freed = 0
     for b in blocks:
+        b.body, k1, k2 = simplify_body(b.body, fpu_ptr_re)
+        x87_dropped += k1
+        freed += k2
         def goto(m, b=b):
             nonlocal chained, unresolved
             t = int(m.group(1), 16)
@@ -162,7 +219,18 @@ def main():
             b.body, k = INLINE_RE.subn(r'AOT_I_\1', b.body)
             inlined += k
     print(f'{chained} direct jumps chained, {unresolved} looked up at run time, {len(imports)} helpers, '
-          f'{inlined} SSE helper calls as host instructions')
+          f'{inlined} SSE helper calls as host instructions, {x87_dropped} x87 pointer stores dropped, '
+          f'{freed} unchanged globals no longer stored back')
+
+    # layout: the hottest blocks first and together (fewer pages and cache lines for the code that
+    # runs most), then the rest in pc order
+    order = blocks
+    if a.hot:
+        hot = read_hot(a.hot)
+        first = sorted((b for b in blocks if b.pc in hot), key=lambda b: (-hot[b.pc], b.pc))
+        firsts = {id(b) for b in first}
+        order = first + [b for b in blocks if id(b) not in firsts]
+        print(f'layout: {len(first)} hot blocks first ({len(hot)} hot pcs listed)')
 
     mask = 1
     while mask + 1 < 2 * n:
@@ -178,7 +246,7 @@ def main():
     head = '#include "aot_abi.h"\n#include "aot_gen.h"\n#include "aot_rt.h"\n\n'
     sources = []
     for f0 in range(0, n, PER_FILE):
-        chunk = blocks[f0:f0 + PER_FILE]
+        chunk = order[f0:f0 + PER_FILE]
         names = {b.name for b in chunk}
         protos = set()
         for b in chunk:
@@ -231,7 +299,7 @@ typedef struct {
 char *aot_env AOT_HIDDEN;
 const uintptr_t *aot_frd AOT_HIDDEN;
 const uintptr_t *aot_fwr AOT_HIDDEN;
-uint32_t aot_csr_ok AOT_HIDDEN;
+uint32_t aot_csr_cur AOT_HIDDEN;
 uint32_t aot_valid[AOT_NB_BLOCKS + 1] AOT_HIDDEN;
 uint32_t aot_gen AOT_HIDDEN = 1;
 uint32_t aot_cur[2] AOT_HIDDEN;
@@ -256,7 +324,7 @@ AOT_HIDDEN void aot_enter(char *env, uint32_t id)
     aot_env = env;
     aot_frd = (const uintptr_t *)AOT_H(aot_fast_rd_{fast_mmu});
     aot_fwr = (const uintptr_t *)AOT_H(aot_fast_wr_{fast_mmu});
-    aot_csr_ok = 0;     /* the JIT's code may have left x87's rounding in MXCSR */
+    aot_csr_cur = 0;    /* not known: the JIT's code may have set MXCSR (x87's rounding) */
     aot_fns[id](AOT_LD_I32(AOT_OFF_EAX), AOT_LD_I32(AOT_OFF_ECX), AOT_LD_I32(AOT_OFF_EDX),
                 AOT_LD_I32(AOT_OFF_EBX), AOT_LD_I32(AOT_OFF_ESP), AOT_LD_I32(AOT_OFF_EBP),
                 AOT_LD_I32(AOT_OFF_ESI), AOT_LD_I32(AOT_OFF_EDI), AOT_LD_I32(AOT_OFF_CC_DST),

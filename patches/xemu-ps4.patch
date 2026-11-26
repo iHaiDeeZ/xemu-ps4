@@ -1,9 +1,9 @@
 diff --git a/accel/tcg/aot.c b/accel/tcg/aot.c
 new file mode 100644
-index 0000000..4ec6361
+index 0000000..9a8d067
 --- /dev/null
 +++ b/accel/tcg/aot.c
-@@ -0,0 +1,922 @@
+@@ -0,0 +1,1129 @@
 +/*
 + * xemu-ps4: the ahead-of-time translator's runtime (see include/exec/aot.h).
 + *
@@ -46,6 +46,7 @@ index 0000000..4ec6361
 +#include "accel/tcg/cpu-mmu-index.h"
 +#include "accel/tcg/cpu-ops.h"
 +#include "tb-code-hash.h"
++#include "internal-common.h"
 +#include "tcg/tcg.h"
 +#include "tcg/tcg-ldst.h"
 +#include "exec/memopidx.h"
@@ -59,6 +60,7 @@ index 0000000..4ec6361
 +
 +bool aot_use = true;
 +bool aot_record = true;
++bool aot_direct = true;
 +bool aot_recording;
 +bool aot_loaded;
 +
@@ -102,7 +104,37 @@ index 0000000..4ec6361
 +static char loaded_path[128];
 +
 +/* counters (read by the monitor thread without locks) */
-+static uint64_t st_runs, st_trampolines, st_gens, st_misses_hash;
++static uint64_t st_runs, st_trampolines, st_gens, st_misses_hash, st_direct;
++
++/*
++ * Why translated code returns to the main loop (live console "aot exits"): each return from a
++ * trampoline's run is classified by where the guest stopped. Off unless asked for: one branch in
++ * helper_aot_run.
++ */
++enum {
++    EXIT_REQUEST,       /* an interrupt or exit request was pending: the blocks stopped for it */
++    EXIT_NOT_IN_FILE,   /* the next code isn't in the file: the JIT runs it */
++    EXIT_FLAGS,         /* in the file, but compiled for other CPU flags */
++    EXIT_NOT_VALID,     /* in the file, not entered through its trampoline this generation */
++    EXIT_VALID,         /* in the file and valid: a block ended with exit_tb (STI, POPF, ...) */
++    EXIT_ENTRY,         /* (not an exit: the trampolines entered) */
++    EXIT_KINDS
++};
++static const char *const exit_names[EXIT_KINDS] = {
++    "interrupt/exit request", "not in the file (JIT)", "other flags", "not valid yet",
++    "valid (block exited on purpose)", "entered",
++};
++typedef struct AotExitSlot {
++    uint32_t pc;
++    uint32_t kind;
++    uint64_t n;
++} AotExitSlot;
++#define EXIT_SLOTS 8192
++static bool exit_watch;
++static AotExitSlot *exit_slots;
++static GHashTable *exit_pcs;            /* every block's pc (any flags) */
++static uint64_t exit_totals[EXIT_KINDS], exit_dropped, exit_longjmps, exit_runs0;
++static int64_t exit_since_ns;
 +
 +static inline uint32_t index_hash(uint32_t pc, uint32_t flags)
 +{
@@ -750,8 +782,76 @@ index 0000000..4ec6361
 +    return 0;
 +}
 +
++static void exit_count(uint32_t pc, uint32_t kind)
++{
++    uint32_t h = ((pc * 0x9E3779B1u) ^ (kind * 0x85EBCA77u)) >> 13;
++
++    exit_totals[kind]++;
++    for (int probe = 0; probe < 32; probe++, h++) {
++        AotExitSlot *s = &exit_slots[h & (EXIT_SLOTS - 1)];
++        if (s->n == 0) {
++            s->pc = pc;
++            s->kind = kind;
++        }
++        if (s->pc == pc && s->kind == kind) {
++            s->n++;
++            return;
++        }
++    }
++    exit_dropped++;
++}
++
++static void exit_note(CPUState *cpu, uint32_t entered_pc)
++{
++    TCGTBCPUState s = cpu->cc->tcg_ops->get_tb_cpu_state(cpu);
++    uint32_t pc = (uint32_t)s.pc;
++    uint32_t kind = EXIT_NOT_IN_FILE;
++
++    exit_count(entered_pc, EXIT_ENTRY);
++    if (qatomic_read(&cpu->neg.icount_decr.u16.high) || qatomic_read(&cpu->exit_request)) {
++        kind = EXIT_REQUEST;
++    } else {
++        for (uint32_t id = index_head[index_hash(pc, s.flags) & index_mask]; id; id = index_next[id]) {
++            const AotEntry *e = &hdr->entries[id];
++            if (e->pc == pc && e->flags == s.flags) {
++                kind = hdr->valid[id] ? EXIT_VALID : EXIT_NOT_VALID;
++                break;
++            }
++        }
++        if (kind == EXIT_NOT_IN_FILE && g_hash_table_contains(exit_pcs, GUINT_TO_POINTER(pc))) {
++            kind = EXIT_FLAGS;      /* a block at this pc, under other flags */
++        }
++    }
++    exit_count(pc, kind);
++}
++
++/*
++ * The block the CPU would run next, if it is in the file and valid (its trampoline ran this
++ * generation): what the main loop would find with tb_lookup, for the CPU's real flags. The blocks'
++ * own lookup (AOT_IND) uses the flags they were compiled with: after POPF, STI, a segment load and
++ * the like it misses, and so does every exit_tb.
++ */
++static uint32_t aot_next_id(CPUState *cpu)
++{
++    TCGTBCPUState s = cpu->cc->tcg_ops->get_tb_cpu_state(cpu);
++    uint32_t cf;
++
++    if (s.cs_base != 0 || s.pc > UINT32_MAX) {
++        return 0;
++    }
++    cf = aot_cflags(curr_cflags(cpu));
++    for (uint32_t id = index_head[index_hash(s.pc, s.flags) & index_mask]; id; id = index_next[id]) {
++        const AotEntry *e = &hdr->entries[id];
++        if (e->pc == s.pc && e->flags == s.flags && e->cflags == cf) {
++            return hdr->valid[id] ? id : 0;
++        }
++    }
++    return 0;
++}
++
 +void HELPER(aot_run)(CPUArchState *env, uint32_t id)
 +{
++    CPUState *cpu = env_cpu(env);
 +    const AotEntry *e;
 +
 +    if (unlikely(!aot_loaded || id == 0 || id > hdr->nb_entries)) {
@@ -768,7 +868,30 @@ index 0000000..4ec6361
 +    set_bit(e->pc >> 12, valid_pages);
 +    set_bit((e->pc + e->size - 1) >> 12, valid_pages);
 +    st_runs++;
-+    hdr->enter(env, id);
++    for (int n = 0;; n++) {
++        hdr->enter(env, id);
++        if (unlikely(exit_watch)) {
++            exit_note(cpu, e->pc);
++        }
++        /*
++         * Nothing for the main loop to do (no interrupt, exit request, one-off TB flags, single
++         * step or breakpoint): the next block, if translated and valid, runs from here - what
++         * cpu_exec would do, minus its round trip (cpu_handle_interrupt, tb_lookup, cpu_tb_exec).
++         * Every 256 the main loop gets a turn anyway.
++         */
++        if (!aot_direct || n >= 255 || qatomic_read(&cpu->neg.icount_decr.u16.high) ||
++            qatomic_read(&cpu->exit_request) || qatomic_read(&cpu->interrupt_request) ||
++            cpu->cflags_next_tb != -1 || cpu->singlestep_enabled ||
++            !QTAILQ_EMPTY(&cpu->breakpoints)) {
++            return;
++        }
++        id = aot_next_id(cpu);
++        if (!id) {
++            return;
++        }
++        e = &hdr->entries[id];
++        st_direct++;
++    }
 +}
 +
 +void aot_entered(int id)
@@ -866,8 +989,9 @@ index 0000000..4ec6361
 +            }
 +        }
 +        g_string_append_printf(out, "aot: %s %u blocks, %" PRIu64 " entries from the JIT, %"
-+                               PRIu64 " trampolines, %" PRIu64 " code changed, %" PRIu64
-+                               " generations", loaded_path, hdr->nb_entries, st_runs,
++                               PRIu64 " run straight after (%s), %" PRIu64 " trampolines, %"
++                               PRIu64 " code changed, %" PRIu64 " generations", loaded_path,
++                               hdr->nb_entries, st_runs, st_direct, aot_direct ? "on" : "off",
 +                               st_trampolines, st_misses_hash, st_gens);
 +        if (verbose) {
 +            g_string_append_printf(out, ", %u valid now; flat page tables (MMU %d): %" PRIu64
@@ -892,6 +1016,89 @@ index 0000000..4ec6361
 +                                   (const char *)k);
 +        }
 +        qemu_mutex_unlock(&rec_lock);
++    }
++}
++
++static int exit_slot_cmp(gconstpointer a, gconstpointer b)
++{
++    const AotExitSlot *x = a, *y = b;
++    return x->n < y->n ? 1 : x->n > y->n ? -1 : 0;
++}
++
++/* The live console's "aot exits [on|off]": the exit histogram since it was switched on. */
++void aot_exits(GString *out, const char *args)
++{
++    if (!aot_loaded) {
++        g_string_append(out, "aot exits: no translated code loaded\n");
++        return;
++    }
++    if (strcmp(args, "on") == 0 || strcmp(args, "clear") == 0) {
++        if (!exit_slots) {
++            exit_slots = g_new0(AotExitSlot, EXIT_SLOTS);
++        }
++        exit_watch = false;
++        smp_mb();
++        g_usleep(20000);                /* (an exit being noted finishes) */
++        if (exit_pcs) {
++            g_hash_table_destroy(exit_pcs);
++        }
++        exit_pcs = g_hash_table_new(g_direct_hash, g_direct_equal);
++        for (uint32_t id = 1; id <= hdr->nb_entries; id++) {
++            g_hash_table_add(exit_pcs, GUINT_TO_POINTER(hdr->entries[id].pc));
++        }
++        memset(exit_slots, 0, EXIT_SLOTS * sizeof(*exit_slots));
++        memset(exit_totals, 0, sizeof(exit_totals));
++        exit_dropped = 0;
++        exit_runs0 = st_runs;
++        exit_since_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++        smp_mb();
++        exit_watch = true;
++        g_string_append(out, "aot exits: recording (\"aot exits\" for the table, \"aot exits off\" to stop)\n");
++        return;
++    }
++    if (strcmp(args, "off") == 0) {
++        exit_watch = false;
++        g_string_append(out, "aot exits: stopped\n");
++        return;
++    }
++    if (!exit_slots) {
++        g_string_append(out, "aot exits: not recording (\"aot exits on\")\n");
++        return;
++    }
++    const double secs = MAX(1e-3, (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - exit_since_ns) / 1e9);
++    const uint64_t runs = st_runs - exit_runs0;
++    uint64_t returned = 0;
++    for (int k = 0; k < EXIT_KINDS; k++) {
++        if (k != EXIT_ENTRY) {
++            returned += exit_totals[k];
++        }
++    }
++    g_string_append_printf(out, "aot exits over %.1f s%s: %" PRIu64 " runs (%.0f/s), %" PRIu64
++                           " returned, %" PRIu64 " left by longjmp (exceptions, helpers)\n",
++                           secs, exit_watch ? "" : " (stopped)", runs, runs / secs, returned,
++                           runs > returned ? runs - returned : 0);
++    for (int k = 0; k < EXIT_KINDS; k++) {
++        if (k != EXIT_ENTRY) {
++            g_string_append_printf(out, "  %10.0f/s %5.1f%%  %s\n", exit_totals[k] / secs,
++                                   100.0 * exit_totals[k] / MAX(returned, 1), exit_names[k]);
++        }
++    }
++    if (exit_dropped) {
++        g_string_append_printf(out, "  (%" PRIu64 " not in the table: full)\n", exit_dropped);
++    }
++    g_autofree AotExitSlot *copy = g_memdup2(exit_slots, EXIT_SLOTS * sizeof(*exit_slots));
++    qsort(copy, EXIT_SLOTS, sizeof(*copy), exit_slot_cmp);
++    for (int pass = 0; pass < 2; pass++) {
++        int shown = 0;
++        g_string_append(out, pass ? "busiest trampolines (entered):\n" : "where the blocks stopped:\n");
++        for (int i = 0; i < EXIT_SLOTS && shown < 40 && copy[i].n; i++) {
++            if ((copy[i].kind == EXIT_ENTRY) != (pass == 1)) {
++                continue;
++            }
++            g_string_append_printf(out, "  %10.0f/s  %08x  %s\n", copy[i].n / secs, copy[i].pc,
++                                   exit_names[copy[i].kind]);
++            shown++;
++        }
 +    }
 +}
 +
@@ -1375,7 +1582,7 @@ index 234a6e2..cf06995 100644
    'icount-common.c',
    'monitor.c',
 diff --git a/accel/tcg/tb-maint.c b/accel/tcg/tb-maint.c
-index d21a8bd..a32bdae 100644
+index d21a8bd..d9f7fc8 100644
 --- a/accel/tcg/tb-maint.c
 +++ b/accel/tcg/tb-maint.c
 @@ -34,6 +34,7 @@
@@ -1438,6 +1645,30 @@ index d21a8bd..a32bdae 100644
      /* remove the TB from the hash list */
      phys_pc = tb_page_addr0(tb);
      h = tb_hash_func(phys_pc, (orig_cflags & CF_PCREL ? 0 : tb->pc),
+@@ -948,8 +966,21 @@ static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
+         return;
+     }
+ 
+-    qht_insert(&tb_ctx.inv_htable, tb, h, &existing);
+-    g_assert(existing == NULL);
++    /*
++     * xemu-ps4: an equal invalidated TB (same pc or PC-relative place, flags, cflags, pages, code
++     * hash) may already be there - v00.25 aborted on that after the console returned from its home
++     * screen. Either one revives the same code; keep the older and leave this one out.
++     */
++    if (!qht_insert(&tb_ctx.inv_htable, tb, h, &existing) && existing) {
++        static unsigned warned;
++        const TranslationBlock *o = existing;
++        if (warned++ < 8) {
++            fprintf(stderr, "tb: invalidated TB pc %#" VADDR_PRIx " aot %d cf %#x size %u is like "
++                    "pc %#" VADDR_PRIx " aot %d cf %#x size %u: kept out of the revival table\n",
++                    tb->pc, tb->aot_id, orig_cflags, tb->size, o->pc, o->aot_id,
++                    tb_cflags(o), o->size);
++        }
++    }
+ 
+     /* remove the TB from the page list */
+     if (rm_from_page_list) {
 diff --git a/accel/tcg/tcg-accel-ops-mttcg.c b/accel/tcg/tcg-accel-ops-mttcg.c
 index cf1ee7a..c5cc4da 100644
 --- a/accel/tcg/tcg-accel-ops-mttcg.c
@@ -2482,10 +2713,10 @@ index 779a41b..6e94fa5 100644
      memory_region_add_subregion(system_memory, 0, ram);
 diff --git a/include/exec/aot.h b/include/exec/aot.h
 new file mode 100644
-index 0000000..be72ec5
+index 0000000..4f897ed
 --- /dev/null
 +++ b/include/exec/aot.h
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,92 @@
 +/*
 + * xemu-ps4: the ahead-of-time translator ("translated game code").
 + *
@@ -2513,6 +2744,8 @@ index 0000000..be72ec5
 +/* settings (ui/ps4/ps4-settings.c): run a loaded .aot, record blocks */
 +extern bool aot_use;
 +extern bool aot_record;
++/* the next translated block straight from the last one's return when nothing is pending */
++extern bool aot_direct;
 +
 +/* set while blocks are written (tcg_gen_code calls aot_record_tb) / a .aot is loaded */
 +extern bool aot_recording;
@@ -2551,6 +2784,9 @@ index 0000000..be72ec5
 +
 +/* one line for the monitor / the live console's "aot" command */
 +void aot_stats(GString *out, bool verbose);
++
++/* the live console's "aot exits [on|off|clear]": why translated code returns to the main loop */
++void aot_exits(GString *out, const char *args);
 +
 +/*
 + * The target's part (target/i386/tcg/aot-i386.c): the ABI header the generated C
@@ -3079,10 +3315,10 @@ index 2181267..337e782 100644
      }
 diff --git a/tcg/tcg-aot.c.inc b/tcg/tcg-aot.c.inc
 new file mode 100644
-index 0000000..70394ae
+index 0000000..e0b245b
 --- /dev/null
 +++ b/tcg/tcg-aot.c.inc
-@@ -0,0 +1,1307 @@
+@@ -0,0 +1,1310 @@
 +/*
 + * xemu-ps4: a translation block written out as C, for the ahead-of-time
 + * translator (accel/tcg/aot.c records these on the console, scripts/aot-build.py
@@ -3943,6 +4179,9 @@ index 0000000..70394ae
 +            break;
 +        default:
 +            break;
++        }
++        if (c == INDEX_op_discard) {
++            continue;       /* the value is dead: not a write the block must store back */
 +        }
 +        for (int i = 0; i < no + ni; i++) {
 +            aot_note_temp(&e, op->args[i], i < no);
@@ -5775,10 +6014,10 @@ index 0000000..a80721c
 +}
 diff --git a/ui/ps4/ps4-live.c b/ui/ps4/ps4-live.c
 new file mode 100644
-index 0000000..45c9279
+index 0000000..6a073f9
 --- /dev/null
 +++ b/ui/ps4/ps4-live.c
-@@ -0,0 +1,227 @@
+@@ -0,0 +1,233 @@
 +/*
 + * xemu-ps4: the live console - a TCP port on the PS4 (ps4.ini live_port, default 4445; 0 = off)
 + * to look into and steer the running emulator from a PC (scripts/live.py). One client at a time,
@@ -5891,10 +6130,16 @@ index 0000000..45c9279
 +        args = line + strlen(line);
 +    }
 +    if (strcmp(line, "help") == 0) {
-+        g_string_append(out, "stats | aot [load|off] | hmp <monitor command> | mem <addr> [len] | "
++        g_string_append(out, "stats | aot [load|off|exits [on|off]] | hmp <monitor command> | mem <addr> [len] | "
 +                             "profile [s] | dump | get [key] | set <key> <value> | quit\n");
 +    } else if (strcmp(line, "stats") == 0) {
 +        g_string_append(out, ps4_live_last_monitor);
++    } else if (strcmp(line, "aot") == 0 && strncmp(args, "exits", 5) == 0) {
++        const char *a = args + 5;
++        while (*a == ' ') {
++            a++;
++        }
++        aot_exits(out, a);
 +    } else if (strcmp(line, "aot") == 0) {
 +        if (strcmp(args, "load") == 0 || strcmp(args, "off") == 0) {
 +            /* with the CPU stopped: TBs made for the old file go, the new file's come next */
@@ -6946,10 +7191,10 @@ index 0000000..a2486cb
 +}
 diff --git a/ui/ps4/ps4-settings.c b/ui/ps4/ps4-settings.c
 new file mode 100644
-index 0000000..11ac43c
+index 0000000..bef3328
 --- /dev/null
 +++ b/ui/ps4/ps4-settings.c
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,167 @@
 +/*
 + * xemu-ps4: the PS4 frontend's own settings (ps4-settings.h), "key = value" lines in
 + * /data/xemu/ps4.ini. Unknown keys are ignored, missing ones keep their defaults.
@@ -6986,6 +7231,7 @@ index 0000000..11ac43c
 +    .boot_launcher = true,
 +    .aot = true,
 +    .aot_record = true,
++    .aot_direct = true,
 +};
 +
 +typedef struct {
@@ -7014,12 +7260,14 @@ index 0000000..11ac43c
 +    { "boot_launcher", T_BOOL, &ps4_settings.boot_launcher, 0, 1 },
 +    { "aot", T_BOOL, &ps4_settings.aot, 0, 1 },
 +    { "aot_record", T_BOOL, &ps4_settings.aot_record, 0, 1 },
++    { "aot_direct", T_BOOL, &ps4_settings.aot_direct, 0, 1 },
 +};
 +
 +void ps4_settings_apply_aot(void)
 +{
 +    aot_use = ps4_settings.aot;
 +    aot_record = ps4_settings.aot_record;
++    aot_direct = ps4_settings.aot_direct;
 +}
 +
 +void ps4_settings_load(void)
@@ -7116,10 +7364,10 @@ index 0000000..11ac43c
 +}
 diff --git a/ui/ps4/ps4-settings.h b/ui/ps4/ps4-settings.h
 new file mode 100644
-index 0000000..af429ed
+index 0000000..ccd0b88
 --- /dev/null
 +++ b/ui/ps4/ps4-settings.h
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,74 @@
 +/*
 + * xemu-ps4: the PS4 frontend's own settings (/data/xemu/ps4.ini), next to xemu's xemu.toml.
 + * Changed from the quick menu (ps4-hud.cc); "restart" ones apply at the next start.
@@ -7174,6 +7422,7 @@ index 0000000..af429ed
 +    bool boot_launcher;     /* start in the game library (ps4-launcher.cc) */
 +    bool aot;               /* run a game's translated code (/data/xemu/aot/<ID>.aot) (next game) */
 +    bool aot_record;        /* write the blocks a game runs as C for the PC's build (next game) */
++    bool aot_direct;        /* translated blocks run the next one without the main loop (live) */
 +} PS4Settings;
 +
 +extern PS4Settings ps4_settings;

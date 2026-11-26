@@ -180,6 +180,11 @@ typedef void (*aot_st64_fn)(char *, uint64_t, uint64_t, uint32_t, uintptr_t);
  */
 #define AOT_FAST_OK(oi, cmpm) (((oi) & 15) == AOT_FAST_MMU && ((cmpm) & 0xfffu) == 0)
 #define AOT_NOCROSS(a, SZ) ((SZ) == 1 || ((a) & 0xfffu) <= 0x1000u - (SZ))
+/*
+ * The access stays in its page: aligned ones always do (one test), the rest are checked. Most
+ * guest accesses are aligned; the page-offset compare costs four instructions on each.
+ */
+#define AOT_FITS(a, SZ) ((SZ) == 1 || AOT_LIKELY(((a) & ((SZ) - 1)) == 0) || AOT_NOCROSS(a, SZ))
 typedef void (*aot_st_fn)(char *, uint64_t, uint64_t, uint32_t, uintptr_t);
 #define AOT_SLOW_LD(a, oi) ((aot_ld_fn)AOT_H(aot_slow_ld))(env, (a), (oi), AOT_RA)
 #define AOT_SLOW_ST(a, v, oi) ((aot_st_fn)AOT_H(aot_slow_st))(env, (a), (uint64_t)(v), (oi), AOT_RA)
@@ -188,7 +193,7 @@ typedef void (*aot_st_fn)(char *, uint64_t, uint64_t, uint32_t, uintptr_t);
         uint32_t _a = (uint32_t)(a);                                            \
         if (AOT_FAST_OK(oi, cmpm)) {                                            \
             uintptr_t _t = aot_frd[_a >> 12];                                   \
-            if (AOT_LIKELY(_t != 0 && AOT_NOCROSS(_a, SZ))) {                   \
+            if (AOT_LIKELY(_t != 0 && AOT_FITS(_a, SZ))) {                   \
                 LT _v;                                                          \
                 __builtin_memcpy(&_v, (char *)(_t + _a), SZ);                   \
                 dst = (T)_v;                                                    \
@@ -214,7 +219,7 @@ typedef void (*aot_st_fn)(char *, uint64_t, uint64_t, uint32_t, uintptr_t);
         ST _v = (ST)(val);                                                      \
         if (AOT_FAST_OK(oi, cmpm)) {                                            \
             uintptr_t _t = aot_fwr[_a >> 12];                                   \
-            if (AOT_LIKELY(_t != 0 && AOT_NOCROSS(_a, SZ))) {                   \
+            if (AOT_LIKELY(_t != 0 && AOT_FITS(_a, SZ))) {                   \
                 __builtin_memcpy((char *)(_t + _a), &_v, SZ);                   \
             } else {                                                            \
                 AOT_SYNC_P(); AOT_SYNC_NP(); AOT_CUR(pc, cc);                   \
@@ -271,9 +276,21 @@ static inline uint64_t AOT_ROTR64(uint64_t a, uint64_t b) { b &= 63; return (a >
 
 /* --- xemu's x87 on host SSE (tcg/i386/tcg-target.c.inc, the FP ops) -------------------------- */
 
-/* host MXCSR is 0x1F80 (set by AOT_SSE_CSR; aot_enter and x87's flcr clear it) */
-extern uint32_t aot_csr_ok AOT_HIDDEN;
-#define AOT_SETCSR(v) (_mm_setcsr((uint32_t)(v)), aot_csr_ok = 0)
+/*
+ * The host MXCSR as translated code last set it, 0 when not known (aot_enter: the JIT's code ran
+ * in between). Blocks with x87 code set it from the guest's control word (xemu's flcr) at their
+ * first FP op; the inline SSE ops want 0x1F80. Only a change costs an LDMXCSR (slow on Jaguar):
+ * x87 blocks in a row with the same rounding share one. Nothing else in xemu writes the host
+ * MXCSR (its hard-FPU helpers compute under it).
+ */
+extern uint32_t aot_csr_cur AOT_HIDDEN;
+#define AOT_SETCSR(v) do {                                                      \
+        const uint32_t _csr = (uint32_t)(v);                                    \
+        if (AOT_UNLIKELY(_csr != aot_csr_cur)) {                                \
+            _mm_setcsr(_csr);                                                   \
+            aot_csr_cur = _csr;                                                 \
+        }                                                                       \
+    } while (0)
 
 static inline float AOT_LD80_F32(const char *p) { long double x; __builtin_memcpy(&x, p, 10); return (float)x; }
 static inline double AOT_LD80_F64(const char *p) { long double x; __builtin_memcpy(&x, p, 10); return (double)x; }
@@ -314,12 +331,7 @@ static inline uint64_t AOT_CVTSD2SI64(double a) { return (uint64_t)_mm_cvtsd_si6
  * 0x1F80, and call QEMU's helper otherwise. The guest's MXCSR exception flags are not updated
  * (QEMU raises no SIMD exceptions; games don't read the sticky flags). */
 
-#define AOT_SSE_CSR() do {                                                      \
-        if (AOT_UNLIKELY(!aot_csr_ok)) {                                        \
-            _mm_setcsr(0x1F80u);                                                \
-            aot_csr_ok = 1;                                                     \
-        }                                                                       \
-    } while (0)
+#define AOT_SSE_CSR() AOT_SETCSR(0x1F80u)
 #define AOT_GUEST_CSR_DEFAULT(e) ((AOT_LDM(uint32_t, (e), AOT_OFF_MXCSR) & 0xE040u) == 0)
 
 typedef void (*aot_sse3_fn)(uintptr_t, uintptr_t, uintptr_t, uintptr_t);
