@@ -473,6 +473,14 @@ static inline int aot_overlap(uint32_t a, uint32_t alen, uint32_t b, uint32_t bl
     return a < b + blen && b < a + alen;
 }
 
+/* guest memory through host pointers (any alignment; scripts/hookgen.py's hooks) */
+static inline float aot_hk_ldf(const uint8_t *p) { float f; __builtin_memcpy(&f, p, 4); return f; }
+static inline double aot_hk_ldd(const uint8_t *p) { double d; __builtin_memcpy(&d, p, 8); return d; }
+static inline void aot_hk_stf(uint8_t *p, float f) { __builtin_memcpy(p, &f, 4); }
+static inline void aot_hk_std(uint8_t *p, double d) { __builtin_memcpy(p, &d, 8); }
+static inline uint32_t aot_hk_ld32(const uint8_t *p) { uint32_t v; __builtin_memcpy(&v, p, 4); return v; }
+static inline void aot_hk_st32(uint8_t *p, uint32_t v) { __builtin_memcpy(p, &v, 4); }
+
 #define AOT_HOOK(PC) AOT_HIDDEN AOT_CC void H_##PC(AOT_PARAMS)
 #define AOT_HOOK_BEGIN(PC)                                                      \
     char *env = aot_env;                                                        \
