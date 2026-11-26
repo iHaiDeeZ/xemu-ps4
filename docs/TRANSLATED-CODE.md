@@ -42,7 +42,8 @@ in `.gitignore`).
   (`mulss`, `addss`, ...) become the host's own instructions when the guest uses the default
   MXCSR. The result is a position-independent ELF object with no imports.
 - **Running** (`accel/tcg/aot.c`, `target/i386/tcg/aot-i386.c`): the file is mapped into
-  executable direct memory. When the JIT is about to translate a block the file has, with the
+  executable flexible memory on a 2 MiB-aligned range of its own (the kernel refuses executable
+  direct memory on firmware 13.52). When the JIT is about to translate a block the file has, with the
   same flags and the same code bytes (hash), it makes a one-instruction TB that calls
   `helper_aot_run`, which runs the compiled block. A block counts as valid once its TB ran;
   TLB flushes over its pages and code writes over its bytes make it go through that check
@@ -76,5 +77,8 @@ in `.gitignore`).
                                                     guest instructions; writes the --hot list
     python scripts/hooker.py code 0x000a1380 0x100  the game's code at a guest address
     python scripts/hooker.py ab a.aot b.aot 30      times two builds live; keeps the faster
+    python scripts/hooker.py abset gpu_blit 0 1 30  times two values of a live setting; keeps the faster
+    python scripts/hooker.py nv2a                   the GPU side per frame: submits, waits, uploads,
+                                                    and the image copies by shape and by where they ran
 
 Reports go to `logs/hooker/`.
