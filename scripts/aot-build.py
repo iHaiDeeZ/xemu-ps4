@@ -50,7 +50,7 @@ CFLAGS = ['-O2', '-march=btver2', '-fPIC', '-fvisibility=hidden', '-ffreestandin
 
 
 class Block:
-    __slots__ = ('pc', 'fl', 'cf', 'size', 'icount', 'hash', 'body', 'id', 'name')
+    __slots__ = ('pc', 'fl', 'cf', 'size', 'icount', 'hash', 'body', 'id', 'name', 'hook')
 
 
 def read_blocks(dirs):
@@ -159,6 +159,8 @@ def make_regions(blocks, max_blocks):
             t = by_id.get(int(m.group(2)))
             if t is None or t.fl != b.fl or t.cf != b.cf or abs(t.pc - b.pc) > REGION_DIST:
                 continue
+            if b.hook or t.hook:
+                continue        # a hooked block keeps its own function (emit_hooked)
             if t is b:
                 selfloop.add(b.id)
                 continue
@@ -167,7 +169,8 @@ def make_regions(blocks, max_blocks):
                 parent[ra] = rb
     groups = collections.defaultdict(list)
     for b in blocks:
-        groups[find(b.id)].append(b)
+        if not b.hook:
+            groups[find(b.id)].append(b)
     regions = []
     for g in groups.values():
         g.sort(key=lambda b: (b.pc, b.id))
@@ -207,6 +210,24 @@ def emit_region(rname, r):
     return ''.join(out)
 
 
+HOOK_RE = re.compile(r'^AOT_HOOK\(([0-9a-f]{8})\)', re.M)
+
+
+def emit_hooked(b):
+    """A block whose pc has a hook (aot/hooks/<title>.c): its own translated code as O<id>, and its
+    entry (F<id>) that checks it is valid, names the fallback and runs the hook."""
+    return (f'\n/* pc {b.pc:08x} flags {b.fl:08x} size {b.size} insns {b.icount}: hooked */\n'
+            f'AOT_HIDDEN AOT_CC void O{b.name[1:]}(AOT_PARAMS)\n{{\n'
+            f'    AOT_PROLOGUE({b.id}, 0x{b.pc:08x}u)\n#define AOT_MYFL 0x{b.fl:08x}u\n'
+            f'{b.body}#undef AOT_MYFL\n}}\n'
+            f'AOT_HIDDEN AOT_CC void {b.name}(AOT_PARAMS)\n{{\n'
+            f'    if (AOT_UNLIKELY(!aot_valid[{b.id}])) {{\n'
+            f'        char *env = aot_env;\n        uint32_t g_eip = 0x{b.pc:08x}u;\n'
+            f'        AOT_SYNC_P();\n        return;\n    }}\n'
+            f'    aot_hook_orig = O{b.name[1:]};\n    aot_hook_fl = 0x{b.fl:08x}u;\n'
+            f'    __attribute__((musttail)) return H_{b.pc:08x}(AOT_ARGS);\n}}\n')
+
+
 def ix_hash(pc, fl, mask):
     return ((((pc * 0x9E3779B1) & 0xffffffff) ^ ((fl * 0x85EBCA77) & 0xffffffff)) >> 7) & mask
 
@@ -233,6 +254,9 @@ def main():
                     help="keep x87's last instruction/operand pointer stores")
     ap.add_argument('--regions', action='store_true',
                     help='compile blocks that jump to each other nearby as one function')
+    ap.add_argument('--hooks', default='auto',
+                    help="native versions of game functions: a C file, 'auto' (aot/hooks/<title>.c "
+                         "when there is one) or 'none'")
     ap.add_argument('--region-blocks', type=int, default=48,
                     help='most blocks in one region function')
     a = ap.parse_args()
@@ -301,6 +325,20 @@ def main():
           f'{freed} unchanged globals no longer stored back')
 
     # regions: blocks that jump to each other nearby become one function (aot_rt.h AOT_RCHAIN)
+    # hooks: the game's functions in native C (aot/hooks/<title>.c)
+    hooks_path = None
+    if a.hooks == 'auto':
+        p = os.path.join(RT_DIR, 'hooks', f'{int(a.title, 16):08x}.c')
+        hooks_path = p if os.path.exists(p) else None
+    elif a.hooks != 'none':
+        hooks_path = a.hooks
+    hooks_text = open(hooks_path).read() if hooks_path else ''
+    hooked = {int(x, 16) for x in HOOK_RE.findall(hooks_text)}
+    for b in blocks:
+        b.hook = b.pc in hooked
+    if hooks_path:
+        print(f'hooks: {len(hooked)} functions in {hooks_path}, '
+              f'{sum(1 for b in blocks if b.hook)} blocks run them')
     regions = make_regions(blocks, a.region_blocks) if a.regions else []
     in_region = {b.id for r in regions for b in r}
     units = [r for r in regions] + [[b] for b in blocks if b.id not in in_region]
@@ -347,11 +385,19 @@ def main():
                 names.add(b.name)
                 for m in CHAIN_RE.finditer(b.body):
                     protos.add(m.group(1))
+        for u in fu:
+            for b in u:
+                if b.hook:
+                    names.add(f'H_{b.pc:08x}')
+                    names.add(f'O{b.name[1:]}')
         out = [head]
         out += [f'AOT_HIDDEN AOT_CC void {p}(AOT_PARAMS);\n' for p in sorted(protos | names)]
         for u in fu:
             funcs += [(b.name, fi) for b in u]
-            if len(u) == 1 and u[0].id not in in_region:
+            if len(u) == 1 and u[0].hook:
+                funcs.append((f'O{u[0].name[1:]}', fi))
+                out.append(emit_hooked(u[0]))
+            elif len(u) == 1 and u[0].id not in in_region:
                 b = u[0]
                 out.append(f'\n/* pc {b.pc:08x} flags {b.fl:08x} size {b.size} insns {b.icount} */\n'
                            f'AOT_HIDDEN AOT_CC void {b.name}(AOT_PARAMS)\n{{\n'
@@ -374,9 +420,18 @@ def main():
     with open(os.path.join(work, 'regions.txt'), 'w') as f:
         for rname, u in region_names:
             f.write(rname + ' ' + ' '.join(f'{b.pc:08x}' for b in u) + '\n')
+    if hooks_path:
+        src = os.path.join(work, 'aot_hooks.c')
+        write_if_changed(src, head + f'/* {hooks_path} */\n' + hooks_text)
+        sources.append(src)
+        funcs += [(f'H_{pc:08x}', 'aot_hooks.c') for pc in sorted(hooked)]
+    else:
+        for name in ('aot_hooks.c', 'aot_hooks.o'):
+            if os.path.exists(os.path.join(work, name)):
+                os.remove(os.path.join(work, name))
     with open(os.path.join(work, 'funcs.txt'), 'w') as f:
         for name, fi in funcs:
-            f.write(f'{name} aot_{fi:04d}.c\n')
+            f.write(f'{name} {fi if isinstance(fi, str) else f"aot_{fi:04d}.c"}\n')
 
     # the tables, the entry, the header
     ix = [None] * (mask + 1)
@@ -415,6 +470,8 @@ const uintptr_t *aot_frd AOT_HIDDEN;
 const uintptr_t *aot_fwr AOT_HIDDEN;
 uint32_t aot_csr_cur AOT_HIDDEN;
 uint32_t aot_rent AOT_HIDDEN;
+aot_fn_t aot_hook_orig AOT_HIDDEN;
+uint32_t aot_hook_fl AOT_HIDDEN;
 uint32_t aot_valid[AOT_NB_BLOCKS + 1] AOT_HIDDEN;
 uint32_t aot_gen AOT_HIDDEN = 1;
 uint32_t aot_cur[2] AOT_HIDDEN;

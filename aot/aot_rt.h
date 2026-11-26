@@ -67,6 +67,10 @@ typedef struct aot_ix {
 extern char *const aot_env AOT_HIDDEN;       /* the CPU's env */
 extern const uintptr_t *const aot_frd AOT_HIDDEN;   /* flat page tables: host - guest per page */
 extern const uintptr_t *const aot_fwr AOT_HIDDEN;
+#else
+extern char *aot_env AOT_HIDDEN;
+extern const uintptr_t *aot_frd AOT_HIDDEN;
+extern const uintptr_t *aot_fwr AOT_HIDDEN;
 #endif
 extern uint32_t aot_valid[] AOT_HIDDEN;      /* nonzero: entered through its trampoline */
 extern uint32_t aot_gen AOT_HIDDEN;
@@ -431,5 +435,69 @@ static inline uint32_t AOT_F2U(float f) { uint32_t u; __builtin_memcpy(&u, &f, 4
 static inline float AOT_U2F(uint32_t u) { float f; __builtin_memcpy(&f, &u, 4); return f; }
 static inline uint64_t AOT_D2U(double d) { uint64_t u; __builtin_memcpy(&u, &d, 8); return u; }
 static inline double AOT_U2D(uint64_t u) { double d; __builtin_memcpy(&d, &u, 8); return d; }
+
+/* --- hooks: a game's own functions replaced by C written for the PS4 (aot/hooks/<title>.c) ------
+ *
+ * scripts/aot-build.py --hooks: the block at a hooked pc becomes "valid? then the hook"; the
+ * block's translated code stays as the fallback (aot_hook_orig) for whatever the hook doesn't
+ * take on - memory that isn't plain RAM in the flat page tables, overlapping arguments, unusual
+ * CPU state. A hook does all that the guest function does (memory, registers, flags, x87 state,
+ * the return) so that the game can't tell: scripts/aot-hooktest.py runs the hook and the
+ * translated original on the same inputs and compares guest memory and CPU state bit for bit.
+ * Only the first block's code is checked (its trampoline's hash): hook functions that the game
+ * doesn't rewrite.
+ */
+extern aot_fn_t aot_hook_orig AOT_HIDDEN;      /* the hooked block's own translated code */
+extern uint32_t aot_hook_fl AOT_HIDDEN;        /* its flags (the return's lookup) */
+
+/* CPUX86State fields after the ones aot_abi.h names (QEMU's layout: df follows cc_op; fpus and
+ * fpuc follow fpstt, then fptags[8]) */
+#define AOT_OFF_DF (AOT_OFF_CC_OP + 4)
+#define AOT_OFF_FPUS (AOT_OFF_FPSTT + 4)
+#define AOT_OFF_FPUC (AOT_OFF_FPSTT + 6)
+#define AOT_OFF_FPTAGS (AOT_OFF_FPSTT + 8)
+
+/* a host pointer to guest [a, a + len) when it is in one page of plain RAM (writes: one the flat
+ * write table maps, i.e. no code or dirty tracking on it), else NULL */
+static inline void *aot_hptr(uint32_t a, uint32_t len, int write)
+{
+    if (len == 0 || (a & 0xfffu) + len > 0x1000u) {
+        return 0;
+    }
+    const uintptr_t t = (write ? aot_fwr : aot_frd)[a >> 12];
+    return t ? (void *)(t + a) : 0;
+}
+
+static inline int aot_overlap(uint32_t a, uint32_t alen, uint32_t b, uint32_t blen)
+{
+    return a < b + blen && b < a + alen;
+}
+
+#define AOT_HOOK(PC) AOT_HIDDEN AOT_CC void H_##PC(AOT_PARAMS)
+#define AOT_HOOK_BEGIN(PC)                                                      \
+    char *env = aot_env;                                                        \
+    uint32_t g_eip = 0x##PC##u;                                                 \
+    (void)env
+/* the game's own code does it (scripts/aot-hooktest.py counts these: a test must reach the hook) */
+#ifdef AOT_HOOKTEST
+extern int aot_hooktest_fallbacks;
+#define AOT_HOOKTEST_COUNT() (aot_hooktest_fallbacks++)
+#else
+#define AOT_HOOKTEST_COUNT() ((void)0)
+#endif
+#define AOT_HOOK_FALLBACK() do {                                                \
+        AOT_HOOKTEST_COUNT();                                                   \
+        __attribute__((musttail)) return aot_hook_orig(AOT_ARGS);               \
+    } while (0)
+/* back to the game at RET with the registers as the hook left them */
+#define AOT_HOOK_RETURN(RET) do {                                               \
+        g_eip = (RET);                                                          \
+        const uint32_t _id = aot_lookup(g_eip, aot_hook_fl);                    \
+        if (AOT_LIKELY(_id)) {                                                  \
+            __attribute__((musttail)) return aot_fns[_id](AOT_ARGS);            \
+        }                                                                       \
+        AOT_SYNC_P();                                                           \
+        return;                                                                 \
+    } while (0)
 
 #endif
