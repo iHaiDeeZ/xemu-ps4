@@ -2745,10 +2745,10 @@ index df65d22..9895b19 100644
  
 diff --git a/target/i386/tcg/aot-i386.c b/target/i386/tcg/aot-i386.c
 new file mode 100644
-index 0000000..6a54db5
+index 0000000..9c28d62
 --- /dev/null
 +++ b/target/i386/tcg/aot-i386.c
-@@ -0,0 +1,209 @@
+@@ -0,0 +1,216 @@
 +/*
 + * xemu-ps4: the x86 side of the ahead-of-time translator (include/exec/aot.h).
 + *
@@ -2926,7 +2926,14 @@ index 0000000..6a54db5
 +    AotDisas *d = container_of(db, AotDisas, base);
 +
 +    gen_helper_aot_run(tcg_env, tcg_constant_i32(d->id));
-+    tcg_gen_lookup_and_goto_ptr();
++    /*
++     * Back to the main loop, not straight to the next TB (lookup_and_goto_ptr): translated code
++     * leaves when a block ends with exit_tb(0) - after STI, MOV SS, POPF and the like, so that
++     * cpu_handle_interrupt delivers what became deliverable - or on an exit request. Going on
++     * without the main loop starved the Xbox kernel's idle loop (STI; NOP; NOP; CLI) of its
++     * timer interrupt: Crash never left it (v00.24).
++     */
++    tcg_gen_exit_tb(NULL, 0);
 +}
 +
 +static const TranslatorOps aot_tr_ops = {
