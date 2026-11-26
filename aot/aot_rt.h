@@ -150,6 +150,19 @@ static inline uint32_t aot_lookup(uint32_t pc, uint32_t fl)
         AOT_IND();                                                              \
     } while (0)
 
+/*
+ * Regions (scripts/aot-build.py --regions): blocks that jump to each other nearby are labels B<id>
+ * of one function. A jump between them is a goto; the target's own entry check (valid) still runs.
+ * Entering from outside goes through the block's function, which names it in aot_rent.
+ */
+extern uint32_t aot_rent AOT_HIDDEN;
+#define AOT_RCHAIN(B, PC) do {                                                  \
+        if (AOT_LIKELY(g_eip == (PC))) {                                        \
+            goto B;                                                             \
+        }                                                                       \
+        AOT_IND();                                                              \
+    } while (0)
+
 /* --- guest memory: QEMU's TLB, as tcg/i386/tcg-target.c.inc prepare_host_addr ---------------- */
 
 #define AOT_TLBE(fofs, a)                                                       \

@@ -133,6 +133,80 @@ def read_hot(path):
     return hot
 
 
+CHAIN_RE = re.compile(r'AOT_CHAIN\((F(\d+)_[0-9a-f]+), 0x([0-9a-f]+)u\)')
+LABEL_RE = re.compile(r'(?<![\w])L(\d+): ;')
+GOTO_L_RE = re.compile(r'goto L(\d+);')
+REGION_DIST = 4096
+
+
+def make_regions(blocks, max_blocks):
+    """Groups of blocks (same flags) that jump directly to each other within REGION_DIST bytes:
+    loops and the branches of one function. A group becomes one C function with a label per
+    block (emit_region), so a jump between them is a goto: no frame, no register shuffle, values
+    stay in registers across the blocks. A block that jumps to itself is a region of its own."""
+    by_id = {b.id: b for b in blocks}
+    parent = {b.id: b.id for b in blocks}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    selfloop = set()
+    for b in blocks:
+        for m in CHAIN_RE.finditer(b.body):
+            t = by_id.get(int(m.group(2)))
+            if t is None or t.fl != b.fl or t.cf != b.cf or abs(t.pc - b.pc) > REGION_DIST:
+                continue
+            if t is b:
+                selfloop.add(b.id)
+                continue
+            ra, rb = find(b.id), find(t.id)
+            if ra != rb:
+                parent[ra] = rb
+    groups = collections.defaultdict(list)
+    for b in blocks:
+        groups[find(b.id)].append(b)
+    regions = []
+    for g in groups.values():
+        g.sort(key=lambda b: (b.pc, b.id))
+        for i in range(0, len(g), max_blocks):
+            chunk = g[i:i + max_blocks]
+            if len(chunk) >= 2 or chunk[0].id in selfloop:
+                regions.append(chunk)
+    return regions
+
+
+def emit_region(rname, r):
+    """One C function for the blocks of a region: entered through each block's own function (a
+    thunk that names the block in aot_rent), jumps between them as gotos (AOT_RCHAIN)."""
+    members = {b.id for b in r}
+    out = [f'\n/* region {rname}: {len(r)} blocks */\n'
+           f'AOT_HIDDEN AOT_CC void {rname}(AOT_PARAMS)\n{{\n'
+           '    char *env = aot_env;\n    uint32_t g_eip;\n'
+           '    switch (aot_rent) {\n']
+    out += [f'    case {i}: goto B{b.id};\n' for i, b in enumerate(r)]
+    out.append('    default: __builtin_unreachable();\n    }\n')
+    for b in r:
+        body = LABEL_RE.sub(lambda m, b=b: f'L{b.id}_{m.group(1)}: ;', b.body)
+        body = GOTO_L_RE.sub(lambda m, b=b: f'goto L{b.id}_{m.group(1)};', body)
+        body = CHAIN_RE.sub(lambda m: (f'AOT_RCHAIN(B{m.group(2)}, 0x{m.group(3)}u)'
+                                       if int(m.group(2)) in members else m.group(0)), body)
+        out.append(f'\n/* pc {b.pc:08x} flags {b.fl:08x} size {b.size} insns {b.icount} */\n'
+                   f'B{b.id}: ;\n    g_eip = 0x{b.pc:08x}u;\n'
+                   f'    if (AOT_UNLIKELY(!aot_valid[{b.id}])) {{\n'
+                   f'        AOT_SYNC_P();\n        return;\n    }}\n'
+                   f'    {{\n#define AOT_MYFL 0x{b.fl:08x}u\n')
+        out.append(body)
+        out.append('#undef AOT_MYFL\n    }\n    return;\n')
+    out.append('}\n')
+    for i, b in enumerate(r):
+        out.append(f'AOT_HIDDEN AOT_CC void {b.name}(AOT_PARAMS)\n{{\n    aot_rent = {i};\n'
+                   f'    __attribute__((musttail)) return {rname}(AOT_ARGS);\n}}\n')
+    return ''.join(out)
+
+
 def ix_hash(pc, fl, mask):
     return ((((pc * 0x9E3779B1) & 0xffffffff) ^ ((fl * 0x85EBCA77) & 0xffffffff)) >> 7) & mask
 
@@ -157,6 +231,10 @@ def main():
                     help='guest pcs to place first (scripts/aot-hotblocks.py --hot-out)')
     ap.add_argument('--keep-fpu-pointers', action='store_true',
                     help="keep x87's last instruction/operand pointer stores")
+    ap.add_argument('--regions', action='store_true',
+                    help='compile blocks that jump to each other nearby as one function')
+    ap.add_argument('--region-blocks', type=int, default=48,
+                    help='most blocks in one region function')
     a = ap.parse_args()
 
     t0 = time.time()
@@ -222,15 +300,21 @@ def main():
           f'{inlined} SSE helper calls as host instructions, {x87_dropped} x87 pointer stores dropped, '
           f'{freed} unchanged globals no longer stored back')
 
-    # layout: the hottest blocks first and together (fewer pages and cache lines for the code that
+    # regions: blocks that jump to each other nearby become one function (aot_rt.h AOT_RCHAIN)
+    regions = make_regions(blocks, a.region_blocks) if a.regions else []
+    in_region = {b.id for r in regions for b in r}
+    units = [r for r in regions] + [[b] for b in blocks if b.id not in in_region]
+    if regions:
+        print(f'regions: {len(regions)} functions of {len(in_region)} blocks '
+              f'({len(in_region) / max(len(regions), 1):.1f} each), {n - len(in_region)} blocks alone')
+
+    # layout: the hottest code first and together (fewer pages and cache lines for the code that
     # runs most), then the rest in pc order
-    order = blocks
-    if a.hot:
-        hot = read_hot(a.hot)
-        first = sorted((b for b in blocks if b.pc in hot), key=lambda b: (-hot[b.pc], b.pc))
-        firsts = {id(b) for b in first}
-        order = first + [b for b in blocks if id(b) not in firsts]
-        print(f'layout: {len(first)} hot blocks first ({len(hot)} hot pcs listed)')
+    hot = read_hot(a.hot) if a.hot else {}
+    units.sort(key=lambda u: (-max(hot.get(b.pc, 0.0) for b in u), u[0].pc))
+    if hot:
+        print(f'layout: {sum(1 for u in units if any(b.pc in hot for b in u))} hot units first '
+              f'({len(hot)} hot pcs listed)')
 
     mask = 1
     while mask + 1 < 2 * n:
@@ -245,24 +329,54 @@ def main():
 
     head = '#include "aot_abi.h"\n#include "aot_gen.h"\n#include "aot_rt.h"\n\n'
     sources = []
-    for f0 in range(0, n, PER_FILE):
-        chunk = order[f0:f0 + PER_FILE]
-        names = {b.name for b in chunk}
-        protos = set()
-        for b in chunk:
-            for m in re.finditer(r'AOT_CHAIN\((F\d+_[0-9a-f]+),', b.body):
-                protos.add(m.group(1))
+    files, cur, cur_n = [], [], 0
+    for u in units:
+        if cur and cur_n + len(u) > PER_FILE:
+            files.append(cur)
+            cur, cur_n = [], 0
+        cur.append(u)
+        cur_n += len(u)
+    if cur:
+        files.append(cur)
+    region_names = []
+    funcs = []          # (function, file) for scripts/aot-hotblocks.py
+    for fi, fu in enumerate(files):
+        names, protos = set(), set()
+        for u in fu:
+            for b in u:
+                names.add(b.name)
+                for m in CHAIN_RE.finditer(b.body):
+                    protos.add(m.group(1))
         out = [head]
         out += [f'AOT_HIDDEN AOT_CC void {p}(AOT_PARAMS);\n' for p in sorted(protos | names)]
-        for b in chunk:
-            out.append(f'\n/* pc {b.pc:08x} flags {b.fl:08x} size {b.size} insns {b.icount} */\n'
-                       f'AOT_HIDDEN AOT_CC void {b.name}(AOT_PARAMS)\n{{\n'
-                       f'    AOT_PROLOGUE({b.id}, 0x{b.pc:08x}u)\n#define AOT_MYFL 0x{b.fl:08x}u\n')
-            out.append(b.body)
-            out.append('#undef AOT_MYFL\n}\n')
-        src = os.path.join(work, f'aot_{f0 // PER_FILE:04d}.c')
+        for u in fu:
+            funcs += [(b.name, fi) for b in u]
+            if len(u) == 1 and u[0].id not in in_region:
+                b = u[0]
+                out.append(f'\n/* pc {b.pc:08x} flags {b.fl:08x} size {b.size} insns {b.icount} */\n'
+                           f'AOT_HIDDEN AOT_CC void {b.name}(AOT_PARAMS)\n{{\n'
+                           f'    AOT_PROLOGUE({b.id}, 0x{b.pc:08x}u)\n#define AOT_MYFL 0x{b.fl:08x}u\n')
+                out.append(b.body)
+                out.append('#undef AOT_MYFL\n}\n')
+            else:
+                rname = f'R{len(region_names)}_{u[0].pc:08x}'
+                region_names.append((rname, u))
+                funcs.append((rname, fi))
+                out.append(emit_region(rname, u))
+        src = os.path.join(work, f'aot_{fi:04d}.c')
         write_if_changed(src, ''.join(out))
         sources.append(src)
+    # stale files from a build with more of them
+    for name in os.listdir(work):
+        m = re.match(r'aot_(\d{4})\.[co]$', name)
+        if m and int(m.group(1)) >= len(files):
+            os.remove(os.path.join(work, name))
+    with open(os.path.join(work, 'regions.txt'), 'w') as f:
+        for rname, u in region_names:
+            f.write(rname + ' ' + ' '.join(f'{b.pc:08x}' for b in u) + '\n')
+    with open(os.path.join(work, 'funcs.txt'), 'w') as f:
+        for name, fi in funcs:
+            f.write(f'{name} aot_{fi:04d}.c\n')
 
     # the tables, the entry, the header
     ix = [None] * (mask + 1)
@@ -300,6 +414,7 @@ char *aot_env AOT_HIDDEN;
 const uintptr_t *aot_frd AOT_HIDDEN;
 const uintptr_t *aot_fwr AOT_HIDDEN;
 uint32_t aot_csr_cur AOT_HIDDEN;
+uint32_t aot_rent AOT_HIDDEN;
 uint32_t aot_valid[AOT_NB_BLOCKS + 1] AOT_HIDDEN;
 uint32_t aot_gen AOT_HIDDEN = 1;
 uint32_t aot_cur[2] AOT_HIDDEN;

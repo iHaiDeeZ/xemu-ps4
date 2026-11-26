@@ -49,3 +49,32 @@ in `.gitignore`).
   again, so changed code falls back to the JIT.
 - The file only fits the xemu build that recorded it (`aot_abi.h`'s key): after an xemu update
   that changes the CPU state's layout, record again.
+- When a chain of blocks returns and nothing is pending (no interrupt, exit request or one-off TB
+  flags), `helper_aot_run` runs the next compiled block itself instead of going back through
+  QEMU's main loop (`ps4.ini` `aot_direct`, live: `set aot_direct 0`).
+
+## Build options
+
+`scripts/aot-build.py` also:
+
+- drops x87's last instruction/operand pointer stores (5 stores and 2 loads per x87
+  instruction; only FNSTENV/FNSAVE/FXSAVE read them): `--keep-fpu-pointers` keeps them;
+- `--hot <list>`: lays the listed guest pcs' blocks out first, hottest first (fewer code pages
+  and cache lines for what runs most); `scripts/hooker.py profile` writes the list;
+- `--regions`: compiles blocks that jump to each other within 4 KiB (loops, the branches of a
+  function) as one C function, a jump between them a `goto` (no frame, no register shuffle);
+  each block keeps its own entry. Experimental: compare with `scripts/hooker.py ab`.
+
+## The hooker
+
+`scripts/hooker.py` looks inside the running game through the live console:
+
+    python scripts/hooker.py status                 frame rate, thread loads, translated code
+    python scripts/hooker.py exits 10               why translated code goes back to the main loop
+    python scripts/hooker.py profile                the emulated CPU's time by game block (x87,
+                                                    SSE, integer), with the hottest blocks'
+                                                    guest instructions; writes the --hot list
+    python scripts/hooker.py code 0x000a1380 0x100  the game's code at a guest address
+    python scripts/hooker.py ab a.aot b.aot 30      times two builds live; keeps the faster
+
+Reports go to `logs/hooker/`.

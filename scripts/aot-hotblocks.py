@@ -57,14 +57,27 @@ for i, a in enumerate(sorted(aot_addrs)):
 
 # --- each block's C ------------------------------------------------------------------------------
 src_cache = {}
+# function -> file (scripts/aot-build.py writes funcs.txt since v00.26; before: 300 blocks a file)
+func_file = {}
+try:
+    for line in open(os.path.join(work, 'funcs.txt')):
+        p = line.split()
+        if len(p) == 2:
+            func_file[p[0]] = p[1]
+except OSError:
+    pass
 
 
 def block_c(name):
-    m = re.match(r'F(\d+)_([0-9a-f]{8})$', name)
+    m = re.match(r'([FR])(\d+)_([0-9a-f]{8})$', name)
     if not m:
         return None
-    fid = int(m.group(1))
-    path = os.path.join(work, 'aot_%04d.c' % (fid // 300))
+    if name in func_file:
+        path = os.path.join(work, func_file[name])
+    elif m.group(1) == 'F':
+        path = os.path.join(work, 'aot_%04d.c' % (int(m.group(2)) // 300))
+    else:
+        return None
     if path not in src_cache:
         try:
             src_cache[path] = open(path, encoding='utf-8', errors='replace').read()
@@ -75,7 +88,7 @@ def block_c(name):
     if i < 0:
         return None
     j = s.find('\n}\n', i)
-    head = s.rfind('/* pc ', 0, i)
+    head = s.rfind('/* pc ', 0, i) if name[0] == 'F' else i
     return s[head if head >= 0 else i:j]
 
 
@@ -101,8 +114,8 @@ for name, n in by_block.most_common():
         kind_t['(runtime: ' + name + ')'] += n
         continue
     k, nld, nst, calls = kinds(c)
-    m = re.search(r'size (\d+) insns (\d+)', c)
-    size, insns = (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+    sizes = [(int(x), int(y)) for x, y in re.findall(r'size (\d+) insns (\d+)', c)]
+    size, insns = (sum(s for s, _ in sizes), sum(i for _, i in sizes)) if sizes else (0, 0)
     for x in k or ['integer']:
         kind_t[x] += n
     rows.append((n, name, insns, size, nld, nst, calls, ','.join(k) or 'integer'))
@@ -115,10 +128,22 @@ if hot_out:
             p = line.split()
             if len(p) >= 2:
                 prev[p[0]] = prev.get(p[0], 0) + float(p[1])
+    regions = {}
+    try:
+        for line in open(os.path.join(work, 'regions.txt')):
+            p = line.split()
+            if p:
+                regions[p[0]] = p[1:]
+    except OSError:
+        pass
     for name, n in by_block.items():
         m = re.match(r'F\d+_([0-9a-f]{8})$', name)
         if m:
             prev[m.group(1)] = prev.get(m.group(1), 0) + n
+        elif name in regions:
+            # a region's samples, spread over its blocks: they stay together in the layout
+            for pc in regions[name]:
+                prev[pc] = prev.get(pc, 0) + n / len(regions[name])
     with open(hot_out, 'w') as f:
         for pc, n in sorted(prev.items(), key=lambda kv: -kv[1]):
             f.write('%s %g\n' % (pc, n))
