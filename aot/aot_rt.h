@@ -58,8 +58,17 @@ typedef AOT_CC void (*aot_fn_t)(AOT_PARAMS);
 typedef struct aot_ix {
     uint32_t pc, fl, id, pad;
 } aot_ix_t;
-extern char *aot_env AOT_HIDDEN;             /* the CPU's env (set by aot_enter) */
-extern uint32_t aot_valid[] AOT_HIDDEN;      /* == aot_gen: entered through its trampoline */
+/*
+ * Set by aot_enter before any block runs, constant while blocks run: declared const so that the
+ * compiler keeps them in registers across guest stores (aot_main.c, which writes them, sees them
+ * without the const).
+ */
+#ifndef AOT_MAIN
+extern char *const aot_env AOT_HIDDEN;       /* the CPU's env */
+extern const uintptr_t *const aot_frd AOT_HIDDEN;   /* flat page tables: host - guest per page */
+extern const uintptr_t *const aot_fwr AOT_HIDDEN;
+#endif
+extern uint32_t aot_valid[] AOT_HIDDEN;      /* nonzero: entered through its trampoline */
 extern uint32_t aot_gen AOT_HIDDEN;
 extern uint32_t aot_cur[2] AOT_HIDDEN;       /* the insn's pc and cc_op, for a fault */
 extern void *aot_imp[] AOT_HIDDEN;           /* xemu's helpers, by name (aot_gen.h) */
@@ -78,7 +87,7 @@ static inline uint32_t aot_lookup(uint32_t pc, uint32_t fl)
         if (!e->id) {
             return 0;
         }
-        if (e->pc == pc && e->fl == fl && aot_valid[e->id] == aot_gen) {
+        if (e->pc == pc && e->fl == fl && aot_valid[e->id]) {
             return e->id;
         }
         h = (h + 1) & AOT_IX_MASK;
@@ -116,7 +125,7 @@ static inline uint32_t aot_lookup(uint32_t pc, uint32_t fl)
     uint32_t g_eip = (PC);                                                      \
     uint64_t aot_c = 0;                                                         \
     (void)aot_c;                                                                \
-    if (AOT_UNLIKELY(aot_valid[ID] != aot_gen)) {                               \
+    if (AOT_UNLIKELY(!aot_valid[ID])) {                                          \
         AOT_SYNC_P();                                                           \
         return;                                                                 \
     }
@@ -161,28 +170,64 @@ typedef void (*aot_st64_fn)(char *, uint64_t, uint64_t, uint32_t, uintptr_t);
 #define AOT_SLOW_ST4(a, v, oi) ((aot_st32_fn)AOT_H(stl_mmu))(env, (a), (uint32_t)(v), (oi), AOT_RA)
 #define AOT_SLOW_ST8(a, v, oi) ((aot_st64_fn)AOT_H(stq_mmu))(env, (a), (uint64_t)(v), (oi), AOT_RA)
 
+/*
+ * The flat page tables (accel/tcg/cputlb.c aft_*): for the MMU index the game's code runs in
+ * (AOT_FAST_MMU, aot_gen.h), one entry per 4 KiB guest page: host - guest, 0 = take the slow path.
+ * A load is a shift, one load of the entry and the access, where QEMU's TLB needs two loads from
+ * env, a masked compare and the addend's load. Accesses that must be aligned (cmpm has the
+ * alignment bits) and other MMU indexes keep QEMU's TLB. The slow path (QEMU's helper, then the
+ * table refilled) is aot_slow_ld/aot_slow_st.
+ */
+#define AOT_FAST_OK(oi, cmpm) (((oi) & 15) == AOT_FAST_MMU && ((cmpm) & 0xfffu) == 0)
+#define AOT_NOCROSS(a, SZ) ((SZ) == 1 || ((a) & 0xfffu) <= 0x1000u - (SZ))
+typedef void (*aot_st_fn)(char *, uint64_t, uint64_t, uint32_t, uintptr_t);
+#define AOT_SLOW_LD(a, oi) ((aot_ld_fn)AOT_H(aot_slow_ld))(env, (a), (oi), AOT_RA)
+#define AOT_SLOW_ST(a, v, oi) ((aot_st_fn)AOT_H(aot_slow_st))(env, (a), (uint64_t)(v), (oi), AOT_RA)
+
 #define AOT_LD(dst, T, a, SZ, LT, fofs, adj, cmpm, oi, pc, cc) do {             \
         uint32_t _a = (uint32_t)(a);                                            \
-        char *_e = AOT_TLBE(fofs, _a);                                          \
-        if (AOT_LIKELY(AOT_LDM(uint32_t, _e, AOT_TLBE_READ) == ((_a + (adj)) & (cmpm)))) { \
-            LT _v;                                                              \
-            __builtin_memcpy(&_v, AOT_HOST(_e, _a), SZ);                        \
-            dst = (T)_v;                                                        \
+        if (AOT_FAST_OK(oi, cmpm)) {                                            \
+            uintptr_t _t = aot_frd[_a >> 12];                                   \
+            if (AOT_LIKELY(_t != 0 && AOT_NOCROSS(_a, SZ))) {                   \
+                LT _v;                                                          \
+                __builtin_memcpy(&_v, (char *)(_t + _a), SZ);                   \
+                dst = (T)_v;                                                    \
+            } else {                                                            \
+                AOT_SYNC_P(); AOT_SYNC_NP(); AOT_CUR(pc, cc);                   \
+                dst = (T)(LT)AOT_SLOW_LD(_a, oi);                               \
+            }                                                                   \
         } else {                                                                \
-            AOT_SYNC_P(); AOT_SYNC_NP(); AOT_CUR(pc, cc);                       \
-            dst = (T)(LT)AOT_SLOW_LD##SZ(_a, oi);                               \
+            char *_e = AOT_TLBE(fofs, _a);                                      \
+            if (AOT_LIKELY(AOT_LDM(uint32_t, _e, AOT_TLBE_READ) == ((_a + (adj)) & (cmpm)))) { \
+                LT _v;                                                          \
+                __builtin_memcpy(&_v, AOT_HOST(_e, _a), SZ);                    \
+                dst = (T)_v;                                                    \
+            } else {                                                            \
+                AOT_SYNC_P(); AOT_SYNC_NP(); AOT_CUR(pc, cc);                   \
+                dst = (T)(LT)AOT_SLOW_LD##SZ(_a, oi);                           \
+            }                                                                   \
         }                                                                       \
     } while (0)
 
 #define AOT_ST(val, a, SZ, ST, fofs, adj, cmpm, oi, pc, cc) do {                \
         uint32_t _a = (uint32_t)(a);                                            \
         ST _v = (ST)(val);                                                      \
-        char *_e = AOT_TLBE(fofs, _a);                                          \
-        if (AOT_LIKELY(AOT_LDM(uint32_t, _e, AOT_TLBE_WRITE) == ((_a + (adj)) & (cmpm)))) { \
-            __builtin_memcpy(AOT_HOST(_e, _a), &_v, SZ);                        \
+        if (AOT_FAST_OK(oi, cmpm)) {                                            \
+            uintptr_t _t = aot_fwr[_a >> 12];                                   \
+            if (AOT_LIKELY(_t != 0 && AOT_NOCROSS(_a, SZ))) {                   \
+                __builtin_memcpy((char *)(_t + _a), &_v, SZ);                   \
+            } else {                                                            \
+                AOT_SYNC_P(); AOT_SYNC_NP(); AOT_CUR(pc, cc);                   \
+                AOT_SLOW_ST(_a, _v, oi);                                        \
+            }                                                                   \
         } else {                                                                \
-            AOT_SYNC_P(); AOT_SYNC_NP(); AOT_CUR(pc, cc);                       \
-            AOT_SLOW_ST##SZ(_a, _v, oi);                                        \
+            char *_e = AOT_TLBE(fofs, _a);                                      \
+            if (AOT_LIKELY(AOT_LDM(uint32_t, _e, AOT_TLBE_WRITE) == ((_a + (adj)) & (cmpm)))) { \
+                __builtin_memcpy(AOT_HOST(_e, _a), &_v, SZ);                    \
+            } else {                                                            \
+                AOT_SYNC_P(); AOT_SYNC_NP(); AOT_CUR(pc, cc);                   \
+                AOT_SLOW_ST##SZ(_a, _v, oi);                                    \
+            }                                                                   \
         }                                                                       \
     } while (0)
 

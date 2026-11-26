@@ -16,6 +16,7 @@ tail calls, other jumps look the target up in the file's own table.
 The generated C is the game's code in another form: keep the work dir and the .aot private.
 """
 import argparse
+import collections
 import concurrent.futures
 import hashlib
 import os
@@ -33,6 +34,7 @@ LDST = ['ldub_mmu', 'lduw_mmu', 'ldul_mmu', 'ldq_mmu', 'ld16_mmu',
 # share the host's one register within the block.
 INLINE_SSE = ['addss', 'subss', 'mulss', 'divss', 'comiss', 'ucomiss', 'cvtsi2ss', 'cvttss2si']
 INLINE_RE = re.compile(r'\(\([\w ]+? \(\*\)\([^()]*\)\)AOT_H\((' + '|'.join(INLINE_SSE) + r')\)\)')
+MEM_RE = re.compile(r'AOT_(LD|ST)\(([^;]*)\);')
 PER_FILE = 300
 HEAD_RE = re.compile(r'//@aot pc=([0-9a-f]+) cs=([0-9a-f]+) fl=([0-9a-f]+) cf=([0-9a-f]+) '
                      r'sz=(\d+) ic=(\d+) h=([0-9a-f]+)')
@@ -124,8 +126,21 @@ def main():
     os.makedirs(work, exist_ok=True)
     write_if_changed(os.path.join(work, 'aot_abi.h'), abi)
 
+    # the MMU index of most guest memory accesses: aot_rt.h's flat page tables are for that one
+    mmus = collections.Counter()
+    for b in blocks:
+        for m in MEM_RE.finditer(b.body):
+            args = m.group(2).split(',')
+            try:
+                mmus[int(args[-3]) & 15] += 1
+            except (ValueError, IndexError):
+                pass
+    fast_mmu = mmus.most_common(1)[0][0] if mmus else 5
+    print(f'guest memory accesses by MMU index: {dict(mmus)}; flat page tables for {fast_mmu}')
+
     # direct jumps: a tail call where exactly one block is there for those flags
-    imports = list(LDST) + list(INLINE_SSE)
+    imports = list(LDST) + list(INLINE_SSE) + ['aot_slow_ld', 'aot_slow_st',
+                                              f'aot_fast_rd_{fast_mmu}', f'aot_fast_wr_{fast_mmu}']
     imp_set = set(imports)
     chained = unresolved = inlined = 0
     for b in blocks:
@@ -154,6 +169,7 @@ def main():
         mask = mask * 2 + 1
     gen = [f'/* scripts/aot-build.py: {n} blocks */',
            f'#define AOT_NB_BLOCKS {n}', f'#define AOT_IX_MASK 0x{mask:x}u',
+           f'#define AOT_FAST_MMU {fast_mmu}',
            f'#define AOT_NB_IMPORTS {len(imports)}', 'enum {']
     gen += [f'    AOT_HID_{h} = {i},' for i, h in enumerate(imports)]
     gen += ['};', '#define AOT_H(n) (aot_imp[AOT_HID_##n])', '']
@@ -187,7 +203,7 @@ def main():
         while ix[h] is not None:
             h = (h + 1) & mask
         ix[h] = b
-    m = [head]
+    m = ['#define AOT_MAIN\n' + head]
     m += [f'AOT_HIDDEN AOT_CC void {b.name}(AOT_PARAMS);\n' for b in blocks]
     m.append('''
 typedef struct {
@@ -213,6 +229,8 @@ typedef struct {
 } aot_header_t;
 
 char *aot_env AOT_HIDDEN;
+const uintptr_t *aot_frd AOT_HIDDEN;
+const uintptr_t *aot_fwr AOT_HIDDEN;
 uint32_t aot_csr_ok AOT_HIDDEN;
 uint32_t aot_valid[AOT_NB_BLOCKS + 1] AOT_HIDDEN;
 uint32_t aot_gen AOT_HIDDEN = 1;
@@ -236,6 +254,8 @@ void *aot_imp[AOT_NB_IMPORTS] AOT_HIDDEN;
 AOT_HIDDEN void aot_enter(char *env, uint32_t id)
 {{
     aot_env = env;
+    aot_frd = (const uintptr_t *)AOT_H(aot_fast_rd_{fast_mmu});
+    aot_fwr = (const uintptr_t *)AOT_H(aot_fast_wr_{fast_mmu});
     aot_csr_ok = 0;     /* the JIT's code may have left x87's rounding in MXCSR */
     aot_fns[id](AOT_LD_I32(AOT_OFF_EAX), AOT_LD_I32(AOT_OFF_ECX), AOT_LD_I32(AOT_OFF_EDX),
                 AOT_LD_I32(AOT_OFF_EBX), AOT_LD_I32(AOT_OFF_ESP), AOT_LD_I32(AOT_OFF_EBP),

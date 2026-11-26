@@ -1,9 +1,9 @@
 diff --git a/accel/tcg/aot.c b/accel/tcg/aot.c
 new file mode 100644
-index 0000000..ba5194c
+index 0000000..4ec6361
 --- /dev/null
 +++ b/accel/tcg/aot.c
-@@ -0,0 +1,873 @@
+@@ -0,0 +1,922 @@
 +/*
 + * xemu-ps4: the ahead-of-time translator's runtime (see include/exec/aot.h).
 + *
@@ -46,6 +46,9 @@ index 0000000..ba5194c
 +#include "accel/tcg/cpu-mmu-index.h"
 +#include "accel/tcg/cpu-ops.h"
 +#include "tb-code-hash.h"
++#include "tcg/tcg.h"
++#include "tcg/tcg-ldst.h"
++#include "exec/memopidx.h"
 +#include "elf.h"
 +
 +#include <sys/mman.h>
@@ -276,8 +279,52 @@ index 0000000..ba5194c
 +    loaded_path[0] = '\0';
 +}
 +
++/* accel/tcg/cputlb.c: the flat page tables */
++extern int aft_mmu;
++extern uintptr_t *aft_rd, *aft_wr;
++extern uint64_t aft_fills, aft_clears;
++bool aft_enable(int mmu_idx);
++void aft_refill(CPUState *cpu, int mmu_idx, vaddr addr);
++
++/* the translated code's slow loads and stores: QEMU's, then the flat tables refilled */
++static uint64_t aot_slow_ld(CPUArchState *env, uint64_t addr, uint32_t oi, uintptr_t ra)
++{
++    uint64_t v;
++    switch (get_memop(oi) & MO_SIZE) {
++    case MO_8: v = helper_ldub_mmu(env, addr, oi, ra); break;
++    case MO_16: v = helper_lduw_mmu(env, addr, oi, ra); break;
++    case MO_32: v = helper_ldul_mmu(env, addr, oi, ra); break;
++    default: v = helper_ldq_mmu(env, addr, oi, ra); break;
++    }
++    aft_refill(env_cpu(env), get_mmuidx(oi), addr);
++    return v;
++}
++
++static void aot_slow_st(CPUArchState *env, uint64_t addr, uint64_t val, uint32_t oi, uintptr_t ra)
++{
++    switch (get_memop(oi) & MO_SIZE) {
++    case MO_8: helper_stb_mmu(env, addr, val, oi, ra); break;
++    case MO_16: helper_stw_mmu(env, addr, val, oi, ra); break;
++    case MO_32: helper_stl_mmu(env, addr, val, oi, ra); break;
++    default: helper_stq_mmu(env, addr, val, oi, ra); break;
++    }
++    aft_refill(env_cpu(env), get_mmuidx(oi), addr);
++}
++
 +static void *aot_import(const char *name)
 +{
++    int mmu;
++    if (!strcmp(name, "aot_slow_ld")) {
++        return (void *)aot_slow_ld;
++    }
++    if (!strcmp(name, "aot_slow_st")) {
++        return (void *)aot_slow_st;
++    }
++    /* "aot_fast_rd_<mmu>" / "aot_fast_wr_<mmu>": the flat tables' addresses */
++    if ((sscanf(name, "aot_fast_rd_%d", &mmu) == 1 || sscanf(name, "aot_fast_wr_%d", &mmu) == 1) &&
++        aft_enable(mmu)) {
++        return name[9] == 'r' ? (void *)aft_rd : (void *)aft_wr;
++    }
 +    for (size_t i = 0; i < target->nb_helpers; i++) {
 +        if (!strcmp(target->helpers[i].name, name)) {
 +            return target->helpers[i].func;
@@ -717,7 +764,7 @@ index 0000000..ba5194c
 +        cpu_loop_exit(env_cpu(env));
 +    }
 +    e = &hdr->entries[id];
-+    hdr->valid[id] = *hdr->gen;
++    hdr->valid[id] = 1;
 +    set_bit(e->pc >> 12, valid_pages);
 +    set_bit((e->pc + e->size - 1) >> 12, valid_pages);
 +    st_runs++;
@@ -737,11 +784,12 @@ index 0000000..ba5194c
 +
 +static void aot_new_generation(void)
 +{
-+    (*hdr->gen)++;
-+    if (*hdr->gen == 0) {
-+        memset(hdr->valid, 0, (hdr->nb_entries + 1) * sizeof(uint32_t));
-+        *hdr->gen = 1;
-+    }
++    /*
++     * Blocks check "valid[id]" (1) at entry; files before v00.24 compare it with *gen, which stays
++     * 1: clearing the flags ends the generation for both.
++     */
++    memset(hdr->valid, 0, (hdr->nb_entries + 1) * sizeof(uint32_t));
++    *hdr->gen = 1;
 +    bitmap_zero(valid_pages, 1u << (32 - 12));
 +    st_gens++;
 +}
@@ -814,7 +862,7 @@ index 0000000..ba5194c
 +        uint32_t valid = 0;
 +        if (verbose) {
 +            for (uint32_t id = 1; id <= hdr->nb_entries; id++) {
-+                valid += hdr->valid[id] == *hdr->gen;
++                valid += hdr->valid[id] != 0;
 +            }
 +        }
 +        g_string_append_printf(out, "aot: %s %u blocks, %" PRIu64 " entries from the JIT, %"
@@ -822,7 +870,8 @@ index 0000000..ba5194c
 +                               " generations", loaded_path, hdr->nb_entries, st_runs,
 +                               st_trampolines, st_misses_hash, st_gens);
 +        if (verbose) {
-+            g_string_append_printf(out, ", %u valid now", valid);
++            g_string_append_printf(out, ", %u valid now; flat page tables (MMU %d): %" PRIu64
++                                   " fills, %" PRIu64 " clears", valid, aft_mmu, aft_fills, aft_clears);
 +        }
 +    } else {
 +        g_string_append(out, "aot: no translated code loaded");
@@ -892,18 +941,37 @@ index d93cd17..9a17569 100644
          tb->cs_base == desc->s.cs_base &&
          tb->flags == desc->s.flags &&
 diff --git a/accel/tcg/cputlb.c b/accel/tcg/cputlb.c
-index b9ae474..b81c2a9 100644
+index b9ae474..8c7f36e 100644
 --- a/accel/tcg/cputlb.c
 +++ b/accel/tcg/cputlb.c
-@@ -46,6 +46,7 @@
+@@ -46,6 +46,14 @@
  #include "tb-hash.h"
  #include "tb-internal.h"
  #include "tlb-bounds.h"
 +#include "exec/aot.h"
++
++#ifdef __PS4__
++/* the flat page tables of the translated code (defined after the dirty index) */
++int aft_mmu = -1;
++static void aft_clear_all(void);
++static void aft_flush_page(int mmu_idx, vaddr page);
++#endif
  #include "internal-common.h"
  #ifdef CONFIG_PLUGIN
  #include "qemu/plugin-memory.h"
-@@ -391,6 +392,7 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
+@@ -294,6 +302,11 @@ static void tlb_flush_one_mmuidx_locked(CPUState *cpu, int mmu_idx,
+ 
+     tlb_mmu_resize_locked(desc, fast, now);
+     tlb_mmu_flush_locked(desc, fast);
++#ifdef __PS4__
++    if (mmu_idx == aft_mmu) {
++        aft_clear_all();
++    }
++#endif
+ }
+ 
+ static void tlb_mmu_init(CPUTLBDesc *desc, CPUTLBDescFast *fast, int64_t now)
+@@ -391,6 +404,7 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
      qemu_spin_unlock(&cpu->neg.tlb.c.lock);
  
      tcg_flush_jmp_cache(cpu);
@@ -911,7 +979,17 @@ index b9ae474..b81c2a9 100644
  
      if (to_clean == ALL_MMUIDX_BITS) {
          qatomic_set(&cpu->neg.tlb.c.full_flush_count,
-@@ -551,6 +553,7 @@ static void tlb_flush_page_by_mmuidx_async_0(CPUState *cpu,
+@@ -515,6 +529,9 @@ static void tlb_flush_page_locked(CPUState *cpu, int midx, vaddr page)
+             tlb_n_used_entries_dec(cpu, midx);
+         }
+         tlb_flush_vtlb_page_locked(cpu, midx, page);
++#ifdef __PS4__
++        aft_flush_page(midx, page);
++#endif
+     }
+ }
+ 
+@@ -551,6 +568,7 @@ static void tlb_flush_page_by_mmuidx_async_0(CPUState *cpu,
       */
      tb_jmp_cache_clear_page(cpu, addr - TARGET_PAGE_SIZE);
      tb_jmp_cache_clear_page(cpu, addr);
@@ -919,7 +997,17 @@ index b9ae474..b81c2a9 100644
  }
  
  /**
-@@ -734,6 +737,7 @@ static void tlb_flush_range_by_mmuidx_async_0(CPUState *cpu,
+@@ -707,6 +725,9 @@ static void tlb_flush_range_locked(CPUState *cpu, int midx,
+             tlb_n_used_entries_dec(cpu, midx);
+         }
+         tlb_flush_vtlb_page_mask_locked(cpu, midx, page, mask);
++#ifdef __PS4__
++        aft_flush_page(midx, page);
++#endif
+     }
+ }
+ 
+@@ -734,6 +755,7 @@ static void tlb_flush_range_by_mmuidx_async_0(CPUState *cpu,
          }
      }
      qemu_spin_unlock(&cpu->neg.tlb.c.lock);
@@ -927,7 +1015,7 @@ index b9ae474..b81c2a9 100644
  
      /*
       * If the length is larger than the jump cache size, then it will take
-@@ -900,6 +904,76 @@ static void tlb_reset_dirty_range_locked(CPUTLBEntryFull *full, CPUTLBEntry *ent
+@@ -900,6 +922,252 @@ static void tlb_reset_dirty_range_locked(CPUTLBEntryFull *full, CPUTLBEntry *ent
      }
  }
  
@@ -955,8 +1043,11 @@ index b9ae474..b81c2a9 100644
 +static uintptr_t tdi_base, tdi_size;    /* the guest RAM's host range */
 +static TDIPage *tdi_pages;
 +
++static void aft_set_ram(uintptr_t base, uintptr_t size);
++
 +void tlb_dirty_index_register(void *host, size_t size)
 +{
++    aft_set_ram((uintptr_t)host, size);
 +    if (!tlb_dirty_index_enabled || tdi_pages != NULL) {
 +        return;
 +    }
@@ -1001,13 +1092,189 @@ index b9ae474..b81c2a9 100644
 +}
 +#endif
 +
++
++#ifdef __PS4__
++/*
++ * xemu-ps4: the flat page tables of the ahead-of-time translated code (aot/aot_rt.h AOT_LD/AOT_ST).
++ * For one MMU index (the one the Xbox's code runs in), one entry per 4 KiB guest page: the TLB
++ * entry's addend (host = guest + addend) when QEMU's TLB lets reads / writes of the page through
++ * untrapped, 0 otherwise. The translated code reads them with a shift and one load per access,
++ * where QEMU's TLB takes two loads from env, a masked compare and a third load for the addend.
++ * Entries follow the TLB: set where an entry is made untrapped (tlb_set_page_full, tlb_set_dirty,
++ * aft_refill after a slow access), cleared by flushes and by dirty resets (NV2A's texture and
++ * vertex tracking, code protection) through a reverse map, guest RAM page -> the guest pages
++ * written through it. Races with dirty resets from other threads are QEMU's own TLB races.
++ */
++#define AFT_PAGES (1u << (32 - TARGET_PAGE_BITS))
++#define AFT_REV 4
++#define AFT_REV_OVERFLOW 0xff
++#define AFT_FILLED_MAX (1u << 18)
++
++uintptr_t *aft_rd, *aft_wr;
++static uintptr_t aft_ram_base, aft_ram_size;      /* guest RAM's host range */
++static uint32_t (*aft_rev)[AFT_REV];              /* per RAM page: guest pages written through it */
++static uint8_t *aft_rev_n;
++static uint32_t *aft_filled;                      /* guest pages with an entry, for a cheap clear */
++static uint32_t aft_nfilled;
++uint64_t aft_fills, aft_clears;
++
++static void aft_clear_all(void)
++{
++    if (aft_nfilled >= AFT_FILLED_MAX) {
++        memset(aft_rd, 0, AFT_PAGES * sizeof(uintptr_t));
++        memset(aft_wr, 0, AFT_PAGES * sizeof(uintptr_t));
++    } else {
++        for (uint32_t i = 0; i < aft_nfilled; i++) {
++            aft_rd[aft_filled[i]] = 0;
++            aft_wr[aft_filled[i]] = 0;
++        }
++    }
++    aft_nfilled = 0;
++    memset(aft_rev_n, 0, aft_ram_size >> TARGET_PAGE_BITS);
++    aft_clears++;
++}
++
++bool aft_enable(int mmu_idx)
++{
++    if (aft_mmu >= 0) {
++        return aft_mmu == mmu_idx;
++    }
++    if (!aft_ram_size) {
++        return false;
++    }
++    aft_rd = g_new0(uintptr_t, AFT_PAGES);
++    aft_wr = g_new0(uintptr_t, AFT_PAGES);
++    aft_rev = g_malloc0((aft_ram_size >> TARGET_PAGE_BITS) * sizeof(*aft_rev));
++    aft_rev_n = g_new0(uint8_t, aft_ram_size >> TARGET_PAGE_BITS);
++    aft_filled = g_new(uint32_t, AFT_FILLED_MAX);
++    smp_wmb();
++    aft_mmu = mmu_idx;
++    return true;
++}
++
++/* A TLB entry for page was made (or made writable): mirror what it lets through untrapped. */
++static void aft_note(int mmu_idx, const CPUTLBEntry *e, vaddr page)
++{
++    if (mmu_idx != aft_mmu || page > UINT32_MAX) {
++        return;
++    }
++    const uint32_t v = page >> TARGET_PAGE_BITS;
++    /* as the 32-bit guest's fast path compares: the low 32 bits, flags included */
++    const bool rd = (uint32_t)e->addr_read == (uint32_t)page;
++    const bool wr = (uint32_t)e->addr_write == (uint32_t)page;
++    if (!aft_rd[v] && !aft_wr[v] && (rd || wr)) {
++        if (aft_nfilled < AFT_FILLED_MAX) {
++            aft_filled[aft_nfilled] = v;
++        }
++        aft_nfilled++;
++    }
++    aft_rd[v] = rd ? e->addend : 0;
++    if (!wr) {
++        aft_wr[v] = 0;
++        return;
++    }
++    const uintptr_t off = page + e->addend - aft_ram_base;
++    if (off < aft_ram_size) {
++        const uintptr_t pg = off >> TARGET_PAGE_BITS;
++        uint8_t n = aft_rev_n[pg];
++        bool known = false;
++        if (n != AFT_REV_OVERFLOW) {
++            for (int i = 0; i < n; i++) {
++                known |= aft_rev[pg][i] == v;
++            }
++            if (!known) {
++                if (n < AFT_REV) {
++                    aft_rev[pg][n] = v;
++                    aft_rev_n[pg] = n + 1;
++                } else {
++                    aft_rev_n[pg] = AFT_REV_OVERFLOW;
++                }
++            }
++        }
++    } else {
++        /* not guest RAM (no dirty tracking reaches it): no fast writes */
++        aft_wr[v] = 0;
++        return;
++    }
++    aft_wr[v] = e->addend;
++    aft_fills++;
++}
++
++static void aft_flush_page(int mmu_idx, vaddr page)
++{
++    if (mmu_idx == aft_mmu && page <= UINT32_MAX) {
++        aft_rd[page >> TARGET_PAGE_BITS] = 0;
++        aft_wr[page >> TARGET_PAGE_BITS] = 0;
++    }
++}
++
++/* writes to [start, start + length) of guest RAM (host addresses) are to be trapped again */
++static void aft_reset_dirty(uintptr_t start, uintptr_t length)
++{
++    if (aft_mmu < 0 || length == 0 || start - aft_ram_base >= aft_ram_size) {
++        return;
++    }
++    const uintptr_t first = (start - aft_ram_base) >> TARGET_PAGE_BITS;
++    uintptr_t last = (start + length - 1 - aft_ram_base) >> TARGET_PAGE_BITS;
++    last = MIN(last, (aft_ram_size >> TARGET_PAGE_BITS) - 1);
++    for (uintptr_t pg = first; pg <= last; pg++) {
++        const uint8_t n = aft_rev_n[pg];
++        if (n == AFT_REV_OVERFLOW) {
++            /* too many guest pages through this one: every write goes back through the TLB */
++            const uint32_t cnt = MIN(aft_nfilled, AFT_FILLED_MAX);
++            if (aft_nfilled >= AFT_FILLED_MAX) {
++                memset(aft_wr, 0, AFT_PAGES * sizeof(uintptr_t));
++            } else {
++                for (uint32_t i = 0; i < cnt; i++) {
++                    aft_wr[aft_filled[i]] = 0;
++                }
++            }
++            memset(aft_rev_n, 0, aft_ram_size >> TARGET_PAGE_BITS);
++            return;
++        }
++        for (int i = 0; i < n; i++) {
++            aft_wr[aft_rev[pg][i]] = 0;
++        }
++        aft_rev_n[pg] = 0;
++    }
++}
++
++/* After the translated code's slow access: QEMU's TLB may hold an untrapped entry the table lacks. */
++void aft_refill(CPUState *cpu, int mmu_idx, vaddr addr)
++{
++    if (mmu_idx != aft_mmu) {
++        return;
++    }
++    const vaddr page = addr & TARGET_PAGE_MASK;
++    qemu_spin_lock(&cpu->neg.tlb.c.lock);
++    CPUTLBEntry *e = tlb_entry(cpu, mmu_idx, page);
++    if ((uint32_t)e->addr_read == (uint32_t)page || (uint32_t)e->addr_write == (uint32_t)page) {
++        aft_note(mmu_idx, e, page);
++    }
++    qemu_spin_unlock(&cpu->neg.tlb.c.lock);
++}
++#endif
++
++#ifdef __PS4__
++static void aft_set_ram(uintptr_t base, uintptr_t size)
++{
++    if (!aft_ram_size) {
++        aft_ram_base = base;
++        aft_ram_size = size;
++    }
++}
++#endif
++
  /*
   * Called with tlb_c.lock held.
   * Called only from the vCPU context, i.e. the TLB's owner thread.
-@@ -917,6 +991,49 @@ static inline void copy_tlb_helper_locked(CPUTLBEntry *d, const CPUTLBEntry *s)
+@@ -917,6 +1185,52 @@ static inline void copy_tlb_helper_locked(CPUTLBEntry *d, const CPUTLBEntry *s)
  void tlb_reset_dirty(CPUState *cpu, uintptr_t start, uintptr_t length)
  {
      int mmu_idx;
++#ifdef __PS4__
++    aft_reset_dirty(start, length);
++#endif
 +#ifdef __PS4__
 +    if (tdi_pages != NULL && length != 0 && start - tdi_base < tdi_size &&
 +        start + length - tdi_base <= tdi_size) {
@@ -1054,27 +1321,29 @@ index b9ae474..b81c2a9 100644
  
      qemu_spin_lock(&cpu->neg.tlb.c.lock);
      for (mmu_idx = 0; mmu_idx < NB_MMU_MODES; mmu_idx++) {
-@@ -959,6 +1076,9 @@ static void tlb_set_dirty(CPUState *cpu, vaddr addr)
+@@ -959,6 +1273,10 @@ static void tlb_set_dirty(CPUState *cpu, vaddr addr)
      qemu_spin_lock(&cpu->neg.tlb.c.lock);
      for (mmu_idx = 0; mmu_idx < NB_MMU_MODES; mmu_idx++) {
          tlb_set_dirty1_locked(tlb_entry(cpu, mmu_idx, addr), addr);
 +#ifdef __PS4__
 +        tdi_note_entry(cpu, mmu_idx, tlb_index(cpu, mmu_idx, addr));
++        aft_note(mmu_idx, tlb_entry(cpu, mmu_idx, addr), addr);
 +#endif
      }
  
      for (mmu_idx = 0; mmu_idx < NB_MMU_MODES; mmu_idx++) {
-@@ -1184,6 +1304,9 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
+@@ -1184,6 +1502,10 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
  
      copy_tlb_helper_locked(te, &tn);
      tlb_n_used_entries_inc(cpu, mmu_idx);
 +#ifdef __PS4__
 +    tdi_note_entry(cpu, mmu_idx, index);
++    aft_note(mmu_idx, te, addr_page);
 +#endif
      qemu_spin_unlock(&tlb->c.lock);
  }
  
-@@ -1325,6 +1448,18 @@ static bool victim_tlb_hit(CPUState *cpu, size_t mmu_idx, size_t index,
+@@ -1325,6 +1647,18 @@ static bool victim_tlb_hit(CPUState *cpu, size_t mmu_idx, size_t index,
              copy_tlb_helper_locked(&tmptlb, tlb);
              copy_tlb_helper_locked(tlb, vtlb);
              copy_tlb_helper_locked(vtlb, &tmptlb);
@@ -1198,7 +1467,7 @@ index 8436599..55fa152 100644
  DEF_HELPER_FLAGS_1(exit_atomic, TCG_CALL_NO_WG, noreturn, env)
  
 diff --git a/accel/tcg/translate-all.c b/accel/tcg/translate-all.c
-index 0871388..dda22ee 100644
+index 0871388..657e0c8 100644
 --- a/accel/tcg/translate-all.c
 +++ b/accel/tcg/translate-all.c
 @@ -36,6 +36,7 @@
@@ -1228,6 +1497,23 @@ index 0871388..dda22ee 100644
  }
  
  void page_init(void)
+@@ -328,9 +330,13 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
+ 
+     gen_code_buf = tcg_ctx->code_gen_ptr;
+     tb->tc.ptr = tcg_splitwx_to_rx(gen_code_buf);
+-    if (!(s.cflags & CF_PCREL)) {
+-        tb->pc = s.pc;
+-    }
++    /*
++     * xemu-ps4: the pc it was made at, for PC-relative TBs too (upstream leaves it as whatever the
++     * memory held). An ahead-of-time trampoline matches only its own pc (tb_cmp, tb_lookup_cmp),
++     * and tb_jmp_cache_inval_tb clears the jump cache slot of that pc. Nothing reads it otherwise
++     * for a PC-relative TB.
++     */
++    tb->pc = s.pc;
+     tb->cs_base = s.cs_base;
+     tb->flags = s.flags;
+     tb->cflags = s.cflags;
 diff --git a/block.c b/block.c
 index 14ed7f1..6923af4 100644
 --- a/block.c
