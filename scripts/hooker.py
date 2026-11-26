@@ -14,6 +14,11 @@ where the emulated CPU's time goes, down to the game's own code.
     ab <a.aot> <b.aot> [secs]   A/B timing of two builds of the running game's translated code:
                                 each is uploaded and swapped in live (aot load), then measured; the
                                 faster one is left loaded
+    abset <key> <a> <b> [secs]  A/B timing of a live setting (ps4.ini key, e.g. gpu_blit, async_tex,
+                                gpu_module, aot_direct): measured at a, then at b; the faster stays
+    nv2a [clear]                the GPU side per frame: Vulkan submits and waits (finish reasons),
+                                texture uploads, surface read-backs, and the image blits by shape
+                                and by the way they ran (GPU copy or CPU)
 
 The PC side runs on Windows (Git Bash Python); symbols come from WSL's llvm tools and the build's
 work dir (~/xemups4-build/aot-work/<title>[-variant]): the one whose build time matches the loaded
@@ -159,9 +164,8 @@ def guest_code(con, addr, length):
     tmp = os.path.join(OUT, 'code.bin')
     with open(tmp, 'wb') as f:
         f.write(data)
-    r = subprocess.run(['objdump', '-D', '-b', 'binary', '-m', 'i386', f'--adjust-vma=0x{addr:x}', tmp],
-                       capture_output=True, text=True)
-    lines = [l for l in r.stdout.splitlines() if re.match(r'\s+[0-9a-f]+:', l)]
+    out = wsl(f"objdump -D -b binary -m i386 --adjust-vma=0x{addr:x} '{to_wsl(tmp)}'")
+    lines = [l for l in out.splitlines() if re.match(r'\s+[0-9a-f]+:', l)]
     return '\n'.join(lines)
 
 
@@ -178,22 +182,22 @@ def cmd_profile(con, a):
         sys.exit('no translated code loaded (xemu.log has no aot mapping): start a game from the library')
     work = work_dir_for(title, built)
     print(f'title {title}, translated code at {start:#x} built {built}, symbols from {work}')
-    before = set(con.listdir('/data/xemu/profiles'))
+    # profile numbers restart with each run of xemu: a new profile can reuse an old file's name,
+    # so the new one is the file that appeared or changed size
+    before = profile_files(con)
     print(con.ask('profile'))
     time.sleep(11)
     new = None
     for _ in range(20):
-        names = set(con.listdir('/data/xemu/profiles'))
-        cand = sorted(names - before) or None
+        after = profile_files(con)
+        cand = sorted((n for n in after if before.get(n) != after[n]),
+                      key=lambda n: int(re.sub(r'\D', '', n) or 0))
         if cand:
             new = cand[-1]
             break
         time.sleep(2)
     if new is None:
-        # profile numbers restart with each run: take the newest by number
-        nums = sorted((int(m.group(1)), n) for n in con.listdir('/data/xemu/profiles')
-                      for m in [re.match(r'profile_(\d+)\.txt', n)] if m)
-        new = nums[-1][1]
+        sys.exit('no new profile appeared in /data/xemu/profiles')
     os.makedirs(OUT, exist_ok=True)
     local = os.path.join(OUT, f'profile-{time.strftime("%Y%m%d-%H%M%S")}.txt')
     with open(local, 'wb') as f:
@@ -201,8 +205,8 @@ def cmd_profile(con, a):
     hot = os.path.join(OUT, f'hot-{title}.txt')
     version = re.findall(r'xemu-ps4 (v[\d.]+)', con.get('/data/xemu/xemu.log').decode(errors='replace'))
     elf = f'~/xemups4-build/oelf/{version[-1] if version else "v00.26"}.elf'
-    rep = wsl(f'cd {to_wsl(REPO)} && python3 scripts/aot-hotblocks.py {to_wsl(local)} {elf} '
-              f'{start:x} {work} {top} --hot-out={to_wsl(hot)}')
+    rep = wsl(f"cd '{to_wsl(REPO)}' && python3 scripts/aot-hotblocks.py '{to_wsl(local)}' {elf} "
+              f"{start:x} {work} {top} '--hot-out={to_wsl(hot)}'")
     # regions: name the member blocks
     regions = {}
     for line in wsl(f'cat {work}/regions.txt 2>/dev/null').splitlines():
@@ -226,10 +230,55 @@ def cmd_profile(con, a):
             text.append(guest_code(con, pc, max(size, 16)))
         except Exception as e:      # an unmapped page, a slow console
             text.append(f'  (could not read: {e})')
+    # the emulated CPU's and the NV2A's threads: where their time goes, who waits for what
+    text.append('\nthreads:')
+    text.append(wsl(f"cd '{to_wsl(REPO)}' && python3 scripts/prof-threads.py '{to_wsl(local)}' {elf} "
+                    f"{start:x}").rstrip())
     out = '\n'.join(text)
     print(out)
     save('profile-report', out)
     print(f'hot list for aot-build.py --hot: {os.path.relpath(hot, REPO)}')
+
+
+def profile_files(con):
+    """name -> size of /data/xemu/profiles/profile_N.txt"""
+    with con.ftp() as f:
+        f.cwd('/data/xemu/profiles')
+        lines = []
+        f.retrlines('LIST', lines.append)
+    files = {}
+    for line in lines:
+        p = line.split()
+        if len(p) >= 9 and p[-1].startswith('profile_'):
+            files[p[-1]] = p[4]
+    return files
+
+
+def cmd_nv2a(con, a):
+    rep = con.ask('nv2a ' + ' '.join(a.args))
+    print(rep)
+    save('nv2a', rep)
+
+
+def cmd_abset(con, a):
+    if len(a.args) < 3:
+        sys.exit('abset <key> <a> <b> [seconds]')
+    key, va, vb = a.args[:3]
+    secs = float(a.args[3]) if len(a.args) > 3 else 30.0
+    results = []
+    for v in (va, vb):
+        print(f'{key} = {v}: ' + con.ask(f'set {key} {v}').strip())
+        time.sleep(8)
+        fl, tcg = measure(con, secs)
+        print(f'  {fl:.1f} guest flips/s, emulated CPU thread {tcg:.0f}% busy')
+        results.append((fl, v))
+    best = max(results)
+    if best[1] != vb:
+        con.ask(f'set {key} {best[1]}')
+    text = '\n'.join(f'{fl:6.1f} flips/s  {key} = {v}' for fl, v in results)
+    text += f'\nleft at: {key} = {best[1]}'
+    print(text)
+    save('abset', text)
 
 
 def measure(con, secs):
@@ -281,12 +330,12 @@ def main():
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--host', default=os.environ.get('PS4_HOST', '192.168.0.90'))
-    ap.add_argument('command', choices=['status', 'exits', 'profile', 'code', 'ab'])
+    ap.add_argument('command', choices=['status', 'exits', 'profile', 'code', 'ab', 'abset', 'nv2a'])
     ap.add_argument('args', nargs='*')
     a = ap.parse_args()
     con = Console(a.host)
     {'status': cmd_status, 'exits': cmd_exits, 'profile': cmd_profile, 'code': cmd_code,
-     'ab': cmd_ab}[a.command](con, a)
+     'ab': cmd_ab, 'abset': cmd_abset, 'nv2a': cmd_nv2a}[a.command](con, a)
 
 
 if __name__ == '__main__':

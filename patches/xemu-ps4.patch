@@ -1,9 +1,9 @@
 diff --git a/accel/tcg/aot.c b/accel/tcg/aot.c
 new file mode 100644
-index 0000000..9a8d067
+index 0000000..5913f3d
 --- /dev/null
 +++ b/accel/tcg/aot.c
-@@ -0,0 +1,1129 @@
+@@ -0,0 +1,1174 @@
 +/*
 + * xemu-ps4: the ahead-of-time translator's runtime (see include/exec/aot.h).
 + *
@@ -237,10 +237,45 @@ index 0000000..9a8d067
 +    return base;
 +}
 +
++int32_t sceKernelMapNamedFlexibleMemory(void **addr, size_t len, int prot, int flags,
++                                        const char *name);
++
 +/*
-+ * Executable memory for the file: direct memory if the kernel allows it, else flexible memory
-+ * through mmap (ps4-kit's wrap: the system pool, as the JIT's buffer; the app's regular pool when
-+ * the system pool is short), each probed with a "ret" before use.
++ * Flexible memory on a 2 MiB-aligned range of its own (v00.27). The translated code is 100+ MiB
++ * and its hot part is spread over thousands of 4 KiB pages: v00.26's profile had a fifth of the
++ * translated code's time on the first instructions of the blocks, the jump into a block missing
++ * the TLB. Aligned, the kernel can back the range with 2 MiB pages; ps4-kit's mmap reserves at
++ * 16 KiB alignment.
++ */
++static void *aot_map_flexible_2m(size_t size)
++{
++    void *base = (void *)0x1000000000ull;
++    int32_t r = sceKernelReserveVirtualRange(&base, size, 0, 2 * MiB);
++    if (r != 0) {
++        fprintf(stderr, "aot: no 2 MiB-aligned range of %zu MiB (0x%x)\n", size >> 20,
++                (unsigned)r);
++        return NULL;
++    }
++    r = sceKernelMapNamedFlexibleMemory(&base, size, 0x7 /* CPU read, write, execute */,
++                                        0x10 /* fixed */, "xemu translated code");
++    if (r != 0) {
++        fprintf(stderr, "aot: no %zu MiB of executable flexible memory at 2 MiB (0x%x)\n",
++                size >> 20, (unsigned)r);
++        sceKernelMunmap(base, size);
++        return NULL;
++    }
++    if (!aot_runs_code(base)) {
++        fprintf(stderr, "aot: 2 MiB-aligned flexible memory does not run code\n");
++        sceKernelMunmap(base, size);
++        return NULL;
++    }
++    return base;
++}
++
++/*
++ * Executable memory for the file: direct memory if the kernel allows it, else flexible memory on
++ * a 2 MiB-aligned range, else through mmap (ps4-kit's wrap: the system pool, as the JIT's buffer;
++ * the app's regular pool when the system pool is short), each probed with a "ret" before use.
 + */
 +static void *aot_exec_alloc(size_t size)
 +{
@@ -249,6 +284,16 @@ index 0000000..9a8d067
 +    size = ROUND_UP(size, 16 * KiB);
 +    map_phys = -1;
 +    base = aot_map_direct(size);
++    if (!base) {
++        const size_t big = ROUND_UP(size, 2 * MiB);
++        base = aot_map_flexible_2m(big);
++        if (base) {
++            fprintf(stderr, "aot: %zu MiB of executable flexible memory at %p (2 MiB aligned)\n",
++                    big >> 20, base);
++            map_size = big;
++            return base;
++        }
++    }
 +    if (!base) {
 +        base = mmap(NULL, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS,
 +                    -1, 0);
@@ -2155,12 +2200,26 @@ index c57ecb6..9626c85 100644
      vwd->num_workers = MAX(1, MIN(num_workers, MAX_VOICE_WORKERS));
      vwd->workers = g_malloc0_n(vwd->num_workers, sizeof(VoiceWorker));
      vwd->workers_should_exit = false;
+diff --git a/hw/xbox/nv2a/debug.h b/hw/xbox/nv2a/debug.h
+index 2dc4bec..6f1d25f 100644
+--- a/hw/xbox/nv2a/debug.h
++++ b/hw/xbox/nv2a/debug.h
+@@ -114,6 +114,9 @@
+     _X(NV2A_PROF_QUEUE_SUBMIT_3) \
+     _X(NV2A_PROF_QUEUE_SUBMIT_4) \
+     _X(NV2A_PROF_QUEUE_SUBMIT_5) \
++    _X(NV2A_PROF_TEX_UPLOAD_ASYNC) \
++    _X(NV2A_PROF_BLIT_GPU) \
++    _X(NV2A_PROF_BLIT_CPU) \
+ 
+ enum NV2A_PROF_COUNTERS_ENUM {
+     #define _X(x) x,
 diff --git a/hw/xbox/nv2a/nv2a_vk_ps4.h b/hw/xbox/nv2a/nv2a_vk_ps4.h
 new file mode 100644
-index 0000000..8531287
+index 0000000..bd6e09b
 --- /dev/null
 +++ b/hw/xbox/nv2a/nv2a_vk_ps4.h
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,60 @@
 +/*
 + * xemu-ps4: what the PS4 frontend (ui/ps4) needs from the Vulkan renderer to present on the
 + * renderer's own device: there is no OpenGL on the PS4 to hand the picture to.
@@ -2206,6 +2265,16 @@ index 0000000..8531287
 +void nv2a_vk_ps4_queue_lock(void);
 +void nv2a_vk_ps4_queue_unlock(void);
 +
++/*
++ * ps4.ini switches (live): image blits between surfaces on the GPU (blit.c); texture uploads in
++ * the frame's command buffer instead of a wait for the GPU each (texture.c).
++ */
++extern bool nv2a_vk_ps4_gpu_blit;
++extern bool nv2a_vk_ps4_async_tex;
++/* the live console's `nv2a [clear]`: per-frame GPU counters and the image blits by shape */
++struct _GString;
++void nv2a_vk_ps4_gpu_report(struct _GString *out, const char *args);
++
 +#ifdef __cplusplus
 +}
 +#endif
@@ -2241,6 +2310,56 @@ index fc52f60..96779da 100644
  subdir('glsl')
  subdir('vk')
  specific_ss.add(nv2a_vsh_cpu)
+diff --git a/hw/xbox/nv2a/pgraph/pgraph.c b/hw/xbox/nv2a/pgraph/pgraph.c
+index 9916718..07ba875 100644
+--- a/hw/xbox/nv2a/pgraph/pgraph.c
++++ b/hw/xbox/nv2a/pgraph/pgraph.c
+@@ -44,17 +44,23 @@ uint64_t pgraph_read(void *opaque, hwaddr addr, unsigned int size)
+     NV2AState *d = (NV2AState *)opaque;
+     PGRAPHState *pg = &d->pgraph;
+ 
+-    qemu_mutex_lock(&pg->lock);
+-
++    /*
++     * xemu-ps4: only the RDI port takes pg->lock here. The pfifo thread holds that lock for a
++     * whole method, its waits for the GPU included (an image blit or a texture upload waits
++     * milliseconds), and the guest's interrupt handler reads INTR: the emulated CPU stood
++     * behind it, 9 % of its time in Crash. The other registers are single 32-bit values; a read
++     * gets the last one stored, as the hardware's change under a running CPU anyway.
++     */
+     uint64_t r = 0;
+     switch (addr) {
+     case NV_PGRAPH_INTR:
+-        r = pg->pending_interrupts;
++        r = qatomic_read(&pg->pending_interrupts);
+         break;
+     case NV_PGRAPH_INTR_EN:
+-        r = pg->enabled_interrupts;
++        r = qatomic_read(&pg->enabled_interrupts);
+         break;
+     case NV_PGRAPH_RDI_DATA: {
++        qemu_mutex_lock(&pg->lock);
+         unsigned int select = PG_GET_MASK(NV_PGRAPH_RDI_INDEX,
+                                        NV_PGRAPH_RDI_INDEX_SELECT);
+         unsigned int address = PG_GET_MASK(NV_PGRAPH_RDI_INDEX,
+@@ -67,15 +73,14 @@ uint64_t pgraph_read(void *opaque, hwaddr addr, unsigned int size)
+                                   NV_PGRAPH_RDI_INDEX_ADDRESS));
+         PG_SET_MASK(NV_PGRAPH_RDI_INDEX,
+                  NV_PGRAPH_RDI_INDEX_ADDRESS, address + 1);
++        qemu_mutex_unlock(&pg->lock);
+         break;
+     }
+     default:
+-        r = pgraph_reg_r(pg, addr);
++        r = qatomic_read(&pg->regs_[addr]);
+         break;
+     }
+ 
+-    qemu_mutex_unlock(&pg->lock);
+-
+     nv2a_reg_log_read(NV_PGRAPH, addr, size, r);
+     return r;
+ }
 diff --git a/hw/xbox/nv2a/pgraph/thirdparty/meson.build b/hw/xbox/nv2a/pgraph/thirdparty/meson.build
 index fbc3751..c41e495 100644
 --- a/hw/xbox/nv2a/pgraph/thirdparty/meson.build
@@ -2259,8 +2378,265 @@ index fbc3751..c41e495 100644
 +# xemu-ps4: no OpenGL on the PS4
 +gloffscreen = declare_dependency()
 +endif
+diff --git a/hw/xbox/nv2a/pgraph/vk/blit.c b/hw/xbox/nv2a/pgraph/vk/blit.c
+index e045cfa..e9eb47c 100644
+--- a/hw/xbox/nv2a/pgraph/vk/blit.c
++++ b/hw/xbox/nv2a/pgraph/vk/blit.c
+@@ -25,6 +25,7 @@
+ 
+ #include "hw/xbox/nv2a/nv2a_int.h"
+ #include "renderer.h"
++#include "hw/xbox/nv2a/nv2a_vk_ps4.h"
+ 
+ static void perform_blit(int operation, uint8_t *source, uint8_t *dest,
+                          size_t width, size_t height, size_t width_bytes,
+@@ -107,6 +108,217 @@ static void discard_overwritten_surfaces(PGRAPHState *pg, hwaddr dest_addr,
+     }
+ }
+ 
++/*
++ * xemu-ps4: a source-copy blit from one surface the GPU holds to another is a copy on the GPU,
++ * recorded into the frame's command buffer, and the destination counts as drawn (newer on the
++ * GPU than in RAM, as after a draw). The other way reads both surfaces back to RAM (two waits for
++ * the GPU each), copies on the CPU and uploads the result again: Crash spent 29 % of the pfifo
++ * thread's time there. ps4.ini gpu_blit (live) turns it off; the live console's `nv2a` shows
++ * which blits took which way.
++ */
++bool nv2a_vk_ps4_gpu_blit = true;
++
++#define BLIT_SHAPES 40
++typedef struct BlitShape {
++    uint32_t op, fmt, w, h, spitch, dpitch;
++    const char *how;
++    uint32_t count;
++} BlitShape;
++static BlitShape blit_shapes[BLIT_SHAPES];
++static unsigned int blit_nshapes, blit_unlisted;
++
++static void note_blit(const ImageBlitState *ib, const ContextSurfaces2DState *cs,
++                      const char *how)
++{
++    for (unsigned int i = 0; i < blit_nshapes; i++) {
++        BlitShape *s = &blit_shapes[i];
++        if (s->op == ib->operation && s->fmt == cs->color_format && s->w == ib->width &&
++            s->h == ib->height && s->spitch == cs->source_pitch &&
++            s->dpitch == cs->dest_pitch && s->how == how) {
++            s->count++;
++            return;
++        }
++    }
++    if (blit_nshapes < BLIT_SHAPES) {
++        blit_shapes[blit_nshapes++] = (BlitShape){
++            ib->operation, cs->color_format, ib->width, ib->height, cs->source_pitch,
++            cs->dest_pitch, how, 1
++        };
++    } else {
++        blit_unlisted++;
++    }
++}
++
++/* the one surface over [addr, addr + len), holding the w x h rectangle at addr: its x, y */
++static SurfaceBinding *blit_surface(PGRAPHVkState *r, hwaddr addr, hwaddr len,
++                                    unsigned int pitch, unsigned int bpp, unsigned int w,
++                                    unsigned int h, unsigned int *x, unsigned int *y,
++                                    const char **why)
++{
++    SurfaceBinding *found = NULL, *s;
++    QTAILQ_FOREACH(s, &r->surfaces, entry) {
++        if (addr + len <= s->vram_addr || addr >= s->vram_addr + s->size) {
++            continue;
++        }
++        if (found) {
++            *why = "cpu: two surfaces";
++            return NULL;
++        }
++        found = s;
++    }
++    s = found;
++    if (!s) {
++        *why = "cpu: not a surface";
++        return NULL;
++    }
++    if (!s->color || s->swizzle) {
++        *why = "cpu: zeta or swizzled surface";
++        return NULL;
++    }
++    if (s->pitch != pitch || s->fmt.bytes_per_pixel != bpp || addr < s->vram_addr) {
++        *why = "cpu: pitch, format or start";
++        return NULL;
++    }
++    const hwaddr off = addr - s->vram_addr;
++    if ((off % pitch) % bpp) {
++        *why = "cpu: misaligned";
++        return NULL;
++    }
++    const unsigned int sx = (off % pitch) / bpp, sy = off / pitch;
++    if (sx + w > s->width || sy + h > s->height) {
++        *why = "cpu: outside the surface";
++        return NULL;
++    }
++    if (!s->initialized || s->upload_pending) {
++        *why = "cpu: RAM newer than the surface";
++        return NULL;
++    }
++    *x = sx;
++    *y = sy;
++    return s;
++}
++
++/* NULL when done on the GPU, else why not */
++static const char *gpu_blit(NV2AState *d, hwaddr source_addr, hwaddr source_size,
++                            hwaddr dest_addr, hwaddr dest_size, unsigned int bpp,
++                            bool needs_alpha_patching)
++{
++    PGRAPHState *pg = &d->pgraph;
++    PGRAPHVkState *r = pg->vk_renderer_state;
++    ContextSurfaces2DState *cs = &pg->context_surfaces_2d;
++    ImageBlitState *ib = &pg->image_blit;
++    const char *why = NULL;
++
++    if (ib->operation != NV09F_SET_OPERATION_SRCCOPY) {
++        return "cpu: blend";
++    }
++    unsigned int sx, sy, dx, dy;
++    SurfaceBinding *src = blit_surface(r, source_addr, source_size, cs->source_pitch, bpp,
++                                       ib->width, ib->height, &sx, &sy, &why);
++    if (!src) {
++        return why;
++    }
++    SurfaceBinding *dst = blit_surface(r, dest_addr, dest_size, cs->dest_pitch, bpp,
++                                       ib->width, ib->height, &dx, &dy, &why);
++    if (!dst) {
++        return why[0] == 'c' && strcmp(why, "cpu: not a surface") == 0 ?
++                   "cpu: destination not a surface" : why;
++    }
++    if (src == dst) {
++        return "cpu: same surface";
++    }
++    if (src->host_fmt.vk_format != dst->host_fmt.vk_format) {
++        return "cpu: host formats differ";
++    }
++    /* X8 formats: the CPU path sets the copied alpha; a surface of an X8 format ignores it */
++    if (needs_alpha_patching &&
++        dst->shape.color_format != NV097_SET_SURFACE_FORMAT_COLOR_LE_X8R8G8B8_Z8R8G8B8 &&
++        dst->shape.color_format != NV097_SET_SURFACE_FORMAT_COLOR_LE_X8R8G8B8_O8R8G8B8) {
++        return "cpu: alpha patch";
++    }
++
++    unsigned int w = ib->width, h = ib->height;
++    pgraph_apply_scaling_factor(pg, &sx, &sy);
++    pgraph_apply_scaling_factor(pg, &dx, &dy);
++    pgraph_apply_scaling_factor(pg, &w, &h);
++
++    VkCommandBuffer cmd = pgraph_vk_begin_nondraw_commands(pg);
++    pgraph_vk_transition_image_layout(pg, cmd, src->image, src->host_fmt.vk_format,
++                                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++                                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++    pgraph_vk_transition_image_layout(pg, cmd, dst->image, dst->host_fmt.vk_format,
++                                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++                                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++    VkImageCopy region = {
++        .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++        .srcOffset = { (int32_t)sx, (int32_t)sy, 0 },
++        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++        .dstOffset = { (int32_t)dx, (int32_t)dy, 0 },
++        .extent = { w, h, 1 },
++    };
++    vkCmdCopyImage(cmd, src->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst->image,
++                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
++    pgraph_vk_transition_image_layout(pg, cmd, src->image, src->host_fmt.vk_format,
++                                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++    pgraph_vk_transition_image_layout(pg, cmd, dst->image, dst->host_fmt.vk_format,
++                                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++    pgraph_vk_end_nondraw_commands(pg, cmd);
++
++    /* as after a draw into it: textures made from it see a new draw time */
++    pg->draw_time++;
++    dst->draw_time = pg->draw_time;
++    dst->draw_dirty = true;
++    return NULL;
++}
++
++void nv2a_vk_ps4_gpu_report(GString *out, const char *args)
++{
++    if (args && strcmp(args, "clear") == 0) {
++        blit_nshapes = 0;
++        blit_unlisted = 0;
++        g_string_append(out, "nv2a: blit table cleared\n");
++        return;
++    }
++    const unsigned int n = MIN(g_nv2a_stats.frame_count, NV2A_PROF_NUM_FRAMES);
++    g_string_append_printf(out, "nv2a: gpu_blit %s, async_tex %s\n",
++                           nv2a_vk_ps4_gpu_blit ? "on" : "off",
++                           nv2a_vk_ps4_async_tex ? "on" : "off");
++    if (n == 0) {
++        g_string_append(out, "nv2a: no frames yet\n");
++    } else {
++        int64_t sum[NV2A_PROF__COUNT] = { 0 };
++        int64_t mspf = 0;
++        for (unsigned int i = 0; i < n; i++) {
++            const unsigned int idx =
++                (g_nv2a_stats.frame_ptr + NV2A_PROF_NUM_FRAMES - 1 - i) % NV2A_PROF_NUM_FRAMES;
++            mspf += g_nv2a_stats.frame_history[idx].mspf;
++            for (int c = 0; c < NV2A_PROF__COUNT; c++) {
++                sum[c] += g_nv2a_stats.frame_history[idx].counters[c];
++            }
++        }
++        g_string_append_printf(out, "per frame over the last %u frames (%.1f ms from the guest's "
++                               "frame increment to its flip):\n", n, (double)mspf / n);
++        for (int c = 0; c < NV2A_PROF__COUNT; c++) {
++            if (sum[c]) {
++                g_string_append_printf(out, "  %9.2f  %s\n", (double)sum[c] / n,
++                                       nv2a_profile_get_counter_name(c));
++            }
++        }
++    }
++    g_string_append_printf(out, "image blits by shape (op, color format, size, pitches: way):\n");
++    for (unsigned int i = 0; i < blit_nshapes; i++) {
++        const BlitShape *s = &blit_shapes[i];
++        g_string_append_printf(out, "  %8u  op %u fmt %u %ux%u pitch %u -> %u: %s\n", s->count,
++                               s->op, s->fmt, s->w, s->h, s->spitch, s->dpitch,
++                               s->how ? s->how : "gpu");
++    }
++    if (blit_unlisted) {
++        g_string_append_printf(out, "  (%u more blits of other shapes)\n", blit_unlisted);
++    }
++}
++
+ void pgraph_vk_image_blit(NV2AState *d)
+ {
+     PGRAPHState *pg = &d->pgraph;
+@@ -188,6 +400,26 @@ void pgraph_vk_image_blit(NV2AState *d)
+     size_t total_rows = adjusted_height + (leftover_bytes > 0 ? 1 : 0);
+     hwaddr source_size = total_rows ? (total_rows - 1) * context_surfaces->source_pitch +
+                                        (leftover_bytes ? leftover_bytes : row_pixels * bytes_per_pixel) : 0;
++    bool blit_alpha_patch =
++        context_surfaces->color_format == NV062_SET_COLOR_FORMAT_LE_X8R8G8B8 ||
++        context_surfaces->color_format == NV062_SET_COLOR_FORMAT_LE_X8R8G8B8_Z8R8G8B8;
++    const char *blit_how = "cpu: gpu_blit off";
++    if (qatomic_read(&nv2a_vk_ps4_gpu_blit)) {
++        if (clipped_dest_size < dest_size || leftover_bytes ||
++            row_pixels != image_blit->width || adjusted_height != image_blit->height) {
++            blit_how = "cpu: clipped";
++        } else {
++            blit_how = gpu_blit(d, source_addr, source_size, dest_addr, dest_size,
++                                bytes_per_pixel, blit_alpha_patch);
++        }
++    }
++    note_blit(image_blit, context_surfaces, blit_how);
++    if (blit_how == NULL) {
++        nv2a_profile_inc_counter(NV2A_PROF_BLIT_GPU);
++        return;
++    }
++    nv2a_profile_inc_counter(NV2A_PROF_BLIT_CPU);
++
+     pgraph_vk_download_surfaces_in_range_if_dirty(pg, source_addr, source_size);
+ 
+     // Must happen after the source download so that surfaces overlapping both
 diff --git a/hw/xbox/nv2a/pgraph/vk/buffer.c b/hw/xbox/nv2a/pgraph/vk/buffer.c
-index d87c875..084cbd9 100644
+index d87c875..8d747c2 100644
 --- a/hw/xbox/nv2a/pgraph/vk/buffer.c
 +++ b/hw/xbox/nv2a/pgraph/vk/buffer.c
 @@ -60,6 +60,22 @@ void pgraph_vk_init_buffers(NV2AState *d)
@@ -2313,6 +2689,33 @@ index d87c875..084cbd9 100644
      };
  
      r->storage_buffers[BUFFER_VERTEX_INLINE_STAGING] = (StorageBuffer){
+@@ -137,6 +153,16 @@ void pgraph_vk_init_buffers(NV2AState *d)
+         .buffer_size = r->storage_buffers[BUFFER_UNIFORM].buffer_size,
+     };
+ 
++    /*
++     * xemu-ps4: texture uploads go into the frame's command buffer from here (texture.c), each
++     * at its own offset; the offset goes back to 0 when the command buffer has run (draw.c).
++     */
++    r->storage_buffers[BUFFER_TEXTURE_STAGING] = (StorageBuffer){
++        .alloc_info = host_alloc_create_info,
++        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
++        .buffer_size = 32 * 1024 * 1024,
++    };
++
+     for (int i = 0; i < BUFFER_COUNT; i++) {
+         create_buffer(pg, &r->storage_buffers[i]);
+     }
+@@ -146,7 +172,8 @@ void pgraph_vk_init_buffers(NV2AState *d)
+     int buffers_to_map[] = { BUFFER_VERTEX_RAM,
+                              BUFFER_INDEX_STAGING,
+                              BUFFER_VERTEX_INLINE_STAGING,
+-                             BUFFER_UNIFORM_STAGING };
++                             BUFFER_UNIFORM_STAGING,
++                             BUFFER_TEXTURE_STAGING };
+ 
+     for (int i = 0; i < ARRAY_SIZE(buffers_to_map); i++) {
+         VK_CHECK(vmaMapMemory(
 diff --git a/hw/xbox/nv2a/pgraph/vk/command.c b/hw/xbox/nv2a/pgraph/vk/command.c
 index 0e9fc9a..cee36c5 100644
 --- a/hw/xbox/nv2a/pgraph/vk/command.c
@@ -2385,7 +2788,7 @@ index f4edc47..7f4bd6d 100644
      VK_CHECK(vkAllocateMemory(r->device, &alloc_info, NULL, &d->memory));
      VK_CHECK(vkBindImageMemory(r->device, d->image, d->memory, 0));
 diff --git a/hw/xbox/nv2a/pgraph/vk/draw.c b/hw/xbox/nv2a/pgraph/vk/draw.c
-index bf535b4..26c1893 100644
+index bf535b4..94457fd 100644
 --- a/hw/xbox/nv2a/pgraph/vk/draw.c
 +++ b/hw/xbox/nv2a/pgraph/vk/draw.c
 @@ -1259,8 +1259,10 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
@@ -2399,6 +2802,14 @@ index bf535b4..26c1893 100644
          r->submit_count += 1;
  
          bool check_budget = false;
+@@ -1280,6 +1282,7 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
+         VK_CHECK(vkWaitForFences(r->device, 1, &r->command_buffer_fence,
+                                  VK_TRUE, UINT64_MAX));
+ 
++        r->storage_buffers[BUFFER_TEXTURE_STAGING].buffer_offset = 0;
+         r->descriptor_set_index = 0;
+         r->in_command_buffer = false;
+         destroy_framebuffers(pg);
 diff --git a/hw/xbox/nv2a/pgraph/vk/gpuprops.c b/hw/xbox/nv2a/pgraph/vk/gpuprops.c
 index ecc8bb3..6eba23b 100644
 --- a/hw/xbox/nv2a/pgraph/vk/gpuprops.c
@@ -2652,7 +3063,7 @@ index 4272bbc..49dc57e 100644
      qemu_mutex_unlock(&d->pfifo.lock);
      pgraph_vk_wait_for_surface_download(surface);
 diff --git a/hw/xbox/nv2a/pgraph/vk/renderer.h b/hw/xbox/nv2a/pgraph/vk/renderer.h
-index 1eac3e0..0463d5e 100644
+index 1eac3e0..71f2843 100644
 --- a/hw/xbox/nv2a/pgraph/vk/renderer.h
 +++ b/hw/xbox/nv2a/pgraph/vk/renderer.h
 @@ -41,7 +41,22 @@
@@ -2678,7 +3089,15 @@ index 1eac3e0..0463d5e 100644
  
  typedef struct QueueFamilyIndices {
      int queue_family;
-@@ -286,6 +301,7 @@ typedef struct PGRAPHVkDisplayState {
+@@ -92,6 +107,7 @@ enum Buffer {
+     BUFFER_VERTEX_INLINE_STAGING,
+     BUFFER_UNIFORM,
+     BUFFER_UNIFORM_STAGING,
++    BUFFER_TEXTURE_STAGING, /* xemu-ps4: texture uploads in the frame's command buffer */
+     BUFFER_COUNT
+ };
+ 
+@@ -286,6 +302,7 @@ typedef struct PGRAPHVkDisplayState {
      int width, height;
      int draw_time;
  
@@ -2686,7 +3105,7 @@ index 1eac3e0..0463d5e 100644
      // OpenGL Interop
  #ifdef WIN32
      HANDLE handle;
-@@ -294,6 +310,7 @@ typedef struct PGRAPHVkDisplayState {
+@@ -294,6 +311,7 @@ typedef struct PGRAPHVkDisplayState {
  #endif
      GLuint gl_memory_obj;
      GLuint gl_texture_id;
@@ -2694,6 +3113,134 @@ index 1eac3e0..0463d5e 100644
  } PGRAPHVkDisplayState;
  
  typedef struct ComputePipelineKey {
+diff --git a/hw/xbox/nv2a/pgraph/vk/texture.c b/hw/xbox/nv2a/pgraph/vk/texture.c
+index f1550f7..6bc53a9 100644
+--- a/hw/xbox/nv2a/pgraph/vk/texture.c
++++ b/hw/xbox/nv2a/pgraph/vk/texture.c
+@@ -29,6 +29,7 @@
+ #include "qemu/fast-hash.h"
+ #include "qemu/lru.h"
+ #include "renderer.h"
++#include "hw/xbox/nv2a/nv2a_vk_ps4.h"
+ 
+ static void texture_cache_release_node_resources(PGRAPHVkState *r, TextureBinding *snode);
+ 
+@@ -475,6 +476,96 @@ static bool check_texture_possibly_dirty(NV2AState *d,
+ 
+ // FIXME: Make sure we update sampler when data matches. Should we add filtering
+ // options to the textureshape?
++/*
++ * xemu-ps4: a texture upload recorded into the frame's command buffer, its data at its own
++ * offset in the texture staging buffer, instead of a command buffer of its own that the pfifo
++ * thread submits and then waits for the whole queue to drain (vkQueueWaitIdle): Crash spent a
++ * fifth of the pfifo thread's time there. The copy runs before the draws recorded after it, the
++ * draws before it can't use the new image. ps4.ini async_tex (live) turns it off.
++ */
++bool nv2a_vk_ps4_async_tex = true;
++
++static void upload_texture_image_async(PGRAPHState *pg, TextureBinding *binding,
++                                       TextureLayout *layout, int num_layers)
++{
++    PGRAPHVkState *r = pg->vk_renderer_state;
++    TextureShape *state = &binding->key.state;
++    VkColorFormatInfo vkf = kelvin_color_format_vk_map[state->color_format];
++    StorageBuffer *sb = &r->storage_buffers[BUFFER_TEXTURE_STAGING];
++
++    nv2a_profile_inc_counter(NV2A_PROF_TEX_UPLOAD_ASYNC);
++
++    int num_regions = num_layers * state->levels;
++    g_autofree VkBufferImageCopy *regions =
++        g_malloc0_n(num_regions, sizeof(VkBufferImageCopy));
++    VkBufferImageCopy *region = regions;
++    const VkDeviceSize first = ROUND_UP(sb->buffer_offset, 16);
++
++    for (int layer_idx = 0; layer_idx < num_layers; layer_idx++) {
++        TextureLayer *layer = &layout->layers[layer_idx];
++        for (int level_idx = 0; level_idx < state->levels; level_idx++) {
++            TextureLevel *level = &layer->levels[level_idx];
++            void *data = level->decoded_data;
++            VkDeviceSize size = level->decoded_size;
++            /* 16: a copy's buffer offset is a multiple of the texel block */
++            VkDeviceSize offset =
++                pgraph_vk_append_to_buffer(pg, BUFFER_TEXTURE_STAGING, &data, &size, 1, 16);
++            *region = (VkBufferImageCopy){
++                .bufferOffset = offset,
++                .bufferRowLength = 0,
++                .bufferImageHeight = 0,
++                .imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++                .imageSubresource.mipLevel = level_idx,
++                .imageSubresource.baseArrayLayer = layer_idx,
++                .imageSubresource.layerCount = 1,
++                .imageOffset = (VkOffset3D){ 0, 0, 0 },
++                .imageExtent =
++                    (VkExtent3D){ level->width, level->height, level->depth },
++            };
++            region++;
++        }
++    }
++    vmaFlushAllocation(r->allocator, sb->allocation, first, sb->buffer_offset - first);
++
++    VkCommandBuffer cmd = pgraph_vk_begin_nondraw_commands(pg);
++
++    VkBufferMemoryBarrier host_barrier = {
++        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
++        .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
++        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
++        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .buffer = sb->buffer,
++        .offset = first,
++        .size = sb->buffer_offset - first,
++    };
++    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT,
++                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 1,
++                         &host_barrier, 0, NULL);
++
++    pgraph_vk_transition_image_layout(pg, cmd, binding->image, vkf.vk_format,
++                                      binding->current_layout,
++                                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++    binding->current_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++
++    vkCmdCopyBufferToImage(cmd, sb->buffer, binding->image, binding->current_layout,
++                           num_regions, regions);
++
++    pgraph_vk_transition_image_layout(pg, cmd, binding->image, vkf.vk_format,
++                                      binding->current_layout,
++                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++    binding->current_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
++
++    pgraph_vk_end_nondraw_commands(pg, cmd);
++
++    for (int layer_idx = 0; layer_idx < num_layers; layer_idx++) {
++        TextureLayer *layer = &layout->layers[layer_idx];
++        for (int level_idx = 0; level_idx < state->levels; level_idx++) {
++            g_free(layer->levels[level_idx].decoded_data);
++        }
++    }
++}
++
+ static void upload_texture_image(PGRAPHState *pg, int texture_idx,
+                                  TextureBinding *binding)
+ {
+@@ -501,6 +592,18 @@ static void upload_texture_image(PGRAPHState *pg, int texture_idx,
+     assert(texture_data_size <=
+            r->storage_buffers[BUFFER_STAGING_SRC].buffer_size);
+ 
++    /* xemu-ps4: the frame's command buffer unless the texture is bigger than the whole ring */
++    const VkDeviceSize async_need =
++        texture_data_size + 16 * (VkDeviceSize)(num_layers * state->levels);
++    if (qatomic_read(&nv2a_vk_ps4_async_tex) &&
++        async_need <= r->storage_buffers[BUFFER_TEXTURE_STAGING].buffer_size) {
++        if (!pgraph_vk_buffer_has_space_for(pg, BUFFER_TEXTURE_STAGING, async_need, 16)) {
++            pgraph_vk_finish(pg, VK_FINISH_REASON_NEED_BUFFER_SPACE);
++        }
++        upload_texture_image_async(pg, binding, layout, num_layers);
++        return;
++    }
++
+     // Copy texture data to mapped device buffer
+     uint8_t *mapped_memory_ptr;
+ 
 diff --git a/hw/xbox/xbox.c b/hw/xbox/xbox.c
 index 779a41b..6e94fa5 100644
 --- a/hw/xbox/xbox.c
@@ -6014,10 +6561,10 @@ index 0000000..a80721c
 +}
 diff --git a/ui/ps4/ps4-live.c b/ui/ps4/ps4-live.c
 new file mode 100644
-index 0000000..6a073f9
+index 0000000..4b68db9
 --- /dev/null
 +++ b/ui/ps4/ps4-live.c
-@@ -0,0 +1,233 @@
+@@ -0,0 +1,236 @@
 +/*
 + * xemu-ps4: the live console - a TCP port on the PS4 (ps4.ini live_port, default 4445; 0 = off)
 + * to look into and steer the running emulator from a PC (scripts/live.py). One client at a time,
@@ -6130,8 +6677,9 @@ index 0000000..6a073f9
 +        args = line + strlen(line);
 +    }
 +    if (strcmp(line, "help") == 0) {
-+        g_string_append(out, "stats | aot [load|off|exits [on|off]] | hmp <monitor command> | mem <addr> [len] | "
-+                             "profile [s] | dump | get [key] | set <key> <value> | quit\n");
++        g_string_append(out, "stats | aot [load|off|exits [on|off]] | nv2a [clear] | hmp <monitor command> | "
++                             "mem <addr> [len] | profile [s] | dump | get [key] | set <key> <value> | "
++                             "quit\n");
 +    } else if (strcmp(line, "stats") == 0) {
 +        g_string_append(out, ps4_live_last_monitor);
 +    } else if (strcmp(line, "aot") == 0 && strncmp(args, "exits", 5) == 0) {
@@ -6158,6 +6706,8 @@ index 0000000..6a073f9
 +        }
 +        aot_stats(out, true);
 +        g_string_append_c(out, '\n');
++    } else if (strcmp(line, "nv2a") == 0) {
++        nv2a_vk_ps4_gpu_report(out, args);
 +    } else if (strcmp(line, "hmp") == 0) {
 +        cmd_hmp(out, args);
 +    } else if (strcmp(line, "mem") == 0) {
@@ -7191,10 +7741,10 @@ index 0000000..a2486cb
 +}
 diff --git a/ui/ps4/ps4-settings.c b/ui/ps4/ps4-settings.c
 new file mode 100644
-index 0000000..bef3328
+index 0000000..3716d46
 --- /dev/null
 +++ b/ui/ps4/ps4-settings.c
-@@ -0,0 +1,167 @@
+@@ -0,0 +1,186 @@
 +/*
 + * xemu-ps4: the PS4 frontend's own settings (ps4-settings.h), "key = value" lines in
 + * /data/xemu/ps4.ini. Unknown keys are ignored, missing ones keep their defaults.
@@ -7206,9 +7756,11 @@ index 0000000..bef3328
 + */
 +
 +#include "qemu/osdep.h"
++#include "qemu/atomic.h"
 +#include "exec/aot.h"
 +#include "ps4-settings.h"
 +#include "ui/xemu-settings.h"
++#include "hw/xbox/nv2a/nv2a_vk_ps4.h"
 +
 +#define PS4_SETTINGS_PATH "/data/xemu/ps4.ini"
 +
@@ -7232,6 +7784,8 @@ index 0000000..bef3328
 +    .aot = true,
 +    .aot_record = true,
 +    .aot_direct = true,
++    .gpu_blit = true,
++    .async_tex = true,
 +};
 +
 +typedef struct {
@@ -7261,6 +7815,9 @@ index 0000000..bef3328
 +    { "aot", T_BOOL, &ps4_settings.aot, 0, 1 },
 +    { "aot_record", T_BOOL, &ps4_settings.aot_record, 0, 1 },
 +    { "aot_direct", T_BOOL, &ps4_settings.aot_direct, 0, 1 },
++    { "gpu_blit", T_BOOL, &ps4_settings.gpu_blit, 0, 1 },
++    { "async_tex", T_BOOL, &ps4_settings.async_tex, 0, 1 },
++    { "gpu_module", T_BOOL, &ps4_settings.gpu_module, 0, 1 },
 +};
 +
 +void ps4_settings_apply_aot(void)
@@ -7268,6 +7825,12 @@ index 0000000..bef3328
 +    aot_use = ps4_settings.aot;
 +    aot_record = ps4_settings.aot_record;
 +    aot_direct = ps4_settings.aot_direct;
++}
++
++void ps4_settings_apply_nv2a(void)
++{
++    qatomic_set(&nv2a_vk_ps4_gpu_blit, ps4_settings.gpu_blit);
++    qatomic_set(&nv2a_vk_ps4_async_tex, ps4_settings.async_tex);
 +}
 +
 +void ps4_settings_load(void)
@@ -7344,6 +7907,12 @@ index 0000000..bef3328
 +        if (strncmp(key, "aot", 3) == 0) {
 +            ps4_settings_apply_aot();
 +        }
++        if (strcmp(key, "gpu_blit") == 0 || strcmp(key, "async_tex") == 0) {
++            ps4_settings_apply_nv2a();
++        }
++        if (strcmp(key, "gpu_module") == 0) {
++            ps4_apply_thread_places();
++        }
 +        if (strcmp(key, "poll_spin_us") == 0 && c >= 0) {
 +            extern int64_t ps4_poll_spin_ns;
 +            ps4_poll_spin_ns = (int64_t)c * 1000;
@@ -7364,10 +7933,10 @@ index 0000000..bef3328
 +}
 diff --git a/ui/ps4/ps4-settings.h b/ui/ps4/ps4-settings.h
 new file mode 100644
-index 0000000..ccd0b88
+index 0000000..ef95c9d
 --- /dev/null
 +++ b/ui/ps4/ps4-settings.h
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,81 @@
 +/*
 + * xemu-ps4: the PS4 frontend's own settings (/data/xemu/ps4.ini), next to xemu's xemu.toml.
 + * Changed from the quick menu (ps4-hud.cc); "restart" ones apply at the next start.
@@ -7423,6 +7992,9 @@ index 0000000..ccd0b88
 +    bool aot;               /* run a game's translated code (/data/xemu/aot/<ID>.aot) (next game) */
 +    bool aot_record;        /* write the blocks a game runs as C for the PC's build (next game) */
 +    bool aot_direct;        /* translated blocks run the next one without the main loop (live) */
++    bool gpu_blit;          /* image blits between surfaces as GPU copies (live) */
++    bool async_tex;         /* texture uploads without a wait for the GPU each (live) */
++    bool gpu_module;        /* pinned layout: the NV2A's thread on core 4, off the CPU's L2 (live) */
 +} PS4Settings;
 +
 +extern PS4Settings ps4_settings;
@@ -7436,6 +8008,10 @@ index 0000000..ccd0b88
 +bool ps4_settings_set_text(const char *key, const char *value);
 +/* aot / aot_record to the translator (accel/tcg/aot.c); they apply at the next game */
 +void ps4_settings_apply_aot(void);
++/* gpu_blit / async_tex to the Vulkan renderer (hw/xbox/nv2a/nv2a_vk_ps4.h) */
++void ps4_settings_apply_nv2a(void);
++/* the threads' cores again after cpu_layout / gpu_module changed (xemu-ps4.c) */
++void ps4_apply_thread_places(void);
 +
 +#ifdef __cplusplus
 +}
@@ -7564,10 +8140,10 @@ index 0000000..24e9598
 +}
 diff --git a/ui/ps4/xemu-ps4.c b/ui/ps4/xemu-ps4.c
 new file mode 100644
-index 0000000..d4e08ee
+index 0000000..f6cdd4f
 --- /dev/null
 +++ b/ui/ps4/xemu-ps4.c
-@@ -0,0 +1,1176 @@
+@@ -0,0 +1,1239 @@
 +/*
 + * xemu-ps4: the PS4 frontend (replaces ui/xemu.c and its SDL window + OpenGL).
 + *
@@ -8052,7 +8628,29 @@ index 0000000..d4e08ee
 +static uint64_t app_cores = 0x3f;       /* the cores the app may use (0x7f with the 7th) */
 +static uint64_t shared_cores = 0x30;    /* what isn't pinned: cores 4.. */
 +
-+static void place_thread(const char *name)
++/*
++ * ps4.ini gpu_module (live, pinned layout only): the NV2A's thread on core 4 and core 1 shared
++ * instead. Cores 0-3 are one module with one 2 MiB L2 cache, 4-7 the other: the emulated CPU's
++ * translated code and the NV2A's push buffer, vertex and texture work otherwise share one L2.
++ */
++static uint64_t shared_mask(void)
++{
++    return ps4_settings.gpu_module ? (shared_cores & ~0x10ull) | 0x2ull : shared_cores;
++}
++
++static uint64_t place_mask(const ThreadPlace *place)
++{
++    if (ps4_settings.cpu_layout == PS4_CPU_FLOATING) {
++        return app_cores;
++    }
++    if (place && place->core >= 0) {
++        const int core = ps4_settings.gpu_module && place->core == 1 ? 4 : place->core;
++        return 1ull << core;
++    }
++    return shared_mask();
++}
++
++static const ThreadPlace *find_place(const char *name)
 +{
 +    const ThreadPlace *place = NULL;
 +    for (size_t i = 0; i < ARRAY_SIZE(thread_places); i++) {
@@ -8060,11 +8658,47 @@ index 0000000..d4e08ee
 +            place = &thread_places[i];
 +        }
 +    }
++    return place;
++}
++
++/* every placed thread, for a live change of the layout */
++static struct {
++    char name[32];
++    pthread_t thread;
++} placed[32];
++static int nplaced;
++static pthread_mutex_t placed_lock = PTHREAD_MUTEX_INITIALIZER;
++
++void ps4_apply_thread_places(void)
++{
++    if (ps4_settings.cpu_layout == PS4_CPU_FLOATING) {
++        return;
++    }
++    pthread_mutex_lock(&placed_lock);
++    for (int i = 0; i < nplaced; i++) {
++        ps4x_set_affinity(placed[i].thread, place_mask(find_place(placed[i].name)));
++    }
++    pthread_mutex_unlock(&placed_lock);
++    ps4_kit_set_new_thread_cores(shared_mask());
++    ps4_boot_tracef("threads placed again: NV2A on core %d, shared cores %#llx",
++                    ps4_settings.gpu_module ? 4 : 1, (unsigned long long)shared_mask());
++}
++
++static void place_thread(const char *name)
++{
++    const ThreadPlace *place = find_place(name);
++    pthread_mutex_lock(&placed_lock);
++    if (nplaced < (int)ARRAY_SIZE(placed)) {
++        g_strlcpy(placed[nplaced].name, name, sizeof(placed[nplaced].name));
++        placed[nplaced].thread = pthread_self();
++        nplaced++;
++    }
++    pthread_mutex_unlock(&placed_lock);
 +    if (ps4_settings.cpu_layout == PS4_CPU_FLOATING) {
 +        ps4x_set_affinity(pthread_self(), app_cores);
 +        return;
 +    }
-+    const uint64_t mask = place && place->core >= 0 ? (1ull << place->core) : shared_cores;
++    const uint64_t mask = place_mask(place);
 +    int r1 = ps4x_set_affinity(pthread_self(), mask);
 +    int r2 = place ? ps4x_set_priority(pthread_self(), place->priority) : 0;
 +    if (place) {
@@ -8502,8 +9136,12 @@ index 0000000..d4e08ee
 +    if (shared_cores == 0 || ps4_settings.cpu_layout == PS4_CPU_FLOATING) {
 +        shared_cores = app_cores;
 +    }
-+    ps4_kit_set_new_thread_cores(shared_cores);
-+    ps4x_set_affinity(pthread_self(), shared_cores);
++    ps4_kit_set_new_thread_cores(shared_mask());
++    ps4x_set_affinity(pthread_self(), shared_mask());
++    pthread_mutex_lock(&placed_lock);
++    g_strlcpy(placed[nplaced].name, "main (display)", sizeof(placed[nplaced].name));
++    placed[nplaced++].thread = pthread_self();
++    pthread_mutex_unlock(&placed_lock);
 +    if (ps4_settings.cpu_layout == PS4_CPU_PINNED) {
 +        ps4x_set_priority(pthread_self(), 620);
 +    }
@@ -8513,6 +9151,7 @@ index 0000000..d4e08ee
 +    profiling = ps4_settings.profiler || access(XEMU_DATA "/profile.txt", F_OK) == 0;
 +    tlb_dirty_index_enabled = ps4_settings.tlb_index;
 +    ps4_settings_apply_aot();
++    ps4_settings_apply_nv2a();
 +    if (profiling) {
 +        ps4_sampler_start();
 +        ps4_sampler_register_thread("main (display)");
